@@ -30,6 +30,36 @@ fn in_window(ts: f64, window: Option<(f64, f64)>) -> bool {
     window.is_none_or(|(lo, hi)| ts >= lo && ts <= hi)
 }
 
+/// Function-name matcher: case-insensitive substring or a regex.
+pub enum Matcher {
+    Substr(String),
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    pub fn new(pattern: &str, use_regex: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        if use_regex {
+            Ok(Matcher::Regex(regex::Regex::new(pattern)?))
+        } else {
+            Ok(Matcher::Substr(pattern.to_lowercase()))
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Matcher::Substr(p) => name.to_lowercase().contains(p),
+            Matcher::Regex(re) => re.is_match(name),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Matcher::Substr(p) => format!("`{}`", p),
+            Matcher::Regex(re) => format!("/{}/", re.as_str()),
+        }
+    }
+}
+
 fn fmt_ms(us: f64) -> String {
     format!("{:.2}", us / 1000.0)
 }
@@ -61,11 +91,12 @@ fn window_label(window: Option<(f64, f64)>) -> &'static str {
     }
 }
 
-/// List events matching one of `names`, filtered by window and min duration.
+/// List events matching one of `names`, filtered by window, thread, and min duration.
 pub fn events_md(
     events: &[TraceEvent],
     names: &[String],
     window: Option<(f64, f64)>,
+    tid: Option<u64>,
     min_dur_us: f64,
     top: usize,
     min_ts: f64,
@@ -73,6 +104,7 @@ pub fn events_md(
     let mut rows: Vec<&TraceEvent> = events
         .iter()
         .filter(|e| names.iter().any(|n| n == &e.name))
+        .filter(|e| tid.map_or(true, |t| e.tid == t))
         .filter(|e| e.dur.unwrap_or(0.0) >= min_dur_us)
         .filter(|e| in_window(e.ts, window))
         .collect();
@@ -120,16 +152,16 @@ pub fn events_md(
     out
 }
 
-/// Aggregate CPU profile self-time for functions whose name contains `pattern`,
-/// optionally restricted to a time window (chunk-granularity).
+/// Aggregate CPU profile self-time for functions matching `matcher`,
+/// optionally restricted to a time window (chunk-granularity) and thread.
 pub fn functions_md(
     events: &[TraceEvent],
-    pattern: &str,
+    matcher: &Matcher,
     window: Option<(f64, f64)>,
+    tid: Option<u64>,
     top: usize,
     min_ts: f64,
 ) -> String {
-    let pat = pattern.to_lowercase();
     let mut node_map: HashMap<u64, (String, String)> = HashMap::new();
     let mut self_times: HashMap<u64, f64> = HashMap::new();
     let mut total_in_scope = 0.0f64;
@@ -170,8 +202,12 @@ pub fn functions_md(
             }
         }
 
-        // Accumulate sample time only from in-window chunks.
+        // Accumulate sample time only from chunks in window and on the
+        // requested thread.
         if !in_window(e.ts, window) {
+            continue;
+        }
+        if !tid.map_or(true, |t| e.tid == t) {
             continue;
         }
         let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
@@ -189,7 +225,7 @@ pub fn functions_md(
     let mut funcs: Vec<(&str, &str, f64)> = self_times
         .iter()
         .filter_map(|(id, t)| node_map.get(id).map(|(n, u)| (n.as_str(), u.as_str(), *t)))
-        .filter(|(n, _, _)| n.to_lowercase().contains(&pat))
+        .filter(|(n, _, _)| matcher.matches(n))
         .collect();
     funcs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
 
@@ -197,8 +233,8 @@ pub fn functions_md(
 
     let mut out = String::new();
     out.push_str(&format!(
-        "## CPU Functions matching `{}` ({} functions, {})\n\n",
-        pattern,
+        "## CPU Functions matching {} ({} functions, {})\n\n",
+        matcher.label(),
         funcs.len(),
         window_label(window),
     ));
@@ -210,7 +246,7 @@ pub fn functions_md(
         ));
     }
     out.push_str(&format!(
-        "- **Matched self-time**: {}\n\n",
+        "- **Matched self-time**: {}ms\n\n",
         fmt_ms(matched_total),
     ));
 
@@ -246,6 +282,7 @@ pub fn functions_md(
 pub fn find_md(
     events: &[TraceEvent],
     needle: &str,
+    tid: Option<u64>,
     top: usize,
     min_ts: f64,
 ) -> String {
@@ -253,6 +290,9 @@ pub fn find_md(
     let mut matches: Vec<(&TraceEvent, String)> = Vec::new();
 
     for e in events {
+        if !tid.map_or(true, |t| e.tid == t) {
+            continue;
+        }
         let s = match &e.args {
             Some(v) => serde_json::to_string(v).unwrap_or_default(),
             None => continue,
@@ -272,8 +312,10 @@ pub fn find_md(
 
     let mut out = String::new();
     out.push_str(&format!(
-        "## Find `{}` in event args ({} matches)\n\n",
-        needle, total,
+        "## Find `{}` in event args ({} matches{})\n\n",
+        needle,
+        total,
+        tid.map_or(String::new(), |t| format!(", tid={}", t)),
     ));
 
     if total == 0 {
@@ -297,6 +339,145 @@ pub fn find_md(
     if total > top {
         out.push_str(&format!(
             "\n_Showing {} of {} matches (use --top to see more)._\n",
+            top, total
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Discovery: distinct event names with count and total duration, scoped to the
+/// window/thread. Sorted by total duration descending.
+pub fn names_md(
+    events: &[TraceEvent],
+    window: Option<(f64, f64)>,
+    tid: Option<u64>,
+    top: usize,
+    min_ts: f64,
+) -> String {
+    let mut stats: HashMap<String, (usize, f64)> = HashMap::new();
+    for e in events {
+        if !tid.map_or(true, |t| e.tid == t) || !in_window(e.ts, window) {
+            continue;
+        }
+        let entry = stats.entry(e.name.clone()).or_default();
+        entry.0 += 1;
+        entry.1 += e.dur.unwrap_or(0.0);
+    }
+
+    let mut rows: Vec<(String, usize, f64)> = stats.into_iter().map(|(n, (c, d))| (n, c, d)).collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    let total = rows.len();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Event names ({} distinct, {})\n\n",
+        total,
+        window_label(window),
+    ));
+    if let Some((lo, hi)) = window {
+        out.push_str(&format!(
+            "- **Window**: {:.2}ms … {:.2}ms from trace start\n\n",
+            (lo - min_ts) / 1000.0,
+            (hi - min_ts) / 1000.0,
+        ));
+    }
+    if total == 0 {
+        out.push_str("No events.\n\n");
+        return out;
+    }
+
+    out.push_str("| # | name | count | total(ms) | avg(ms) |\n");
+    out.push_str("|---|------|-------|-----------|---------|\n");
+    for (i, (name, count, dur)) in rows.iter().take(top).enumerate() {
+        let avg = if *count > 0 { dur / *count as f64 } else { 0.0 };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            i + 1,
+            name,
+            count,
+            fmt_ms(*dur),
+            fmt_ms(avg),
+        ));
+    }
+    if total > top {
+        out.push_str(&format!(
+            "\n_Showing {} of {} names (use --top to see more)._\n",
+            top, total
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Discovery: distinct threads (tid) with event count, RunTask total duration,
+/// and the most frequent event name. Scoped to the window.
+pub fn threads_md(
+    events: &[TraceEvent],
+    window: Option<(f64, f64)>,
+    top: usize,
+    min_ts: f64,
+) -> String {
+    let mut tids: HashMap<u64, (usize, f64, HashMap<String, usize>)> = HashMap::new();
+    for e in events {
+        if !in_window(e.ts, window) {
+            continue;
+        }
+        let entry = tids.entry(e.tid).or_default();
+        entry.0 += 1;
+        if e.name == "RunTask" {
+            entry.1 += e.dur.unwrap_or(0.0);
+        }
+        *entry.2.entry(e.name.clone()).or_default() += 1;
+    }
+
+    let mut rows: Vec<(u64, usize, f64, String)> = tids
+        .into_iter()
+        .map(|(tid, (count, runtask, names))| {
+            let top_name = names
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(n, _)| n)
+                .unwrap_or_default();
+            (tid, count, runtask, top_name)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    let total = rows.len();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Threads ({} distinct, {})\n\n",
+        total,
+        window_label(window),
+    ));
+    if let Some((lo, hi)) = window {
+        out.push_str(&format!(
+            "- **Window**: {:.2}ms … {:.2}ms from trace start\n\n",
+            (lo - min_ts) / 1000.0,
+            (hi - min_ts) / 1000.0,
+        ));
+    }
+    if total == 0 {
+        out.push_str("No threads.\n\n");
+        return out;
+    }
+
+    out.push_str("| # | tid | events | RunTask(ms) | top event |\n");
+    out.push_str("|---|-----|--------|------------|-----------|\n");
+    for (i, (tid, count, runtask, top_name)) in rows.iter().take(top).enumerate() {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            i + 1,
+            tid,
+            count,
+            fmt_ms(*runtask),
+            top_name,
+        ));
+    }
+    if total > top {
+        out.push_str(&format!(
+            "\n_Showing {} of {} threads (use --top to see more)._\n",
             top, total
         ));
     }

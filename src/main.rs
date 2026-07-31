@@ -65,12 +65,32 @@ struct Cli {
     /// Inspect: limit number of rows (default 30)
     #[arg(long, default_value_t = 30)]
     top: usize,
+
+    /// Inspect: restrict events/functions/find to this thread id (tid)
+    #[arg(long)]
+    tid: Option<u64>,
+
+    /// Inspect: list distinct event names with counts/total duration
+    #[arg(long)]
+    names: bool,
+
+    /// Inspect: list distinct threads (tid) with counts/RunTask duration
+    #[arg(long)]
+    threads: bool,
+
+    /// Inspect: interpret --function as a regex instead of a substring
+    #[arg(long)]
+    regex: bool,
 }
 
 impl Cli {
     /// Any granular-inspect flag present?
     fn is_inspect(&self) -> bool {
-        self.events.is_some() || self.function.is_some() || self.find.is_some()
+        self.events.is_some()
+            || self.function.is_some()
+            || self.find.is_some()
+            || self.names
+            || self.threads
     }
 }
 
@@ -207,6 +227,20 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         ));
     }
 
+    if cli.names {
+        out.push_str(&inspect::names_md(
+            events,
+            window,
+            cli.tid,
+            cli.top,
+            min_ts,
+        ));
+    }
+
+    if cli.threads {
+        out.push_str(&inspect::threads_md(events, window, cli.top, min_ts));
+    }
+
     if let Some(names_raw) = &cli.events {
         let names: Vec<String> = names_raw
             .split(',')
@@ -217,6 +251,7 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
             events,
             &names,
             window,
+            cli.tid,
             min_dur_us,
             cli.top,
             min_ts,
@@ -224,17 +259,19 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     }
 
     if let Some(pattern) = &cli.function {
+        let matcher = inspect::Matcher::new(pattern, cli.regex)?;
         out.push_str(&inspect::functions_md(
             events,
-            pattern,
+            &matcher,
             window,
+            cli.tid,
             cli.top,
             min_ts,
         ));
     }
 
     if let Some(needle) = &cli.find {
-        out.push_str(&inspect::find_md(events, needle, cli.top, min_ts));
+        out.push_str(&inspect::find_md(events, needle, cli.tid, cli.top, min_ts));
     }
 
     print!("{}", out);
