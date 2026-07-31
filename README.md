@@ -2,6 +2,8 @@
 
 Chrome DevTools Performance trace analyzer with TUI. Parses `{ "traceEvents": [...] }` JSON and surfaces actionable performance insights.
 
+Accepts plain `.json` and gzipped `.json.gz` traces — a single file, or a directory (list / batch export).
+
 Chrome DevTools trace JSON files are massive and impractical to read by hand. chperf structures and summarizes the trace, then exports it as Markdown. Feed the exported result directly to an LLM like Claude Code for instant bottleneck identification and improvement suggestions.
 
 ![TUI Screenshot](capture.png)
@@ -20,6 +22,9 @@ Requires Rust 2024 edition (1.85+).
 # Single trace analysis (TUI)
 chperf trace.json
 
+# Gzipped traces are supported transparently (.json.gz)
+chperf trace.json.gz --export
+
 # Compare two traces
 chperf before.json --compare after.json
 
@@ -37,7 +42,46 @@ chperf before.json --compare after.json --export --summary
 
 # Manual CPU throttle override (auto-detected from trace metadata when available)
 chperf trace.json --throttle 6
+
+# Directory of traces: list them (pick a file to analyze further)
+chperf traces/
+
+# Batch-export every trace in a directory to `chperf-export-<name>.md` files
+chperf traces/ --export
 ```
+
+## Inspect
+
+Granular CLI inspection for questions the summary can't answer — scoped to a
+time window with `--around <ms>` + `--window <half_ms>` (ms from trace start).
+Output is Markdown, ready to paste to an LLM.
+
+```sh
+# List events by name, filtered by min duration (microseconds)
+chperf trace.json --events RunTask,FireAnimationFrame --min-dur 5000 --top 10
+
+# Same, but only within ±100ms around a timestamp (ms from trace start)
+chperf trace.json --events GPUTask,RunTask --around 11877674 --window 100
+
+# Aggregate CPU self-time for functions whose name contains a substring,
+# optionally within the window
+chperf trace.json --function render --around 11877674 --window 100
+
+# Search event args (JSON) for a substring, e.g. a marker name
+chperf trace.json --find setPlayerRespawned --top 20
+
+# Flags compose: combine --events + --function + --find in one run
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--events <a,b,…>` | List events matching these names |
+| `--function <substr>` | Aggregate CPU samples whose function name contains this |
+| `--find <substr>` | Search event `args` JSON (case-insensitive) |
+| `--around <ms>` | Center of the time window (ms from trace start) |
+| `--window <ms>` | Half-width of the window (default 100) |
+| `--min-dur <us>` | Only events with duration ≥ this (microseconds) |
+| `--top <n>` | Limit rows (default 30) |
 
 ## Features
 

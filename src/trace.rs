@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone)]
 pub struct TraceMetadata {
@@ -55,10 +55,17 @@ pub struct TraceEvent {
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
-    let mut trace: TraceFile = serde_json::from_reader(reader)?;
+    // Stream .gz through a gzip decoder so serde_json reads decompressed bytes
+    // without buffering the whole file in memory.
+    let trace: TraceFile = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        serde_json::from_reader(flate2::read::GzDecoder::new(reader))?
+    } else {
+        serde_json::from_reader(reader)?
+    };
+    let mut trace = trace;
 
     // Extract page URL from TracingStartedInBrowser event
-    if trace.metadata.is_some() || true {
+    {
         let meta = trace.metadata.get_or_insert_with(|| TraceMetadata {
             cpu_throttling: None,
             source: None,
@@ -119,4 +126,47 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
         .max_by_key(|(_, c)| *c)
         .map(|(tid, _)| tid)
         .unwrap_or(0)
+}
+
+/// Stable stem for a trace file: strips both `.json` and `.json.gz`.
+/// `Trace-20260731T180758.json.gz` -> `Trace-20260731T180758`.
+pub fn trace_stem(path: &Path) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let name = name.strip_suffix(".json").unwrap_or(name);
+    name.to_string()
+}
+
+/// Scan a directory for Chrome trace files (`*.json`, `*.json.gz`).
+/// When both `.json` and `.json.gz` exist for the same stem, keep only the
+/// `.json.gz` (smaller I/O). Sorted by name.
+pub fn list_traces(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut by_stem: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let is_gz = name.ends_with(".json.gz");
+        let is_plain = !is_gz && name.ends_with(".json");
+        if !is_gz && !is_plain {
+            continue;
+        }
+        let stem = trace_stem(&path);
+        match by_stem.get(&stem) {
+            // Prefer .gz: replace a plain entry when we meet its gz twin.
+            Some(existing) if existing.extension().and_then(|e| e.to_str()) == Some("gz") => {}
+            _ => {
+                by_stem.insert(stem, path);
+            }
+        }
+    }
+    Ok(by_stem.into_values().collect())
 }
