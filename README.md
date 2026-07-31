@@ -61,33 +61,41 @@ Output is Markdown, ready to paste to an LLM.
 chperf trace.json --names --top 20
 chperf trace.json --threads --top 20            # find the main/GPU thread tid
 
-# List events by name, filtered by min duration (microseconds) and thread
+# List events by name, filtered by min duration (microseconds), thread, process
 chperf trace.json --events RunTask,FireAnimationFrame --min-dur 5000 --top 10
 chperf trace.json --events GPUTask --tid 10033   # only on a specific thread
+chperf trace.json --events '^Fire' --regex       # names as regex
 
 # Same, but only within ±100ms around a timestamp (ms from trace start)
 chperf trace.json --events GPUTask,RunTask --around 11877674 --window 100
 
 # Aggregate CPU self-time for matching functions. Substring by default, or a
-# regex with --regex; optionally scoped to the window and/or thread.
+# regex with --regex; optionally scoped to the window/thread/process.
 chperf trace.json --function render --around 11877674 --window 100
 chperf trace.json --function '^_render' --regex
 
-# Search event args (JSON) for a substring, e.g. a marker name
-chperf trace.json --find setPlayerRespawned --top 20
+# Heaviest call stacks (root → leaf), with full caller chain. Filter leaves
+# with --function, scope with --around/--tid.
+chperf trace.json --stacks --function render --around 11877674 --window 100 --top 10
 
-# Flags compose: combine --events + --function + --find in one run
+# Search event args (JSON) for a substring or regex, e.g. a marker name
+chperf trace.json --find setPlayerRespawned --top 20
+chperf trace.json --find 'frame.*sampleTraceId' --regex
+
+# Flags compose: combine --names + --stacks + --function in one run
 ```
 
 | Flag | Purpose |
 |------|---------|
 | `--names` | List distinct event names with count/total duration |
 | `--threads` | List distinct threads (tid) with RunTask time and top event |
+| `--stacks` | Heaviest CPU call stacks (root → leaf) with caller chains |
 | `--events <a,b,…>` | List events matching these names |
 | `--function <pat>` | Aggregate CPU samples whose function name matches |
-| `--regex` | Treat `--function` as a regex instead of a substring |
-| `--find <substr>` | Search event `args` JSON (case-insensitive) |
-| `--tid <n>` | Restrict events/functions/find to this thread |
+| `--find <pat>` | Search event `args` JSON |
+| `--regex` | Treat `--events`/`--function`/`--find` as regex (not exact/substring) |
+| `--tid <n>` | Restrict to this thread |
+| `--pid <n>` | Restrict to this process |
 | `--around <ms>` | Center of the time window (ms from trace start) |
 | `--window <ms>` | Half-width of the window (default 100) |
 | `--min-dur <us>` | Only events with duration ≥ this (microseconds) |

@@ -70,6 +70,10 @@ struct Cli {
     #[arg(long)]
     tid: Option<u64>,
 
+    /// Inspect: restrict events/functions/find to this process id (pid)
+    #[arg(long)]
+    pid: Option<u64>,
+
     /// Inspect: list distinct event names with counts/total duration
     #[arg(long)]
     names: bool,
@@ -78,7 +82,11 @@ struct Cli {
     #[arg(long)]
     threads: bool,
 
-    /// Inspect: interpret --function as a regex instead of a substring
+    /// Inspect: heaviest CPU call stacks (root → leaf), heaviest first
+    #[arg(long)]
+    stacks: bool,
+
+    /// Inspect: interpret --function/--find/--events as regex instead of substring/exact
     #[arg(long)]
     regex: bool,
 }
@@ -91,6 +99,7 @@ impl Cli {
             || self.find.is_some()
             || self.names
             || self.threads
+            || self.stacks
     }
 }
 
@@ -207,8 +216,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_single(trace_path, cli.compare.as_deref().map(Path::new), &cli)
 }
 
-/// Granular inspection: events by name, CPU functions, or arg search, each
-/// optionally scoped to a time window. Prints Markdown to stdout.
+/// Granular inspection: events by name, CPU functions/stacks, or arg search,
+/// each scoped to a window/thread/process. Prints Markdown to stdout.
 fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
@@ -216,6 +225,11 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     let min_ts = inspect::trace_start_us(events);
     let window = inspect::window_us(cli.around, cli.window, min_ts);
     let min_dur_us = cli.min_dur.unwrap_or(0.0);
+    let scope = inspect::Scope {
+        window,
+        tid: cli.tid,
+        pid: cli.pid,
+    };
 
     let mut out = String::new();
     out.push_str(&format!("# chperf inspect: {}\n\n", trace::trace_stem(path)));
@@ -228,17 +242,11 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     }
 
     if cli.names {
-        out.push_str(&inspect::names_md(
-            events,
-            window,
-            cli.tid,
-            cli.top,
-            min_ts,
-        ));
+        out.push_str(&inspect::names_md(events, &scope, cli.top, min_ts));
     }
 
     if cli.threads {
-        out.push_str(&inspect::threads_md(events, window, cli.top, min_ts));
+        out.push_str(&inspect::threads_md(events, &scope, cli.top, min_ts));
     }
 
     if let Some(names_raw) = &cli.events {
@@ -247,31 +255,42 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        let filter = inspect::NameFilter::new(&names, cli.regex)?;
         out.push_str(&inspect::events_md(
             events,
-            &names,
-            window,
-            cli.tid,
+            &filter,
+            names_raw.trim(),
+            &scope,
             min_dur_us,
             cli.top,
             min_ts,
         ));
     }
 
-    if let Some(pattern) = &cli.function {
-        let matcher = inspect::Matcher::new(pattern, cli.regex)?;
-        out.push_str(&inspect::functions_md(
+    // Functions and stacks can share a single matcher (filter by name).
+    let func_matcher = if let Some(pattern) = &cli.function {
+        Some(inspect::Matcher::new(pattern, cli.regex)?)
+    } else {
+        None
+    };
+
+    if let Some(m) = &func_matcher {
+        out.push_str(&inspect::functions_md(events, m, &scope, cli.top, min_ts));
+    }
+
+    if cli.stacks {
+        out.push_str(&inspect::stacks_md(
             events,
-            &matcher,
-            window,
-            cli.tid,
+            func_matcher.as_ref(),
+            &scope,
             cli.top,
             min_ts,
         ));
     }
 
     if let Some(needle) = &cli.find {
-        out.push_str(&inspect::find_md(events, needle, cli.tid, cli.top, min_ts));
+        let m = inspect::Matcher::new(needle, cli.regex)?;
+        out.push_str(&inspect::find_md(events, &m, &scope, cli.top, min_ts));
     }
 
     print!("{}", out);

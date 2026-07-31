@@ -1,11 +1,13 @@
-//! Granular trace inspection: filter events by name/time-window, aggregate CPU
-//! samples by function (optionally within a window), and search event args.
+//! Granular trace inspection: filter events by name/thread/process/time-window,
+//! aggregate CPU samples by function and by call stack, and search event args.
 //!
 //! Output is Markdown so it can be piped to an LLM, mirroring `--export`.
 
 use crate::trace::TraceEvent;
 use serde_json::Value;
 use std::collections::HashMap;
+
+// ── Time helpers ──
 
 /// Absolute trace start (min `ts` across events), in microseconds.
 pub fn trace_start_us(events: &[TraceEvent]) -> f64 {
@@ -28,36 +30,6 @@ pub fn window_us(
 
 fn in_window(ts: f64, window: Option<(f64, f64)>) -> bool {
     window.is_none_or(|(lo, hi)| ts >= lo && ts <= hi)
-}
-
-/// Function-name matcher: case-insensitive substring or a regex.
-pub enum Matcher {
-    Substr(String),
-    Regex(regex::Regex),
-}
-
-impl Matcher {
-    pub fn new(pattern: &str, use_regex: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        if use_regex {
-            Ok(Matcher::Regex(regex::Regex::new(pattern)?))
-        } else {
-            Ok(Matcher::Substr(pattern.to_lowercase()))
-        }
-    }
-
-    fn matches(&self, name: &str) -> bool {
-        match self {
-            Matcher::Substr(p) => name.to_lowercase().contains(p),
-            Matcher::Regex(re) => re.is_match(name),
-        }
-    }
-
-    fn label(&self) -> String {
-        match self {
-            Matcher::Substr(p) => format!("`{}`", p),
-            Matcher::Regex(re) => format!("/{}/", re.as_str()),
-        }
-    }
 }
 
 fn fmt_ms(us: f64) -> String {
@@ -91,22 +63,108 @@ fn window_label(window: Option<(f64, f64)>) -> &'static str {
     }
 }
 
-/// List events matching one of `names`, filtered by window, thread, and min duration.
+// ── Filters ──
+
+/// Window + thread + process scope applied to every inspector.
+#[derive(Clone, Copy)]
+pub struct Scope {
+    pub window: Option<(f64, f64)>,
+    pub tid: Option<u64>,
+    pub pid: Option<u64>,
+}
+
+impl Scope {
+    pub fn allows_event(&self, e: &TraceEvent) -> bool {
+        in_window(e.ts, self.window)
+            && self.tid.is_none_or(|t| e.tid == t)
+            && self.pid.is_none_or(|p| e.pid == p)
+    }
+
+    fn window_line(&self, min_ts: f64) -> Option<String> {
+        self.window.map(|(lo, hi)| {
+            format!(
+                "- **Window**: {:.2}ms … {:.2}ms from trace start\n",
+                (lo - min_ts) / 1000.0,
+                (hi - min_ts) / 1000.0,
+            )
+        })
+    }
+}
+
+/// Function/string matcher: case-insensitive substring or a regex.
+pub enum Matcher {
+    Substr(String),
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    pub fn new(pattern: &str, use_regex: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        if use_regex {
+            Ok(Matcher::Regex(regex::Regex::new(pattern)?))
+        } else {
+            Ok(Matcher::Substr(pattern.to_lowercase()))
+        }
+    }
+
+    fn matches(&self, s: &str) -> bool {
+        match self {
+            Matcher::Substr(p) => s.to_lowercase().contains(p),
+            Matcher::Regex(re) => re.is_match(s),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Matcher::Substr(p) => format!("`{}`", p),
+            Matcher::Regex(re) => format!("/{}/", re.as_str()),
+        }
+    }
+}
+
+/// Event-name filter: exact names, or regexes (with `--regex`).
+pub enum NameFilter {
+    Exact(Vec<String>),
+    Regex(Vec<regex::Regex>),
+}
+
+impl NameFilter {
+    pub fn new(names: &[String], use_regex: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        if use_regex {
+            let rs = names
+                .iter()
+                .map(|n| regex::Regex::new(n))
+                .collect::<Result<_, _>>()?;
+            Ok(NameFilter::Regex(rs))
+        } else {
+            Ok(NameFilter::Exact(names.to_vec()))
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            NameFilter::Exact(v) => v.iter().any(|n| n == name),
+            NameFilter::Regex(v) => v.iter().any(|r| r.is_match(name)),
+        }
+    }
+}
+
+// ── Inspectors ──
+
+/// List events matching the filter, scoped and filtered by min duration.
 pub fn events_md(
     events: &[TraceEvent],
-    names: &[String],
-    window: Option<(f64, f64)>,
-    tid: Option<u64>,
+    filter: &NameFilter,
+    display: &str,
+    scope: &Scope,
     min_dur_us: f64,
     top: usize,
     min_ts: f64,
 ) -> String {
     let mut rows: Vec<&TraceEvent> = events
         .iter()
-        .filter(|e| names.iter().any(|n| n == &e.name))
-        .filter(|e| tid.map_or(true, |t| e.tid == t))
+        .filter(|e| filter.matches(&e.name))
         .filter(|e| e.dur.unwrap_or(0.0) >= min_dur_us)
-        .filter(|e| in_window(e.ts, window))
+        .filter(|e| scope.allows_event(e))
         .collect();
     rows.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
 
@@ -114,17 +172,13 @@ pub fn events_md(
     let mut out = String::new();
     out.push_str(&format!(
         "## Events: {} ({} matches, {})\n\n",
-        names.join(" | "),
+        display,
         total,
-        window_label(window),
+        window_label(scope.window),
     ));
-
-    if let Some((lo, hi)) = window {
-        out.push_str(&format!(
-            "- **Window**: {:.2}ms … {:.2}ms from trace start\n\n",
-            (lo - min_ts) / 1000.0,
-            (hi - min_ts) / 1000.0,
-        ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
     }
 
     if total == 0 {
@@ -132,33 +186,35 @@ pub fn events_md(
         return out;
     }
 
-    out.push_str("| # | t(ms) | dur(ms) | name | tid | args |\n");
-    out.push_str("|---|-------|---------|------|-----|------|\n");
+    out.push_str("| # | t(ms) | dur(ms) | name | tid | pid | args |\n");
+    out.push_str("|---|-------|---------|------|-----|-----|------|\n");
     for (i, e) in rows.iter().take(top).enumerate() {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             i + 1,
             fmt_ms(e.ts - min_ts),
             fmt_ms(e.dur.unwrap_or(0.0)),
             e.name,
             e.tid,
+            e.pid,
             args_compact(&e.args),
         ));
     }
     if total > top {
-        out.push_str(&format!("\n_Showing {} of {} matches (use --top to see more)._\n", top, total));
+        out.push_str(&format!(
+            "\n_Showing {} of {} matches (use --top to see more)._\n",
+            top, total
+        ));
     }
     out.push('\n');
     out
 }
 
-/// Aggregate CPU profile self-time for functions matching `matcher`,
-/// optionally restricted to a time window (chunk-granularity) and thread.
+/// Aggregate CPU profile self-time for functions matching `matcher`, scoped.
 pub fn functions_md(
     events: &[TraceEvent],
     matcher: &Matcher,
-    window: Option<(f64, f64)>,
-    tid: Option<u64>,
+    scope: &Scope,
     top: usize,
     min_ts: f64,
 ) -> String {
@@ -202,12 +258,8 @@ pub fn functions_md(
             }
         }
 
-        // Accumulate sample time only from chunks in window and on the
-        // requested thread.
-        if !in_window(e.ts, window) {
-            continue;
-        }
-        if !tid.map_or(true, |t| e.tid == t) {
+        // Accumulate sample time only from in-scope chunks.
+        if !scope.allows_event(e) {
             continue;
         }
         let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
@@ -236,14 +288,10 @@ pub fn functions_md(
         "## CPU Functions matching {} ({} functions, {})\n\n",
         matcher.label(),
         funcs.len(),
-        window_label(window),
+        window_label(scope.window),
     ));
-    if let Some((lo, hi)) = window {
-        out.push_str(&format!(
-            "- **Window**: {:.2}ms … {:.2}ms from trace start\n",
-            (lo - min_ts) / 1000.0,
-            (hi - min_ts) / 1000.0,
-        ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
     }
     out.push_str(&format!(
         "- **Matched self-time**: {}ms\n\n",
@@ -255,8 +303,8 @@ pub fn functions_md(
         return out;
     }
 
-    out.push_str("| # | function | self | % of window | file |\n");
-    out.push_str("|---|----------|------|-------------|------|\n");
+    out.push_str("| # | function | self | % in scope | file |\n");
+    out.push_str("|---|----------|------|------------|------|\n");
     for (i, (name, url, t)) in funcs.iter().take(top).enumerate() {
         let pct = if total_in_scope > 0.0 {
             t / total_in_scope * 100.0
@@ -278,31 +326,203 @@ pub fn functions_md(
     out
 }
 
-/// Search event `args` (JSON) for `needle` (case-insensitive) and list matches.
-pub fn find_md(
+/// Aggregate CPU sample time per leaf node and render each leaf's full call
+/// stack (root → leaf), heaviest first. Optionally filter leaves by `matcher`.
+pub fn stacks_md(
     events: &[TraceEvent],
-    needle: &str,
-    tid: Option<u64>,
+    matcher: Option<&Matcher>,
+    scope: &Scope,
     top: usize,
     min_ts: f64,
 ) -> String {
-    let nl = needle.to_lowercase();
-    let mut matches: Vec<(&TraceEvent, String)> = Vec::new();
+    // node id -> (name, url, parent)
+    let mut node_map: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
+    let mut leaf_time: HashMap<u64, f64> = HashMap::new();
 
     for e in events {
-        if !tid.map_or(true, |t| e.tid == t) {
+        if e.name != "ProfileChunk" {
+            continue;
+        }
+        let args = match &e.args {
+            Some(a) => a,
+            None => continue,
+        };
+        let data = match args.get("data") {
+            Some(d) => d,
+            None => continue,
+        };
+        let cpu_profile = match data.get("cpuProfile") {
+            Some(cp) => cp,
+            None => continue,
+        };
+
+        if let Some(nodes) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
+            for node in nodes {
+                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let call_frame = node.get("callFrame");
+                let func_name = call_frame
+                    .and_then(|cf| cf.get("functionName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(anonymous)")
+                    .to_string();
+                let url = call_frame
+                    .and_then(|cf| cf.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let parent = node.get("parent").and_then(|v| v.as_u64());
+                node_map.entry(id).or_insert((func_name, url, parent));
+            }
+        }
+
+        if !scope.allows_event(e) {
+            continue;
+        }
+        let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
+        let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
+        if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
+            for (sample, delta) in samples.iter().zip(deltas.iter()) {
+                let node_id = sample.as_u64().unwrap_or(0);
+                let dt = delta.as_f64().unwrap_or(0.0);
+                *leaf_time.entry(node_id).or_default() += dt;
+            }
+        }
+    }
+
+    // Filter leaves by name matcher, if any.
+    let mut leaves: Vec<(u64, f64)> = leaf_time
+        .into_iter()
+        .filter(|(id, _)| match matcher {
+            Some(m) => node_map
+                .get(id)
+                .map(|(n, _, _)| m.matches(n))
+                .unwrap_or(false),
+            None => true,
+        })
+        .collect();
+    let total_matched: f64 = leaves.iter().map(|(_, t)| *t).sum();
+    leaves.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let mut out = String::new();
+    let filter_desc = match matcher {
+        Some(m) => format!("leaf ~ {}", m.label()),
+        None => "all leaves".to_string(),
+    };
+    out.push_str(&format!(
+        "## Heaviest call stacks ({} leaves, {}, {})\n\n",
+        leaves.len(),
+        filter_desc,
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+    }
+
+    if leaves.is_empty() {
+        out.push_str("No matching stacks.\n\n");
+        return out;
+    }
+
+    let grand_total: f64 = leaves.iter().map(|(_, t)| *t).sum();
+    for (rank, (id, t)) in leaves.iter().take(top).enumerate() {
+        let (name, url, _parent) = match node_map.get(id) {
+            Some(n) => (n.0.as_str().to_string(), n.1.clone(), n.2),
+            None => (
+                "(unknown)".to_string(),
+                String::new(),
+                None,
+            ),
+        };
+        // Reconstruct root → leaf chain by walking parents.
+        let mut chain_ids: Vec<u64> = Vec::new();
+        let mut cur = Some(*id);
+        while let Some(cid) = cur {
+            chain_ids.push(cid);
+            cur = node_map.get(&cid).and_then(|n| n.2);
+        }
+        chain_ids.reverse();
+
+        let names: Vec<String> = chain_ids
+            .iter()
+            .map(|cid| {
+                node_map
+                    .get(cid)
+                    .map(|(n, _, _)| {
+                        if n.is_empty() {
+                            "(anonymous)".to_string()
+                        } else {
+                            n.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            })
+            .collect();
+
+        let depth = names.len();
+        let pct = if grand_total > 0.0 {
+            t / grand_total * 100.0
+        } else {
+            0.0
+        };
+        // Abbreviate long chains: keep first 2 and last 10.
+        let display_chain = if depth > 14 {
+            let head: Vec<&str> = names[..2].iter().map(|s| s.as_str()).collect();
+            let tail: Vec<&str> = names[depth - 10..].iter().map(|s| s.as_str()).collect();
+            format!("{} → … → {}", head.join(" → "), tail.join(" → "))
+        } else {
+            names.join(" → ")
+        };
+
+        let short_url = url.rfind('/').map(|i| &url[i + 1..]).unwrap_or(&url).to_string();
+        let leaf_label = if name.is_empty() { "(anonymous)" } else { &name };
+
+        out.push_str(&format!(
+            "### #{}  {}ms ({:.1}% of matched)  depth {}\n",
+            rank + 1,
+            fmt_ms(*t),
+            pct,
+            depth,
+        ));
+        out.push_str(&format!("- **leaf**: `{}` _{}_ \n", leaf_label, short_url));
+        out.push_str(&format!("- **stack**: {}\n\n", display_chain));
+    }
+    let _ = total_matched;
+    out
+}
+
+/// Search event `args` (JSON) for `matcher` and list matches.
+pub fn find_md(
+    events: &[TraceEvent],
+    matcher: &Matcher,
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> String {
+    let mut matches: Vec<(&TraceEvent, String)> = Vec::new();
+
+    let needle_label = matcher.label();
+    for e in events {
+        if !scope.allows_event(e) {
             continue;
         }
         let s = match &e.args {
             Some(v) => serde_json::to_string(v).unwrap_or_default(),
             None => continue,
         };
-        if let Some(idx) = s.to_lowercase().find(&nl) {
-            // Snippet: ~60 chars around the match.
-            let chars: Vec<char> = s.chars().collect();
-            let start = idx.saturating_sub(60);
-            let end = (idx + nl.len() + 60).min(chars.len());
-            let snippet: String = chars[start..end].iter().collect();
+        // For substring matchers, locate the (case-insensitive) hit for a snippet.
+        if matcher.matches(&s) {
+            let snippet = match matcher {
+                Matcher::Substr(p) => {
+                    let idx = s.to_lowercase().find(p).unwrap_or(0);
+                    snippet_around(&s, idx, p.len())
+                }
+                Matcher::Regex(re) => {
+                    let m = re.find(&s);
+                    let idx = m.as_ref().map(|m| m.start()).unwrap_or(0);
+                    let len = m.map(|m| m.len()).unwrap_or(0);
+                    snippet_around(&s, idx, len)
+                }
+            };
             matches.push((e, snippet));
         }
     }
@@ -312,10 +532,8 @@ pub fn find_md(
 
     let mut out = String::new();
     out.push_str(&format!(
-        "## Find `{}` in event args ({} matches{})\n\n",
-        needle,
-        total,
-        tid.map_or(String::new(), |t| format!(", tid={}", t)),
+        "## Find {} in event args ({} matches)\n\n",
+        needle_label, total,
     ));
 
     if total == 0 {
@@ -346,18 +564,18 @@ pub fn find_md(
     out
 }
 
-/// Discovery: distinct event names with count and total duration, scoped to the
-/// window/thread. Sorted by total duration descending.
-pub fn names_md(
-    events: &[TraceEvent],
-    window: Option<(f64, f64)>,
-    tid: Option<u64>,
-    top: usize,
-    min_ts: f64,
-) -> String {
+fn snippet_around(s: &str, idx: usize, len: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = idx.saturating_sub(60);
+    let end = (idx + len + 60).min(chars.len());
+    chars[start..end].iter().collect()
+}
+
+/// Discovery: distinct event names with count and total duration, scoped.
+pub fn names_md(events: &[TraceEvent], scope: &Scope, top: usize, min_ts: f64) -> String {
     let mut stats: HashMap<String, (usize, f64)> = HashMap::new();
     for e in events {
-        if !tid.map_or(true, |t| e.tid == t) || !in_window(e.ts, window) {
+        if !scope.allows_event(e) {
             continue;
         }
         let entry = stats.entry(e.name.clone()).or_default();
@@ -365,7 +583,10 @@ pub fn names_md(
         entry.1 += e.dur.unwrap_or(0.0);
     }
 
-    let mut rows: Vec<(String, usize, f64)> = stats.into_iter().map(|(n, (c, d))| (n, c, d)).collect();
+    let mut rows: Vec<(String, usize, f64)> = stats
+        .into_iter()
+        .map(|(n, (c, d))| (n, c, d))
+        .collect();
     rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     let total = rows.len();
 
@@ -373,14 +594,11 @@ pub fn names_md(
     out.push_str(&format!(
         "## Event names ({} distinct, {})\n\n",
         total,
-        window_label(window),
+        window_label(scope.window),
     ));
-    if let Some((lo, hi)) = window {
-        out.push_str(&format!(
-            "- **Window**: {:.2}ms … {:.2}ms from trace start\n\n",
-            (lo - min_ts) / 1000.0,
-            (hi - min_ts) / 1000.0,
-        ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
     }
     if total == 0 {
         out.push_str("No events.\n\n");
@@ -411,16 +629,11 @@ pub fn names_md(
 }
 
 /// Discovery: distinct threads (tid) with event count, RunTask total duration,
-/// and the most frequent event name. Scoped to the window.
-pub fn threads_md(
-    events: &[TraceEvent],
-    window: Option<(f64, f64)>,
-    top: usize,
-    min_ts: f64,
-) -> String {
+/// and the most frequent event name. Scoped.
+pub fn threads_md(events: &[TraceEvent], scope: &Scope, top: usize, min_ts: f64) -> String {
     let mut tids: HashMap<u64, (usize, f64, HashMap<String, usize>)> = HashMap::new();
     for e in events {
-        if !in_window(e.ts, window) {
+        if !scope.allows_event(e) {
             continue;
         }
         let entry = tids.entry(e.tid).or_default();
@@ -449,14 +662,11 @@ pub fn threads_md(
     out.push_str(&format!(
         "## Threads ({} distinct, {})\n\n",
         total,
-        window_label(window),
+        window_label(scope.window),
     ));
-    if let Some((lo, hi)) = window {
-        out.push_str(&format!(
-            "- **Window**: {:.2}ms … {:.2}ms from trace start\n\n",
-            (lo - min_ts) / 1000.0,
-            (hi - min_ts) / 1000.0,
-        ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
     }
     if total == 0 {
         out.push_str("No threads.\n\n");
