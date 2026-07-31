@@ -95,6 +95,11 @@ chperf trace.json --task --around 11877674 --window 500 --top 3
 chperf trace.json --find setPlayerRespawned --top 20 --full-args
 chperf trace.json --find 'frame.*sampleTraceId' --regex
 
+# Machine-readable JSON for jq / pipelines (every inspector supports it;
+# durations in µs, args emitted as parsed objects).
+chperf trace.json --function render --top 10 --json | jq '.sections.functions[0]'
+chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].args'
+
 # Flags compose: combine --names + --stacks + --function in one run
 ```
 
@@ -112,6 +117,7 @@ chperf trace.json --find 'frame.*sampleTraceId' --regex
 | `--function <pat>` | Aggregate CPU samples whose function name matches |
 | `--find <pat>` | Search event `args` JSON |
 | `--regex` | Treat `--events`/`--function`/`--find` as regex (not exact/substring) |
+| `--json` | Emit JSON (for jq/pipelines) instead of Markdown |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |
 | `--pid <n>` | Restrict to this process |

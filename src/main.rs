@@ -125,6 +125,10 @@ struct Cli {
     /// Inspect: interpret --function/--find/--events as regex instead of substring/exact
     #[arg(long)]
     regex: bool,
+
+    /// Inspect: emit JSON (for jq/pipelines) instead of Markdown
+    #[arg(long)]
+    json: bool,
 }
 
 impl Cli {
@@ -318,40 +322,35 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     };
     let min_dur_us = cli.min_dur.unwrap_or(0.0);
 
-    let mut out = String::new();
-    out.push_str(&format!("# chperf inspect: {}\n\n", trace::trace_stem(path)));
-    if let Some(ref note) = anchor_note {
-        out.push_str(&format!("**{}**\n\n", note));
-    }
-    if let Some((lo, hi)) = window {
-        out.push_str(&format!(
-            "**Window**: {:.2}ms … {:.2}ms from trace start\n\n",
-            (lo - min_ts) / 1000.0,
-            (hi - min_ts) / 1000.0,
-        ));
-    }
-
-    // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown).
+    // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown/json).
     if cli.flame {
-        let matcher = cli.function.as_deref().map(|p| inspect::Matcher::new(p, cli.regex)).transpose()?;
+        let matcher = cli
+            .function
+            .as_deref()
+            .map(|p| inspect::Matcher::new(p, cli.regex))
+            .transpose()?;
         print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &scope));
         return Ok(());
     }
 
+    // Collect sections as (key, markdown, json) triples.
+    let mut sections: Vec<(&'static str, String, serde_json::Value)> = Vec::new();
+
     if cli.timeline {
-        out.push_str(&inspect::timeline_md(events, &scope, cli.bucket, min_ts));
+        let (m, j) = inspect::timeline_section(events, &scope, cli.bucket, min_ts);
+        sections.push(("timeline", m, j));
     }
-
     if cli.task {
-        out.push_str(&inspect::task_md(events, &scope, cli.top, min_ts));
+        let (m, j) = inspect::task_section(events, &scope, cli.top, min_ts);
+        sections.push(("task", m, j));
     }
-
     if cli.names {
-        out.push_str(&inspect::names_md(events, &scope, sort, cli.top, min_ts));
+        let (m, j) = inspect::names_section(events, &scope, sort, cli.top, min_ts);
+        sections.push(("names", m, j));
     }
-
     if cli.threads {
-        out.push_str(&inspect::threads_md(events, &scope, cli.top, min_ts));
+        let (m, j) = inspect::threads_section(events, &scope, cli.top, min_ts);
+        sections.push(("threads", m, j));
     }
 
     if let Some(names_raw) = &cli.events {
@@ -361,17 +360,10 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
             .filter(|s| !s.is_empty())
             .collect();
         let filter = inspect::NameFilter::new(&names, cli.regex)?;
-        if cli.stats {
-            out.push_str(&inspect::stats_md(
-                events,
-                &filter,
-                names_raw.trim(),
-                &scope,
-                min_dur_us,
-                min_ts,
-            ));
+        let (m, j) = if cli.stats {
+            inspect::stats_section(events, &filter, names_raw.trim(), &scope, min_dur_us, min_ts)
         } else {
-            out.push_str(&inspect::events_md(
+            inspect::events_section(
                 events,
                 &filter,
                 names_raw.trim(),
@@ -381,8 +373,9 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
                 cli.full_args,
                 cli.top,
                 min_ts,
-            ));
-        }
+            )
+        };
+        sections.push((if cli.stats { "stats" } else { "events" }, m, j));
     }
 
     // Functions and stacks can share a single matcher (filter by name).
@@ -391,39 +384,25 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     } else {
         None
     };
-
     if let Some(m) = &func_matcher {
-        out.push_str(&inspect::functions_md(events, m, &scope, cli.top, min_ts));
+        let (md, j) = inspect::functions_section(events, m, &scope, cli.top, min_ts);
+        sections.push(("functions", md, j));
     }
-
     if cli.stacks {
-        out.push_str(&inspect::stacks_md(
-            events,
-            func_matcher.as_ref(),
-            &scope,
-            cli.top,
-            min_ts,
-        ));
+        let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), &scope, cli.top, min_ts);
+        sections.push(("stacks", md, j));
     }
-
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
-        out.push_str(&inspect::find_md(events, &m, &scope, cli.full_args, cli.top, min_ts));
+        let (md, j) = inspect::find_section(events, &m, &scope, cli.full_args, cli.top, min_ts);
+        sections.push(("find", md, j));
     }
 
     // --worst with no other section: default to listing RunTask around the anchor.
-    if cli.worst
-        && !cli.timeline
-        && !cli.names
-        && !cli.threads
-        && cli.events.is_none()
-        && cli.function.is_none()
-        && !cli.stacks
-        && cli.find.is_none()
-    {
+    if cli.worst && sections.is_empty() {
         let names = vec!["RunTask".to_string()];
         let filter = inspect::NameFilter::new(&names, false)?;
-        out.push_str(&inspect::events_md(
+        let (md, j) = inspect::events_section(
             events,
             &filter,
             "RunTask",
@@ -433,10 +412,51 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
             cli.full_args,
             cli.top,
             min_ts,
-        ));
+        );
+        sections.push(("events", md, j));
     }
 
-    print!("{}", out);
+    // Dispatch output format.
+    if cli.json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("trace".into(), serde_json::json!(trace::trace_stem(path)));
+        if let Some(ref note) = anchor_note {
+            obj.insert("anchor".into(), serde_json::json!(note));
+        }
+        obj.insert(
+            "window".into(),
+            match window {
+                Some((lo, hi)) => serde_json::json!([
+                    ((lo - min_ts) / 1000.0).round(),
+                    ((hi - min_ts) / 1000.0).round(),
+                ]),
+                None => serde_json::Value::Null,
+            },
+        );
+        let mut secs = serde_json::Map::new();
+        for (k, _, j) in &sections {
+            secs.insert((*k).into(), j.clone());
+        }
+        obj.insert("sections".into(), serde_json::Value::Object(secs));
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
+    } else {
+        let mut out = String::new();
+        out.push_str(&format!("# chperf inspect: {}\n\n", trace::trace_stem(path)));
+        if let Some(ref note) = anchor_note {
+            out.push_str(&format!("**{}**\n\n", note));
+        }
+        if let Some((lo, hi)) = window {
+            out.push_str(&format!(
+                "**Window**: {:.2}ms … {:.2}ms from trace start\n\n",
+                (lo - min_ts) / 1000.0,
+                (hi - min_ts) / 1000.0,
+            ));
+        }
+        for (_, m, _) in &sections {
+            out.push_str(m);
+        }
+        print!("{}", out);
+    }
     Ok(())
 }
 
