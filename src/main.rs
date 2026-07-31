@@ -66,13 +66,17 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     top: usize,
 
-    /// Inspect: restrict events/functions/find to this thread id (tid)
+    /// Inspect: restrict events/functions/find to this thread (numeric tid or "main")
     #[arg(long)]
-    tid: Option<u64>,
+    tid: Option<String>,
 
     /// Inspect: restrict events/functions/find to this process id (pid)
     #[arg(long)]
     pid: Option<u64>,
+
+    /// Inspect: restrict to events whose category (cat) contains this substring
+    #[arg(long)]
+    cat: Option<String>,
 
     /// Inspect: list distinct event names with counts/total duration
     #[arg(long)]
@@ -85,6 +89,30 @@ struct Cli {
     /// Inspect: heaviest CPU call stacks (root → leaf), heaviest first
     #[arg(long)]
     stacks: bool,
+
+    /// Inspect: busy timeline (RunTask per time bucket)
+    #[arg(long)]
+    timeline: bool,
+
+    /// Inspect: timeline bucket size in ms (default auto ~40 buckets, 10-500ms)
+    #[arg(long)]
+    bucket: Option<f64>,
+
+    /// Inspect: duration distribution table instead of event list (use with --events)
+    #[arg(long)]
+    stats: bool,
+
+    /// Inspect: auto-anchor --around on the worst (longest) RunTask
+    #[arg(long)]
+    worst: bool,
+
+    /// Inspect: sort order for --events/--names (ts, dur, name, count)
+    #[arg(long)]
+    sort: Option<String>,
+
+    /// Inspect: print full event args (no truncation) for --events/--find
+    #[arg(long)]
+    full_args: bool,
 
     /// Inspect: interpret --function/--find/--events as regex instead of substring/exact
     #[arg(long)]
@@ -100,6 +128,8 @@ impl Cli {
             || self.names
             || self.threads
             || self.stacks
+            || self.timeline
+            || self.worst
     }
 }
 
@@ -216,23 +246,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_single(trace_path, cli.compare.as_deref().map(Path::new), &cli)
 }
 
-/// Granular inspection: events by name, CPU functions/stacks, or arg search,
-/// each scoped to a window/thread/process. Prints Markdown to stdout.
+/// Granular inspection: events/functions/stacks/timeline/args, each scoped to a
+/// window/thread/process/category. Prints Markdown to stdout.
 fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
     let events = &trace.trace_events;
     let min_ts = inspect::trace_start_us(events);
-    let window = inspect::window_us(cli.around, cli.window, min_ts);
-    let min_dur_us = cli.min_dur.unwrap_or(0.0);
+
+    // Resolve --tid (numeric or "main" → auto-detected main thread).
+    let tid = match &cli.tid {
+        None => None,
+        Some(s) if s == "main" => Some(trace::detect_main_thread(events)),
+        Some(s) => Some(s.parse::<u64>().map_err(|e| {
+            format!("invalid --tid `{}` (use a number or \"main\"): {}", s, e)
+        })?),
+    };
+
+    // Pre-window scope (for --worst search): tid/pid/cat, no window.
+    let scope_nowin = inspect::Scope {
+        window: None,
+        tid,
+        pid: cli.pid,
+        cat: cli.cat.as_deref().map(|c| c.to_lowercase()),
+    };
+
+    // Determine the time anchor: --worst finds the longest RunTask, else --around.
+    let mut anchor_note: Option<String> = None;
+    let (around_ms, window_ms) = if cli.worst {
+        match inspect::worst_runtask(events, &scope_nowin) {
+            Some((ts, dur)) => {
+                let a = (ts - min_ts) / 1000.0;
+                let w = cli.window.unwrap_or_else(|| (dur / 1000.0 / 2.0).max(50.0));
+                anchor_note = Some(format!(
+                    "Anchored at worst RunTask: t={:.2}ms, dur={:.2}ms (window ±{:.0}ms)",
+                    a,
+                    dur / 1000.0,
+                    w
+                ));
+                (Some(a), Some(w))
+            }
+            None => (cli.around, cli.window),
+        }
+    } else {
+        (cli.around, cli.window)
+    };
+
+    let window = inspect::window_us(around_ms, window_ms, min_ts);
     let scope = inspect::Scope {
         window,
-        tid: cli.tid,
+        tid,
         pid: cli.pid,
+        cat: scope_nowin.cat.clone(),
     };
+
+    let sort = match cli.sort.as_deref() {
+        Some("dur") => inspect::Sort::Dur,
+        Some("name") => inspect::Sort::Name,
+        Some("count") => inspect::Sort::Count,
+        _ => inspect::Sort::Ts,
+    };
+    let min_dur_us = cli.min_dur.unwrap_or(0.0);
 
     let mut out = String::new();
     out.push_str(&format!("# chperf inspect: {}\n\n", trace::trace_stem(path)));
+    if let Some(ref note) = anchor_note {
+        out.push_str(&format!("**{}**\n\n", note));
+    }
     if let Some((lo, hi)) = window {
         out.push_str(&format!(
             "**Window**: {:.2}ms … {:.2}ms from trace start\n\n",
@@ -241,8 +321,12 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         ));
     }
 
+    if cli.timeline {
+        out.push_str(&inspect::timeline_md(events, &scope, cli.bucket, min_ts));
+    }
+
     if cli.names {
-        out.push_str(&inspect::names_md(events, &scope, cli.top, min_ts));
+        out.push_str(&inspect::names_md(events, &scope, sort, cli.top, min_ts));
     }
 
     if cli.threads {
@@ -256,15 +340,28 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
             .filter(|s| !s.is_empty())
             .collect();
         let filter = inspect::NameFilter::new(&names, cli.regex)?;
-        out.push_str(&inspect::events_md(
-            events,
-            &filter,
-            names_raw.trim(),
-            &scope,
-            min_dur_us,
-            cli.top,
-            min_ts,
-        ));
+        if cli.stats {
+            out.push_str(&inspect::stats_md(
+                events,
+                &filter,
+                names_raw.trim(),
+                &scope,
+                min_dur_us,
+                min_ts,
+            ));
+        } else {
+            out.push_str(&inspect::events_md(
+                events,
+                &filter,
+                names_raw.trim(),
+                &scope,
+                min_dur_us,
+                sort,
+                cli.full_args,
+                cli.top,
+                min_ts,
+            ));
+        }
     }
 
     // Functions and stacks can share a single matcher (filter by name).
@@ -290,7 +387,32 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
 
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
-        out.push_str(&inspect::find_md(events, &m, &scope, cli.top, min_ts));
+        out.push_str(&inspect::find_md(events, &m, &scope, cli.full_args, cli.top, min_ts));
+    }
+
+    // --worst with no other section: default to listing RunTask around the anchor.
+    if cli.worst
+        && !cli.timeline
+        && !cli.names
+        && !cli.threads
+        && cli.events.is_none()
+        && cli.function.is_none()
+        && !cli.stacks
+        && cli.find.is_none()
+    {
+        let names = vec!["RunTask".to_string()];
+        let filter = inspect::NameFilter::new(&names, false)?;
+        out.push_str(&inspect::events_md(
+            events,
+            &filter,
+            "RunTask",
+            &scope,
+            0.0,
+            inspect::Sort::Dur,
+            cli.full_args,
+            cli.top,
+            min_ts,
+        ));
     }
 
     print!("{}", out);

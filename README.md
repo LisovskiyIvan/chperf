@@ -57,29 +57,35 @@ time window with `--around <ms>` + `--window <half_ms>` (ms from trace start).
 Output is Markdown, ready to paste to an LLM.
 
 ```sh
-# Discovery: what event names / threads exist? Start here, then drill in.
+# Where is the jank? Start with a timeline, or jump straight to the worst task.
+chperf trace.json --timeline                     # busy% per time bucket
+chperf trace.json --timeline --around 11877674 --window 2000
+chperf trace.json --worst --stacks --top 10      # auto-anchor on longest RunTask
+
+# Discovery: what event names / threads exist?
 chperf trace.json --names --top 20
-chperf trace.json --threads --top 20            # find the main/GPU thread tid
+chperf trace.json --threads --top 20             # find the main/GPU thread tid
 
-# List events by name, filtered by min duration (microseconds), thread, process
-chperf trace.json --events RunTask,FireAnimationFrame --min-dur 5000 --top 10
-chperf trace.json --events GPUTask --tid 10033   # only on a specific thread
-chperf trace.json --events '^Fire' --regex       # names as regex
+# List events by name, filtered by min duration/thread/process, sorted by duration
+chperf trace.json --events RunTask --sort dur --top 10      # top spikes
+chperf trace.json --events GPUTask --tid 10033             # only on a thread
+chperf trace.json --events '^Fire' --regex                 # names as regex
 
-# Same, but only within ±100ms around a timestamp (ms from trace start)
+# How bad is it? Duration distribution per event name.
+chperf trace.json --events RunTask,FunctionCall --stats
+
+# Within ±100ms around a timestamp (ms from trace start)
 chperf trace.json --events GPUTask,RunTask --around 11877674 --window 100
 
-# Aggregate CPU self-time for matching functions. Substring by default, or a
-# regex with --regex; optionally scoped to the window/thread/process.
-chperf trace.json --function render --around 11877674 --window 100
+# Aggregate CPU self-time for matching functions; --tid main targets main thread.
+chperf trace.json --function render --tid main --around 11877674 --window 100
 chperf trace.json --function '^_render' --regex
 
-# Heaviest call stacks (root → leaf), with full caller chain. Filter leaves
-# with --function, scope with --around/--tid.
-chperf trace.json --stacks --function render --around 11877674 --window 100 --top 10
+# Heaviest call stacks (root → leaf) with full caller chain.
+chperf trace.json --stacks --function render --around 11877674 --window 100
 
-# Search event args (JSON) for a substring or regex, e.g. a marker name
-chperf trace.json --find setPlayerRespawned --top 20
+# Search event args (substring or regex); --full-args disables truncation.
+chperf trace.json --find setPlayerRespawned --top 20 --full-args
 chperf trace.json --find 'frame.*sampleTraceId' --regex
 
 # Flags compose: combine --names + --stacks + --function in one run
@@ -87,19 +93,26 @@ chperf trace.json --find 'frame.*sampleTraceId' --regex
 
 | Flag | Purpose |
 |------|---------|
+| `--timeline` | Busy timeline (RunTask per time bucket, with bars) |
+| `--worst` | Auto-anchor `--around` on the longest RunTask |
 | `--names` | List distinct event names with count/total duration |
 | `--threads` | List distinct threads (tid) with RunTask time and top event |
 | `--stacks` | Heaviest CPU call stacks (root → leaf) with caller chains |
 | `--events <a,b,…>` | List events matching these names |
+| `--stats` | Duration distribution (min/avg/p50/p90/p99/max) per event name |
 | `--function <pat>` | Aggregate CPU samples whose function name matches |
 | `--find <pat>` | Search event `args` JSON |
 | `--regex` | Treat `--events`/`--function`/`--find` as regex (not exact/substring) |
-| `--tid <n>` | Restrict to this thread |
+| `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
+| `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |
 | `--pid <n>` | Restrict to this process |
+| `--cat <substr>` | Restrict to events whose category contains this |
+| `--full-args` | Print full event `args` (no truncation) for `--events`/`--find` |
 | `--around <ms>` | Center of the time window (ms from trace start) |
 | `--window <ms>` | Half-width of the window (default 100) |
 | `--min-dur <us>` | Only events with duration ≥ this (microseconds) |
 | `--top <n>` | Limit rows (default 30) |
+| `--bucket <ms>` | Timeline bucket size (default auto ~40 buckets, 10–500ms) |
 
 ## Features
 
