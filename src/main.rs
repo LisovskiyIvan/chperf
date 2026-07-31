@@ -90,6 +90,14 @@ struct Cli {
     #[arg(long)]
     stacks: bool,
 
+    /// Inspect: folded stacks (`a;b;c <us>`) for flamegraph.pl / speedscope
+    #[arg(long)]
+    flame: bool,
+
+    /// Inspect: break down the heaviest RunTasks into their child events
+    #[arg(long)]
+    task: bool,
+
     /// Inspect: busy timeline (RunTask per time bucket)
     #[arg(long)]
     timeline: bool,
@@ -128,6 +136,8 @@ impl Cli {
             || self.names
             || self.threads
             || self.stacks
+            || self.flame
+            || self.task
             || self.timeline
             || self.worst
     }
@@ -321,8 +331,19 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         ));
     }
 
+    // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown).
+    if cli.flame {
+        let matcher = cli.function.as_deref().map(|p| inspect::Matcher::new(p, cli.regex)).transpose()?;
+        print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &scope));
+        return Ok(());
+    }
+
     if cli.timeline {
         out.push_str(&inspect::timeline_md(events, &scope, cli.bucket, min_ts));
+    }
+
+    if cli.task {
+        out.push_str(&inspect::task_md(events, &scope, cli.top, min_ts));
     }
 
     if cli.names {

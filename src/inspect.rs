@@ -446,59 +446,9 @@ pub fn stacks_md(
     top: usize,
     min_ts: f64,
 ) -> String {
-    // node id -> (name, url, parent)
-    let mut node_map: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-    let mut leaf_time: HashMap<u64, f64> = HashMap::new();
-
-    for e in events {
-        if e.name != "ProfileChunk" {
-            continue;
-        }
-        let args = match &e.args {
-            Some(a) => a,
-            None => continue,
-        };
-        let data = match args.get("data") {
-            Some(d) => d,
-            None => continue,
-        };
-        let cpu_profile = match data.get("cpuProfile") {
-            Some(cp) => cp,
-            None => continue,
-        };
-
-        if let Some(nodes) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
-            for node in nodes {
-                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                let call_frame = node.get("callFrame");
-                let func_name = call_frame
-                    .and_then(|cf| cf.get("functionName"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(anonymous)")
-                    .to_string();
-                let url = call_frame
-                    .and_then(|cf| cf.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let parent = node.get("parent").and_then(|v| v.as_u64());
-                node_map.entry(id).or_insert((func_name, url, parent));
-            }
-        }
-
-        if !scope.allows_event(e) {
-            continue;
-        }
-        let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
-        let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
-        if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
-            for (sample, delta) in samples.iter().zip(deltas.iter()) {
-                let node_id = sample.as_u64().unwrap_or(0);
-                let dt = delta.as_f64().unwrap_or(0.0);
-                *leaf_time.entry(node_id).or_default() += dt;
-            }
-        }
-    }
+    let cpu = collect_cpu_profile(events, scope);
+    let node_map = cpu.nodes;
+    let leaf_time = cpu.leaf_time;
 
     let mut leaves: Vec<(u64, f64)> = leaf_time
         .into_iter()
@@ -874,4 +824,216 @@ pub fn worst_runtask(events: &[TraceEvent], scope: &Scope) -> Option<(f64, f64)>
         .filter(|e| e.name == "RunTask" && e.ph == "X" && scope.allows_event(e))
         .filter_map(|e| e.dur.map(|d| (e.ts, d)))
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+}
+
+// ── CPU profile collection (shared by stacks + flame) ──
+
+/// node id -> (name, url, parent)
+pub struct CpuProfile {
+    pub nodes: HashMap<u64, (String, String, Option<u64>)>,
+    pub leaf_time: HashMap<u64, f64>,
+}
+
+/// Register all CPU profile nodes, and accumulate per-leaf sample time from
+/// in-scope chunks. Shared by `stacks_md` and `stacks_folded`.
+pub fn collect_cpu_profile(events: &[TraceEvent], scope: &Scope) -> CpuProfile {
+    let mut nodes: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
+    let mut leaf_time: HashMap<u64, f64> = HashMap::new();
+
+    for e in events {
+        if e.name != "ProfileChunk" {
+            continue;
+        }
+        let args = match &e.args {
+            Some(a) => a,
+            None => continue,
+        };
+        let data = match args.get("data") {
+            Some(d) => d,
+            None => continue,
+        };
+        let cpu_profile = match data.get("cpuProfile") {
+            Some(cp) => cp,
+            None => continue,
+        };
+
+        if let Some(node_arr) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
+            for node in node_arr {
+                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let call_frame = node.get("callFrame");
+                let func_name = call_frame
+                    .and_then(|cf| cf.get("functionName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(anonymous)")
+                    .to_string();
+                let url = call_frame
+                    .and_then(|cf| cf.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let parent = node.get("parent").and_then(|v| v.as_u64());
+                nodes.entry(id).or_insert((func_name, url, parent));
+            }
+        }
+
+        if !scope.allows_event(e) {
+            continue;
+        }
+        let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
+        let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
+        if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
+            for (sample, delta) in samples.iter().zip(deltas.iter()) {
+                let node_id = sample.as_u64().unwrap_or(0);
+                let dt = delta.as_f64().unwrap_or(0.0);
+                *leaf_time.entry(node_id).or_default() += dt;
+            }
+        }
+    }
+
+    CpuProfile { nodes, leaf_time }
+}
+
+fn node_chain_names(nodes: &HashMap<u64, (String, String, Option<u64>)>, leaf: u64) -> Vec<String> {
+    let mut ids: Vec<u64> = Vec::new();
+    let mut cur = Some(leaf);
+    while let Some(id) = cur {
+        ids.push(id);
+        cur = nodes.get(&id).and_then(|n| n.2);
+    }
+    ids.reverse();
+    ids.iter()
+        .map(|id| {
+            nodes
+                .get(id)
+                .map(|(n, _, _)| {
+                    if n.is_empty() {
+                        "(anonymous)".to_string()
+                    } else {
+                        n.clone()
+                    }
+                })
+                .unwrap_or_else(|| "(unknown)".to_string())
+        })
+        .collect()
+}
+
+/// Folded-stack output (`a;b;c <weight>`) for flamegraph.pl / speedscope.
+/// `weight` is total self-time in microseconds. One line per distinct leaf.
+pub fn stacks_folded(
+    events: &[TraceEvent],
+    matcher: Option<&Matcher>,
+    scope: &Scope,
+) -> String {
+    let cpu = collect_cpu_profile(events, scope);
+    let mut leaves: Vec<(u64, f64)> = cpu
+        .leaf_time
+        .iter()
+        .filter(|(id, _)| match matcher {
+            Some(m) => cpu.nodes.get(id).map(|(n, _, _)| m.matches(n)).unwrap_or(false),
+            None => true,
+        })
+        .map(|(id, t)| (*id, *t))
+        .collect();
+    leaves.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let mut out = String::new();
+    for (id, t) in &leaves {
+        let chain = node_chain_names(&cpu.nodes, *id);
+        out.push_str(&format!("{} {:.0}\n", chain.join(";"), t));
+    }
+    out
+}
+
+/// Drill into the heaviest RunTasks: for each, list its child events grouped by
+/// name with duration, and the top FunctionCall's target function.
+pub fn task_md(events: &[TraceEvent], scope: &Scope, top: usize, min_ts: f64) -> String {
+    let mut tasks: Vec<&TraceEvent> = events
+        .iter()
+        .filter(|e| {
+            e.name == "RunTask" && e.ph == "X" && e.dur.is_some() && scope.allows_event(e)
+        })
+        .collect();
+    tasks.sort_by(|a, b| b.dur.unwrap().partial_cmp(&a.dur.unwrap()).unwrap());
+    let total = tasks.len();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## RunTask breakdown ({} tasks, {})\n\n",
+        total,
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    for (rank, rt) in tasks.iter().take(top).enumerate() {
+        let rt_ts = rt.ts;
+        let rt_end = rt.ts + rt.dur.unwrap();
+        let rt_dur = rt.dur.unwrap();
+
+        // Children: same thread, within [rt_ts, rt_end], not RunTask.
+        let mut groups: HashMap<String, (usize, f64)> = HashMap::new();
+        let mut top_fc: Option<(String, f64)> = None; // (functionName, dur)
+        for e in events {
+            if e.tid != rt.tid || e.name == "RunTask" || e.ts < rt_ts || e.ts > rt_end {
+                continue;
+            }
+            let d = e.dur.unwrap_or(0.0);
+            let g = groups.entry(e.name.clone()).or_default();
+            g.0 += 1;
+            g.1 += d;
+            if e.name == "FunctionCall" && top_fc.as_ref().map_or(true, |(_, dd)| d > *dd) {
+                let fn_name = e
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.get("data"))
+                    .and_then(|d| d.get("functionName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                top_fc = Some((fn_name, d));
+            }
+        }
+
+        let mut children: Vec<(String, usize, f64)> = groups
+            .into_iter()
+            .map(|(n, (c, d))| (n, c, d))
+            .collect();
+        children.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+        out.push_str(&format!(
+            "### #{}  t={:.2}ms  dur={}ms  tid={}\n\n",
+            rank + 1,
+            (rt_ts - min_ts) / 1000.0,
+            fmt_ms(rt_dur),
+            rt.tid,
+        ));
+        if children.is_empty() {
+            out.push_str("_No child events._\n\n");
+            continue;
+        }
+        out.push_str("| child | count | total(ms) | % of task |\n");
+        out.push_str("|-------|-------|-----------|-----------|\n");
+        for (name, count, dur) in &children {
+            let pct = if rt_dur > 0.0 { dur / rt_dur * 100.0 } else { 0.0 };
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.1}% |\n",
+                name,
+                count,
+                fmt_ms(*dur),
+                pct,
+            ));
+        }
+        if let Some((fn_name, d)) = top_fc {
+            let label = if fn_name.is_empty() { "(anonymous)" } else { &fn_name };
+            out.push_str(&format!(
+                "\n- **top FunctionCall**: `{}` ({})\n",
+                label,
+                fmt_ms(d),
+            ));
+        }
+        out.push('\n');
+    }
+    out
 }

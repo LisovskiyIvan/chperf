@@ -84,6 +84,13 @@ chperf trace.json --function '^_render' --regex
 # Heaviest call stacks (root → leaf) with full caller chain.
 chperf trace.json --stacks --function render --around 11877674 --window 100
 
+# Folded stacks → flamegraph.pl / speedscope.
+chperf trace.json --flame --function render | flamegraph.pl > flame.svg
+
+# What's inside the jank? Break down a RunTask's child events.
+chperf trace.json --worst --task --top 5
+chperf trace.json --task --around 11877674 --window 500 --top 3
+
 # Search event args (substring or regex); --full-args disables truncation.
 chperf trace.json --find setPlayerRespawned --top 20 --full-args
 chperf trace.json --find 'frame.*sampleTraceId' --regex
@@ -98,6 +105,8 @@ chperf trace.json --find 'frame.*sampleTraceId' --regex
 | `--names` | List distinct event names with count/total duration |
 | `--threads` | List distinct threads (tid) with RunTask time and top event |
 | `--stacks` | Heaviest CPU call stacks (root → leaf) with caller chains |
+| `--flame` | Folded stacks (`a;b;c <us>`) for flamegraph.pl / speedscope |
+| `--task` | Break down the heaviest RunTasks into child events + top JS call |
 | `--events <a,b,…>` | List events matching these names |
 | `--stats` | Duration distribution (min/avg/p50/p90/p99/max) per event name |
 | `--function <pat>` | Aggregate CPU samples whose function name matches |
