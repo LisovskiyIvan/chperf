@@ -633,12 +633,12 @@ fn draw_summary_table(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, stat)| {
-            let importance = match stat.name.as_str() {
+            let importance = match stat.name {
                 "RunTask" | "UpdateLayoutTree" | "Layout" => "***",
                 "Paint" | "FunctionCall" | "FireAnimationFrame" => "** ",
                 _ => "*  ",
             };
-            let name_color = match stat.name.as_str() {
+            let name_color = match stat.name {
                 "RunTask" | "UpdateLayoutTree" | "Layout" => Color::Red,
                 "Paint" | "FunctionCall" | "FireAnimationFrame" => Color::Yellow,
                 _ => Color::White,
@@ -657,7 +657,7 @@ fn draw_summary_table(frame: &mut Frame, app: &App, area: Rect) {
 
             Row::new(vec![
                 Cell::from(importance).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(stat.name.clone()).style(Style::default().fg(name_color)),
+                Cell::from(stat.name).style(Style::default().fg(name_color)),
                 Cell::from(fmt_time(stat.total_time_us, t)),
                 Cell::from(format!("{}", stat.count))
                     .style(Style::default().fg(Color::DarkGray)),

@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::io::BufReader;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone)]
@@ -54,15 +54,19 @@ pub struct TraceEvent {
 
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    // Stream .gz through a gzip decoder so serde_json reads decompressed bytes
-    // without buffering the whole file in memory.
-    let trace: TraceFile = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        serde_json::from_reader(flate2::read::GzDecoder::new(reader))?
+    // Decompress (if .gz) and parse from an in-memory slice. This is far
+    // faster than streaming serde_json through the gzip decoder: zlib-rs
+    // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
+    let bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(file).read_to_end(&mut out)?;
+        out
     } else {
-        serde_json::from_reader(reader)?
+        let mut out = Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
+        file.take(u64::MAX).read_to_end(&mut out)?;
+        out
     };
-    let mut trace = trace;
+    let mut trace: TraceFile = serde_json::from_slice(&bytes)?;
 
     // Extract page URL from TracingStartedInBrowser event
     {

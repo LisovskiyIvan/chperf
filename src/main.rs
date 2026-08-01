@@ -166,18 +166,50 @@ fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>>
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
     let main_tid = trace::detect_main_thread(&trace.trace_events);
+    let events = &trace.trace_events;
     eprintln!(
         "  {} events, main thread tid={}",
-        trace.trace_events.len(),
+        events.len(),
         main_tid
     );
+    // The six analysis passes are independent and read-only, so on large
+    // traces they run concurrently (each pass itself parallelizes hot work).
+    const PARALLEL_THRESHOLD: usize = 200_000;
+    let (summary, scroll_frames, cpu_profile, layout_dirty, style_recalc, forced_reflows) =
+        if events.len() >= PARALLEL_THRESHOLD {
+            std::thread::scope(|s| {
+                let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
+                let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
+                let c = s.spawn(|| analysis::analyze_cpu_profile(events));
+                let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
+                let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
+                let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
+                (
+                    a.join().unwrap(),
+                    b.join().unwrap(),
+                    c.join().unwrap(),
+                    d.join().unwrap(),
+                    e.join().unwrap(),
+                    f.join().unwrap(),
+                )
+            })
+        } else {
+            (
+                analysis::analyze_summary(events, main_tid),
+                analysis::analyze_scroll_frames(events, main_tid),
+                analysis::analyze_cpu_profile(events),
+                analysis::analyze_layout_dirty(events, main_tid),
+                analysis::analyze_style_recalc(events, main_tid),
+                analysis::analyze_forced_reflows(events, main_tid),
+            )
+        };
     Ok(Analyzed {
-        summary: analysis::analyze_summary(&trace.trace_events, main_tid),
-        scroll_frames: analysis::analyze_scroll_frames(&trace.trace_events, main_tid),
-        cpu_profile: analysis::analyze_cpu_profile(&trace.trace_events),
-        layout_dirty: analysis::analyze_layout_dirty(&trace.trace_events, main_tid),
-        style_recalc: analysis::analyze_style_recalc(&trace.trace_events, main_tid),
-        forced_reflows: analysis::analyze_forced_reflows(&trace.trace_events, main_tid),
+        summary,
+        scroll_frames,
+        cpu_profile,
+        layout_dirty,
+        style_recalc,
+        forced_reflows,
         trace,
         main_tid,
     })
@@ -519,38 +551,60 @@ fn run_single(
 }
 
 /// Batch-export every trace in a directory as Markdown files.
+/// Traces are analyzed in parallel in small groups: trace parsing is
+/// memory-heavy, so we cap concurrency to keep peak RAM bounded.
 fn batch_export(cli: &Cli, traces: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+    const GROUP: usize = 3;
     let summary_only = cli.summary;
-    for path in traces {
-        let stem = trace::trace_stem(path);
-        let analyzed = load_and_analyze(path)?;
-        let (mut app, _trace) = build_app(analyzed, None, stem.clone());
-
-        // Throttle: CLI flag priority, else auto-detect from trace metadata
-        let throttle = cli.throttle.unwrap_or_else(|| {
-            app.metadata
-                .as_ref()
-                .and_then(|m| m.cpu_throttling)
-                .unwrap_or(1.0)
+    let throttle = cli.throttle;
+    for group in traces.chunks(GROUP) {
+        std::thread::scope(|s| {
+            for path in group {
+                s.spawn(|| {
+                    if let Err(e) = export_one(path, throttle, summary_only) {
+                        eprintln!("  ERROR {}: {}", path.display(), e);
+                    }
+                });
+            }
         });
-        if throttle > 1.0 {
-            app.throttle_factor = throttle;
-            app.throttle_factor_saved = throttle;
-        }
-
-        let md = if summary_only {
-            export::export_summary_only(&app)
-        } else {
-            export::export_markdown(&app)
-        };
-
-        let out_path = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(format!("chperf-export-{}.md", stem));
-        std::fs::write(&out_path, &md)?;
-        eprintln!("  -> {}", out_path.display());
     }
+    Ok(())
+}
+
+/// Load, analyze, apply throttle, export a single trace to `chperf-export-<stem>.md`.
+fn export_one(
+    path: &Path,
+    throttle: Option<f64>,
+    summary_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stem = trace::trace_stem(path);
+    let analyzed = load_and_analyze(path)?;
+    let (mut app, _trace) = build_app(analyzed, None, stem.clone());
+
+    // Throttle: CLI flag priority, else auto-detect from trace metadata
+    let throttle = throttle.unwrap_or_else(|| {
+        app.metadata
+            .as_ref()
+            .and_then(|m| m.cpu_throttling)
+            .unwrap_or(1.0)
+    });
+    if throttle > 1.0 {
+        app.throttle_factor = throttle;
+        app.throttle_factor_saved = throttle;
+    }
+
+    let md = if summary_only {
+        export::export_summary_only(&app)
+    } else {
+        export::export_markdown(&app)
+    };
+
+    let out_path = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("chperf-export-{}.md", stem));
+    std::fs::write(&out_path, &md)?;
+    eprintln!("  -> {}", out_path.display());
     Ok(())
 }
 

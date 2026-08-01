@@ -113,6 +113,20 @@ impl Scope {
     }
 }
 
+/// Allocation-free ASCII case-insensitive substring check; falls back to the
+/// Unicode `to_lowercase` path for non-ASCII needles (identical semantics).
+fn contains_ignore_case(hay: &str, needle: &str) -> bool {
+    if needle.is_ascii() {
+        hay.len() >= needle.len()
+            && hay
+                .as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    } else {
+        hay.to_lowercase().contains(needle)
+    }
+}
+
 /// Function/string matcher: case-insensitive substring or a regex.
 pub enum Matcher {
     Substr(String),
@@ -130,7 +144,7 @@ impl Matcher {
 
     fn matches(&self, s: &str) -> bool {
         match self {
-            Matcher::Substr(p) => s.to_lowercase().contains(p),
+            Matcher::Substr(p) => contains_ignore_case(s, p),
             Matcher::Regex(re) => re.is_match(s),
         }
     }
@@ -267,7 +281,7 @@ pub fn stats_section(
     min_dur_us: f64,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut groups: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut groups: HashMap<&str, Vec<f64>> = HashMap::new();
     for e in events {
         if !filter.matches(&e.name) || !scope.allows_event(e) {
             continue;
@@ -276,10 +290,10 @@ pub fn stats_section(
         if d < min_dur_us {
             continue;
         }
-        groups.entry(e.name.clone()).or_default().push(d);
+        groups.entry(e.name.as_str()).or_default().push(d);
     }
 
-    let mut rows: Vec<(String, Vec<f64>)> = groups.into_iter().collect();
+    let mut rows: Vec<(&str, Vec<f64>)> = groups.into_iter().collect();
     rows.sort_by(|a, b| b.1.iter().sum::<f64>().partial_cmp(&a.1.iter().sum::<f64>()).unwrap());
 
     let mut out = String::new();
@@ -344,63 +358,12 @@ pub fn functions_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut node_map: HashMap<u64, (String, String)> = HashMap::new();
-    let mut self_times: HashMap<u64, f64> = HashMap::new();
-    let mut total_in_scope = 0.0f64;
-
-    for e in events {
-        if e.name != "ProfileChunk" {
-            continue;
-        }
-        let args = match &e.args {
-            Some(a) => a,
-            None => continue,
-        };
-        let data = match args.get("data") {
-            Some(d) => d,
-            None => continue,
-        };
-        let cpu_profile = match data.get("cpuProfile") {
-            Some(cp) => cp,
-            None => continue,
-        };
-
-        if let Some(nodes) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
-            for node in nodes {
-                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                let call_frame = node.get("callFrame");
-                let func_name = call_frame
-                    .and_then(|cf| cf.get("functionName"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(anonymous)")
-                    .to_string();
-                let url = call_frame
-                    .and_then(|cf| cf.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                node_map.entry(id).or_insert((func_name, url));
-            }
-        }
-
-        if !scope.allows_event(e) {
-            continue;
-        }
-        let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
-        let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
-        if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
-            for (sample, delta) in samples.iter().zip(deltas.iter()) {
-                let node_id = sample.as_u64().unwrap_or(0);
-                let dt = delta.as_f64().unwrap_or(0.0);
-                *self_times.entry(node_id).or_default() += dt;
-                total_in_scope += dt;
-            }
-        }
-    }
+    let (node_map, self_times) = crate::analysis::scan_profile_chunks(events, Some(scope), 0);
+    let total_in_scope: f64 = self_times.values().sum();
 
     let mut funcs: Vec<(&str, &str, f64)> = self_times
         .iter()
-        .filter_map(|(id, t)| node_map.get(id).map(|(n, u)| (n.as_str(), u.as_str(), *t)))
+        .filter_map(|(id, t)| node_map.get(id).map(|(n, u, _)| (n.as_str(), u.as_str(), *t)))
         .filter(|(n, _, _)| matcher.matches(n))
         .collect();
     funcs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
@@ -461,59 +424,7 @@ pub struct CpuProfile {
 /// Register all CPU profile nodes, and accumulate per-leaf sample time from
 /// in-scope chunks. Shared by `stacks_section` and `stacks_folded`.
 pub fn collect_cpu_profile(events: &[TraceEvent], scope: &Scope) -> CpuProfile {
-    let mut nodes: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-    let mut leaf_time: HashMap<u64, f64> = HashMap::new();
-
-    for e in events {
-        if e.name != "ProfileChunk" {
-            continue;
-        }
-        let args = match &e.args {
-            Some(a) => a,
-            None => continue,
-        };
-        let data = match args.get("data") {
-            Some(d) => d,
-            None => continue,
-        };
-        let cpu_profile = match data.get("cpuProfile") {
-            Some(cp) => cp,
-            None => continue,
-        };
-
-        if let Some(node_arr) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
-            for node in node_arr {
-                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                let call_frame = node.get("callFrame");
-                let func_name = call_frame
-                    .and_then(|cf| cf.get("functionName"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(anonymous)")
-                    .to_string();
-                let url = call_frame
-                    .and_then(|cf| cf.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let parent = node.get("parent").and_then(|v| v.as_u64());
-                nodes.entry(id).or_insert((func_name, url, parent));
-            }
-        }
-
-        if !scope.allows_event(e) {
-            continue;
-        }
-        let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
-        let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
-        if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
-            for (sample, delta) in samples.iter().zip(deltas.iter()) {
-                let node_id = sample.as_u64().unwrap_or(0);
-                let dt = delta.as_f64().unwrap_or(0.0);
-                *leaf_time.entry(node_id).or_default() += dt;
-            }
-        }
-    }
-
+    let (nodes, leaf_time) = crate::analysis::scan_profile_chunks(events, Some(scope), 0);
     CpuProfile { nodes, leaf_time }
 }
 
@@ -650,6 +561,22 @@ pub fn stacks_folded(
     out
 }
 
+/// Does this JSON value (or any nested string, object key, number, bool)
+/// match? Mirrors the old behavior of matching the fully serialized JSON.
+fn value_matches(v: &Value, matcher: &Matcher) -> bool {
+    match v {
+        Value::String(s) => matcher.matches(s),
+        Value::Array(a) => a.iter().any(|v| value_matches(v, matcher)),
+        Value::Object(m) => {
+            m.iter()
+                .any(|(k, v)| matcher.matches(k) || value_matches(v, matcher))
+        }
+        Value::Number(n) => matcher.matches(&n.to_string()),
+        Value::Bool(b) => matcher.matches(if *b { "true" } else { "false" }),
+        Value::Null => matcher.matches("null"),
+    }
+}
+
 /// Search event `args` (JSON) for `matcher` and list matches.
 pub fn find_section(
     events: &[TraceEvent],
@@ -665,11 +592,14 @@ pub fn find_section(
         if !scope.allows_event(e) {
             continue;
         }
-        let s = match &e.args {
-            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+        let args = match &e.args {
+            Some(v) => v,
             None => continue,
         };
-        if matcher.matches(&s) {
+        // Walk the JSON tree instead of serializing the whole value to a
+        // string per event (numbers/bools are skipped without allocation).
+        if value_matches(args, matcher) {
+            let s = serde_json::to_string(args).unwrap_or_default();
             let snippet = if full_args {
                 truncate(&s, 500)
             } else {
@@ -750,17 +680,20 @@ pub fn names_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut stats: HashMap<String, (usize, f64)> = HashMap::new();
+    let mut stats: HashMap<&str, (usize, f64)> = HashMap::new();
     for e in events {
         if !scope.allows_event(e) {
             continue;
         }
-        let entry = stats.entry(e.name.clone()).or_default();
+        let entry = stats.entry(e.name.as_str()).or_default();
         entry.0 += 1;
         entry.1 += e.dur.unwrap_or(0.0);
     }
 
-    let mut rows: Vec<(String, usize, f64)> = stats.into_iter().map(|(n, (c, d))| (n, c, d)).collect();
+    let mut rows: Vec<(String, usize, f64)> = stats
+        .into_iter()
+        .map(|(n, (c, d))| (n.to_string(), c, d))
+        .collect();
     match sort {
         Sort::Count => rows.sort_by(|a, b| b.1.cmp(&a.1)),
         Sort::Name => rows.sort_by(|a, b| a.0.cmp(&b.0)),
@@ -821,7 +754,7 @@ pub fn threads_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut tids: HashMap<u64, (usize, f64, HashMap<String, usize>)> = HashMap::new();
+    let mut tids: HashMap<u64, (usize, f64, HashMap<&str, usize>)> = HashMap::new();
     for e in events {
         if !scope.allows_event(e) {
             continue;
@@ -831,7 +764,7 @@ pub fn threads_section(
         if e.name == "RunTask" {
             entry.1 += e.dur.unwrap_or(0.0);
         }
-        *entry.2.entry(e.name.clone()).or_default() += 1;
+        *entry.2.entry(e.name.as_str()).or_default() += 1;
     }
 
     let mut rows: Vec<(u64, usize, f64, String)> = tids
@@ -840,7 +773,7 @@ pub fn threads_section(
             let top_name = names
                 .into_iter()
                 .max_by_key(|(_, c)| *c)
-                .map(|(n, _)| n)
+                .map(|(n, _)| n.to_string())
                 .unwrap_or_default();
             (tid, count, runtask, top_name)
         })

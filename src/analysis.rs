@@ -1,11 +1,12 @@
 use crate::trace::TraceEvent;
+use crate::inspect::Scope;
 use std::collections::HashMap;
 
 // ── Summary ──
 
 #[derive(Clone)]
 pub struct EventTypeStat {
-    pub name: String,
+    pub name: &'static str,
     pub total_time_us: f64,
     pub count: usize,
     pub avg_time_us: f64,
@@ -21,72 +22,73 @@ pub struct SummaryResult {
     pub event_stats: Vec<EventTypeStat>,
 }
 
-const TARGET_EVENTS: &[&str] = &[
-    "RunTask",
-    "UpdateLayoutTree",
-    "Layout",
-    "Paint",
-    "FunctionCall",
-    "FireAnimationFrame",
-    "Layerize",
-    "Commit",
-    "HitTest",
-    "IntersectionObserverController::computeIntersections",
-    "MajorGC",
-    "MinorGC",
-    "EvaluateScript",
-];
+/// Map an event name to its canonical `'static` key, or `None` if not tracked.
+fn target_key(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "RunTask" => "RunTask",
+        "UpdateLayoutTree" => "UpdateLayoutTree",
+        "Layout" => "Layout",
+        "Paint" => "Paint",
+        "FunctionCall" => "FunctionCall",
+        "FireAnimationFrame" => "FireAnimationFrame",
+        "Layerize" => "Layerize",
+        "Commit" => "Commit",
+        "HitTest" => "HitTest",
+        "IntersectionObserverController::computeIntersections" => {
+            "IntersectionObserverController::computeIntersections"
+        }
+        "MajorGC" => "MajorGC",
+        "MinorGC" => "MinorGC",
+        "EvaluateScript" => "EvaluateScript",
+        _ => return None,
+    })
+}
 
 pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
-    let main_events: Vec<&TraceEvent> = events
-        .iter()
-        .filter(|e| e.tid == main_tid && e.ph == "X")
-        .collect();
+    // Single pass over the trace: duration bounds, long tasks, busy time, stats.
+    let mut long_task_durs: Vec<f64> = Vec::new();
+    let mut stats_map: HashMap<&'static str, (f64, usize)> = HashMap::new();
+    let mut main_thread_busy_us = 0.0f64;
+    let mut min_ts = f64::INFINITY;
+    let mut max_ts = 0.0f64;
 
-    // Long tasks
-    let mut long_task_durs: Vec<f64> = main_events
-        .iter()
-        .filter(|e| e.name == "RunTask")
-        .filter_map(|e| e.dur)
-        .filter(|&d| d > 50_000.0)
-        .collect();
-    long_task_durs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    let long_task_count = long_task_durs.len();
-    let long_tasks_top: Vec<f64> = long_task_durs.into_iter().take(10).collect();
-
-    // Trace duration
-    let min_ts = events.iter().map(|e| e.ts).fold(f64::INFINITY, f64::min);
-    let max_ts = events.iter().fold(0.0f64, |acc, e| {
+    for e in events {
         let end = e.ts + e.dur.unwrap_or(0.0);
-        acc.max(end)
-    });
-    let total_trace_duration_us = max_ts - min_ts;
-
-    // Main thread busy time
-    let main_thread_busy_us: f64 = main_events
-        .iter()
-        .filter(|e| e.name == "RunTask")
-        .filter_map(|e| e.dur)
-        .sum();
-
-    // Event stats
-    let mut stats_map: HashMap<&str, (f64, usize)> = HashMap::new();
-    for e in &main_events {
-        if TARGET_EVENTS.contains(&e.name.as_str()) {
-            if let Some(dur) = e.dur {
-                let entry = stats_map
-                    .entry(TARGET_EVENTS.iter().find(|&&n| n == e.name).unwrap())
-                    .or_default();
-                entry.0 += dur;
+        if e.ts < min_ts {
+            min_ts = e.ts;
+        }
+        if end > max_ts {
+            max_ts = end;
+        }
+        if e.tid != main_tid || e.ph != "X" {
+            continue;
+        }
+        if e.name == "RunTask" {
+            if let Some(d) = e.dur {
+                main_thread_busy_us += d;
+                if d > 50_000.0 {
+                    long_task_durs.push(d);
+                }
+            }
+        }
+        if let Some(key) = target_key(&e.name) {
+            if let Some(d) = e.dur {
+                let entry = stats_map.entry(key).or_default();
+                entry.0 += d;
                 entry.1 += 1;
             }
         }
     }
 
+    long_task_durs.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let long_task_count = long_task_durs.len();
+    let long_tasks_top: Vec<f64> = long_task_durs.into_iter().take(10).collect();
+    let total_trace_duration_us = (max_ts - min_ts).max(0.0);
+
     let mut event_stats: Vec<EventTypeStat> = stats_map
         .into_iter()
         .map(|(name, (total, count))| EventTypeStat {
-            name: name.to_string(),
+            name,
             total_time_us: total,
             count,
             avg_time_us: if count > 0 {
@@ -176,36 +178,48 @@ pub struct ScrollFrameResult {
 }
 
 pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFrameResult {
-    let main_x: Vec<&TraceEvent> = events
+    let mut main_x: Vec<&TraceEvent> = events
         .iter()
         .filter(|e| e.tid == main_tid && e.ph == "X")
         .collect();
+    main_x.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
 
-    let run_tasks: Vec<&&TraceEvent> = main_x
+    let run_tasks: Vec<&TraceEvent> = main_x
         .iter()
+        .copied()
         .filter(|e| e.name == "RunTask" && e.dur.is_some())
         .collect();
 
     let mut tasks = Vec::new();
 
+    // Single sweep: RunTasks on a thread are serial and non-nested, so each
+    // main-thread event falls inside at most one task. `lo` only moves forward.
+    let mut lo = 0usize;
     for rt in &run_tasks {
         let rt_ts = rt.ts;
         let rt_dur = rt.dur.unwrap();
         let rt_end = rt_ts + rt_dur;
 
-        let children: Vec<&&TraceEvent> = main_x
-            .iter()
-            .filter(|e| {
-                e.ts >= rt_ts && (e.ts + e.dur.unwrap_or(0.0)) <= rt_end && e.name != "RunTask"
-            })
-            .collect();
-
-        let has_heavy_ult = children
-            .iter()
-            .any(|e| e.name == "UpdateLayoutTree" && e.dur.unwrap_or(0.0) > 50_000.0);
-        let has_heavy_fc = children
-            .iter()
-            .any(|e| e.name == "FunctionCall" && e.dur.unwrap_or(0.0) > 50_000.0);
+        while lo < main_x.len() && main_x[lo].ts < rt_ts {
+            lo += 1;
+        }
+        let mut j = lo;
+        let mut has_heavy_ult = false;
+        let mut has_heavy_fc = false;
+        while j < main_x.len() && main_x[j].ts <= rt_end {
+            let e = main_x[j];
+            if e.name != "RunTask" {
+                let d = e.dur.unwrap_or(0.0);
+                if d > 50_000.0 {
+                    if e.name == "UpdateLayoutTree" {
+                        has_heavy_ult = true;
+                    } else if e.name == "FunctionCall" {
+                        has_heavy_fc = true;
+                    }
+                }
+            }
+            j += 1;
+        }
 
         if !has_heavy_ult && !has_heavy_fc {
             continue;
@@ -222,17 +236,24 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
             layout_us: 0.0,
         };
 
-        for c in &children {
-            let d = c.dur.unwrap_or(0.0);
-            match c.name.as_str() {
-                "FunctionCall" => ft.js_us += d,
-                "UpdateLayoutTree" => ft.ult_us += d,
-                "Paint" => ft.paint_us += d,
-                "Layerize" | "Commit" => ft.composite_us += d,
-                "HitTest" => ft.hit_test_us += d,
-                "Layout" => ft.layout_us += d,
-                _ => {}
+        j = lo;
+        while j < main_x.len() && main_x[j].ts <= rt_end {
+            let e = main_x[j];
+            if e.name != "RunTask" {
+                let d = e.dur.unwrap_or(0.0);
+                if d > 0.0 && e.ts + d <= rt_end {
+                    match e.name.as_str() {
+                        "FunctionCall" => ft.js_us += d,
+                        "UpdateLayoutTree" => ft.ult_us += d,
+                        "Paint" => ft.paint_us += d,
+                        "Layerize" | "Commit" => ft.composite_us += d,
+                        "HitTest" => ft.hit_test_us += d,
+                        "Layout" => ft.layout_us += d,
+                        _ => {}
+                    }
+                }
             }
+            j += 1;
         }
         tasks.push(ft);
     }
@@ -330,8 +351,51 @@ pub struct CpuProfileResult {
     pub native_time_us: f64,
 }
 
-pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
-    let mut node_map: HashMap<u64, (String, String)> = HashMap::new();
+/// Parallel ProfileChunk scan: each thread accumulates its own node/self-time
+/// maps over a slice of events, results are merged afterwards.
+///
+/// `reserve_threads` is the number of threads that may already be busy running
+/// sibling passes; CPU chunking backs off to leave room for them.
+pub fn scan_profile_chunks(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    reserve_threads: usize,
+) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
+    const MIN_CHUNK_WORK: usize = 64_000;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(reserve_threads).max(1))
+        .unwrap_or(1);
+    let threads = threads.max(1);
+    if threads == 1 || events.len() < MIN_CHUNK_WORK {
+        return scan_profile_chunk(events, scope);
+    }
+    let chunk = events.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = events
+            .chunks(chunk)
+            .map(|c| s.spawn(|| scan_profile_chunk(c, scope)))
+            .collect();
+        let mut nodes: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
+        let mut times: HashMap<u64, f64> = HashMap::new();
+        for h in handles {
+            let (n, t) = h.join().unwrap();
+            for (id, v) in n {
+                nodes.entry(id).or_insert(v);
+            }
+            for (id, dt) in t {
+                *times.entry(id).or_default() += dt;
+            }
+        }
+        (nodes, times)
+    })
+}
+
+/// Single-threaded scan of one events slice, shared by the parallel helper.
+fn scan_profile_chunk(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
+    let mut node_map: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
     let mut self_times: HashMap<u64, f64> = HashMap::new();
 
     for e in events {
@@ -365,10 +429,16 @@ pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                node_map.entry(id).or_insert((func_name, url));
+                let parent = node.get("parent").and_then(|v| v.as_u64());
+                node_map.entry(id).or_insert((func_name, url, parent));
             }
         }
 
+        if let Some(scope) = scope {
+            if !scope.allows_event(e) {
+                continue;
+            }
+        }
         let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
         let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
 
@@ -380,6 +450,15 @@ pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
             }
         }
     }
+    (node_map, self_times)
+}
+
+pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
+    let (node_map, self_times) = scan_profile_chunks(events, None, 5);
+    let node_map: HashMap<u64, (String, String)> = node_map
+        .into_iter()
+        .map(|(id, (n, u, _))| (id, (n, u)))
+        .collect();
 
     let mut functions: Vec<FunctionTime> = self_times
         .into_iter()
@@ -567,55 +646,53 @@ pub struct ForcedReflowResult {
 
 /// Detect forced reflow: RunTask containing alternating FunctionCall→(Layout|UpdateLayoutTree)→FunctionCall pattern
 pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedReflowResult {
-    let main_x: Vec<&TraceEvent> = events
+    let mut main_x: Vec<&TraceEvent> = events
         .iter()
         .filter(|e| e.tid == main_tid && e.ph == "X")
         .collect();
+    main_x.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
 
-    let run_tasks: Vec<&&TraceEvent> = main_x
+    let run_tasks: Vec<&TraceEvent> = main_x
         .iter()
+        .copied()
         .filter(|e| e.name == "RunTask" && e.dur.is_some())
         .collect();
 
     let mut entries = Vec::new();
 
+    // Single sweep, same as scroll frames: children are in ts order already.
+    let mut lo = 0usize;
     for rt in &run_tasks {
         let rt_ts = rt.ts;
         let rt_end = rt_ts + rt.dur.unwrap();
 
-        // Get direct children sorted by timestamp
-        let mut children: Vec<&&TraceEvent> = main_x
-            .iter()
-            .filter(|e| {
-                e.ts >= rt_ts
-                    && (e.ts + e.dur.unwrap_or(0.0)) <= rt_end
-                    && e.name != "RunTask"
-                    && (e.name == "FunctionCall"
-                        || e.name == "Layout"
-                        || e.name == "UpdateLayoutTree")
-            })
-            .collect();
-        children.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+        while lo < main_x.len() && main_x[lo].ts < rt_ts {
+            lo += 1;
+        }
 
         // Look for JS→Layout/ULT alternation pattern
         let mut reflow_count = 0usize;
         let mut layout_time = 0.0f64;
         let mut last_was_js = false;
-
-        for c in &children {
-            match c.name.as_str() {
-                "FunctionCall" => {
-                    last_was_js = true;
-                }
-                "Layout" | "UpdateLayoutTree" => {
-                    if last_was_js {
-                        reflow_count += 1;
-                        layout_time += c.dur.unwrap_or(0.0);
+        let mut j = lo;
+        while j < main_x.len() && main_x[j].ts <= rt_end {
+            let c = main_x[j];
+            if c.name != "RunTask" && c.ts + c.dur.unwrap_or(0.0) <= rt_end {
+                match c.name.as_str() {
+                    "FunctionCall" => {
+                        last_was_js = true;
                     }
-                    last_was_js = false;
+                    "Layout" | "UpdateLayoutTree" => {
+                        if last_was_js {
+                            reflow_count += 1;
+                            layout_time += c.dur.unwrap_or(0.0);
+                        }
+                        last_was_js = false;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            j += 1;
         }
 
         if reflow_count >= 2 {
@@ -724,12 +801,12 @@ pub fn analyze_compare(
     let map_a: HashMap<&str, &EventTypeStat> = summary_a
         .event_stats
         .iter()
-        .map(|s| (s.name.as_str(), s))
+        .map(|s| (s.name, s))
         .collect();
     let map_b: HashMap<&str, &EventTypeStat> = summary_b
         .event_stats
         .iter()
-        .map(|s| (s.name.as_str(), s))
+        .map(|s| (s.name, s))
         .collect();
 
     let mut all_names: Vec<&str> = map_a.keys().chain(map_b.keys()).copied().collect();
