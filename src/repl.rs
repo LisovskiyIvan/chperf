@@ -293,7 +293,8 @@ fn print_help() {
     println!("      [--tid TID|main] [--pid N] [--cat S] [--around MS] [--window MS] [--regex] [--full-args] [--json]");
     println!("  names [--top N] | threads [--top N] | timeline [--around MS] [--window MS] [--bucket MS]");
     println!("  stats <names> | function <pat> [--regex] | find <pat> [--regex] [--full-args] | jank [--top N]");
-    println!("  worst [--task] [--stacks] [--top N] | task [--top N] | stacks [--top N] | flame [--function P]");
+    println!("  worst [--task] [--stacks] [--top N] | task [--top N] | stacks [--function P] [--top N] | flame [--function P]");
     println!("  compare <file2> | export [file] | summary | throttle N | status | clear | help | quit");
+    println!("  every query also accepts [--json] for jq/pipelines");
     println!();
 }
