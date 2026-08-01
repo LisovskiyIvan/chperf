@@ -2,6 +2,7 @@ mod analysis;
 mod app;
 mod export;
 mod inspect;
+mod repl;
 mod trace;
 mod ui;
 
@@ -17,123 +18,127 @@ use ratatui::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "chperf", about = "Chrome DevTools Trace JSON analyzer (TUI)")]
-struct Cli {
+pub(crate) struct Cli {
     /// Path to trace JSON file (.json or .json.gz) or a directory of traces
-    trace: String,
+    pub(crate) trace: Option<String>,
+
+    /// Interactive REPL: load and analyze once, then query live
+    #[arg(long)]
+    pub(crate) repl: bool,
 
     /// Optional second trace file for comparison
     #[arg(short, long)]
-    compare: Option<String>,
+    pub(crate) compare: Option<String>,
 
     /// Export analysis as Markdown (to stdout or file)
     /// Use --export to print to stdout, --export=FILE to write to file
     #[arg(short, long, num_args = 0..=1, default_missing_value = "-")]
-    export: Option<String>,
+    pub(crate) export: Option<String>,
 
     /// CPU throttle factor (e.g. --throttle 20 divides all times by 20)
     #[arg(short, long)]
-    throttle: Option<f64>,
+    pub(crate) throttle: Option<f64>,
 
     /// Export only the comparison summary table (use with --export --compare)
     #[arg(short, long)]
-    summary: bool,
+    pub(crate) summary: bool,
 
     /// Inspect: list events by name (comma-separated), e.g. --events GPUTask,RunTask
     #[arg(long)]
-    events: Option<String>,
+    pub(crate) events: Option<String>,
 
     /// Inspect: aggregate CPU samples whose function name contains this substring
     #[arg(long)]
-    function: Option<String>,
+    pub(crate) function: Option<String>,
 
     /// Inspect: search event args (JSON) for this substring
     #[arg(long)]
-    find: Option<String>,
+    pub(crate) find: Option<String>,
 
     /// Inspect: center of the time window, in ms from trace start (use with --window)
     #[arg(long)]
-    around: Option<f64>,
+    pub(crate) around: Option<f64>,
 
     /// Inspect: half-width of the time window in ms (default 100, use with --around)
     #[arg(long)]
-    window: Option<f64>,
+    pub(crate) window: Option<f64>,
 
     /// Inspect: only events with duration >= this value, in microseconds
     #[arg(long)]
-    min_dur: Option<f64>,
+    pub(crate) min_dur: Option<f64>,
 
     /// Inspect: limit number of rows (default 30)
     #[arg(long, default_value_t = 30)]
-    top: usize,
+    pub(crate) top: usize,
 
     /// Inspect: restrict events/functions/find to this thread (numeric tid or "main")
     #[arg(long)]
-    tid: Option<String>,
+    pub(crate) tid: Option<String>,
 
     /// Inspect: restrict events/functions/find to this process id (pid)
     #[arg(long)]
-    pid: Option<u64>,
+    pub(crate) pid: Option<u64>,
 
     /// Inspect: restrict to events whose category (cat) contains this substring
     #[arg(long)]
-    cat: Option<String>,
+    pub(crate) cat: Option<String>,
 
     /// Inspect: list distinct event names with counts/total duration
     #[arg(long)]
-    names: bool,
+    pub(crate) names: bool,
 
     /// Inspect: list distinct threads (tid) with counts/RunTask duration
     #[arg(long)]
-    threads: bool,
+    pub(crate) threads: bool,
 
     /// Inspect: heaviest CPU call stacks (root → leaf), heaviest first
     #[arg(long)]
-    stacks: bool,
+    pub(crate) stacks: bool,
 
     /// Inspect: folded stacks (`a;b;c <us>`) for flamegraph.pl / speedscope
     #[arg(long)]
-    flame: bool,
+    pub(crate) flame: bool,
 
     /// Inspect: break down the heaviest RunTasks into their child events
     #[arg(long)]
-    task: bool,
+    pub(crate) task: bool,
 
     /// Inspect: busy timeline (RunTask per time bucket)
     #[arg(long)]
-    timeline: bool,
+    pub(crate) timeline: bool,
 
     /// Inspect: timeline bucket size in ms (default auto ~40 buckets, 10-500ms)
     #[arg(long)]
-    bucket: Option<f64>,
+    pub(crate) bucket: Option<f64>,
 
     /// Inspect: duration distribution table instead of event list (use with --events)
     #[arg(long)]
-    stats: bool,
+    pub(crate) stats: bool,
 
     /// Inspect: auto-anchor --around on the worst (longest) RunTask
     #[arg(long)]
-    worst: bool,
+    pub(crate) worst: bool,
 
     /// Inspect: sort order for --events/--names (ts, dur, name, count)
     #[arg(long)]
-    sort: Option<String>,
+    pub(crate) sort: Option<String>,
 
     /// Inspect: print full event args (no truncation) for --events/--find
     #[arg(long)]
-    full_args: bool,
+    pub(crate) full_args: bool,
 
     /// Inspect: interpret --function/--find/--events as regex instead of substring/exact
     #[arg(long)]
-    regex: bool,
+    pub(crate) regex: bool,
 
     /// Inspect: emit JSON (for jq/pipelines) instead of Markdown
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 }
 
 impl Cli {
     /// Any granular-inspect flag present?
-    fn is_inspect(&self) -> bool {
+    pub(crate) fn is_inspect(&self) -> bool {
         self.events.is_some()
             || self.function.is_some()
             || self.find.is_some()
@@ -150,19 +155,19 @@ impl Cli {
 // ── Analyzed trace ──
 
 /// All derived analysis for a single parsed trace.
-struct Analyzed {
-    trace: trace::TraceFile,
+pub(crate) struct Analyzed {
+    pub(crate) trace: trace::TraceFile,
     #[allow(dead_code)]
-    main_tid: u64,
-    summary: analysis::SummaryResult,
-    scroll_frames: analysis::ScrollFrameResult,
-    cpu_profile: analysis::CpuProfileResult,
-    layout_dirty: analysis::LayoutDirtyResult,
-    style_recalc: analysis::StyleRecalcResult,
-    forced_reflows: analysis::ForcedReflowResult,
+    pub(crate) main_tid: u64,
+    pub(crate) summary: analysis::SummaryResult,
+    pub(crate) scroll_frames: analysis::ScrollFrameResult,
+    pub(crate) cpu_profile: analysis::CpuProfileResult,
+    pub(crate) layout_dirty: analysis::LayoutDirtyResult,
+    pub(crate) style_recalc: analysis::StyleRecalcResult,
+    pub(crate) forced_reflows: analysis::ForcedReflowResult,
 }
 
-fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>> {
+pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
     let main_tid = trace::detect_main_thread(&trace.trace_events);
@@ -215,12 +220,13 @@ fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>>
     })
 }
 
-/// Build the App (with optional compare) from analyzed traces.
+/// Build the App (with optional compare) from analyzed traces. Borrows the
+/// analyses so the REPL can rebuild the app (e.g. after `compare <file>`).
 fn build_app(
-    a: Analyzed,
-    b: Option<(Analyzed, String)>,
+    a: &Analyzed,
+    b: Option<(&Analyzed, String)>,
     name_a: String,
-) -> (app::App, trace::TraceFile) {
+) -> app::App {
     let (compare_result, trace_name_b) = if let Some((bb, name_b)) = b {
         let cmp = analysis::analyze_compare(
             &a.summary,
@@ -240,24 +246,34 @@ fn build_app(
     };
 
     let metadata = a.trace.metadata.clone();
-    let app = app::App::new(
-        a.summary,
-        a.scroll_frames,
-        a.cpu_profile,
-        a.layout_dirty,
-        a.style_recalc,
-        a.forced_reflows,
+    app::App::new(
+        a.summary.clone(),
+        a.scroll_frames.clone(),
+        a.cpu_profile.clone(),
+        a.layout_dirty.clone(),
+        a.style_recalc.clone(),
+        a.forced_reflows.clone(),
         compare_result,
         name_a,
         trace_name_b,
         metadata,
-    );
-    (app, a.trace)
+    )
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let trace_path = Path::new(&cli.trace);
+    let trace_path = match cli.trace.as_deref().map(Path::new) {
+        Some(p) => p,
+        None => {
+            eprintln!("error: a trace file path is required (or use `--repl <trace>`)");
+            std::process::exit(2);
+        }
+    };
+
+    // Interactive REPL: load + analyze once, then run live queries.
+    if cli.repl {
+        return repl::run_repl(trace_path, &cli);
+    }
 
     // Directory mode: scan for traces, then batch-export or list them.
     if trace_path.is_dir() {
@@ -265,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if traces.is_empty() {
             eprintln!(
                 "No trace files (*.json / *.json.gz) found in {}",
-                cli.trace
+                cli.trace.as_deref().unwrap_or("")
             );
             return Ok(());
         }
@@ -273,14 +289,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return batch_export(&cli, &traces);
         }
         // No TUI picker: list traces and guide the user to pick one explicitly.
-        eprintln!("Found {} trace(s) in {}:", traces.len(), cli.trace);
+        eprintln!("Found {} trace(s) in {}:", traces.len(), cli.trace.as_deref().unwrap_or(""));
         for (i, p) in traces.iter().enumerate() {
             eprintln!("  {:>3}. {}", i + 1, p.display());
         }
         eprintln!(
             "\nAnalyze one: chperf <file> [--export] [--compare <file2>] | inspect: --events/--function/--find"
         );
-        eprintln!("Export all:  chperf {} --export", cli.trace);
+        eprintln!("Export all:  chperf {} --export", cli.trace.as_deref().unwrap_or(""));
         return Ok(());
     }
 
@@ -297,7 +313,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
-    let events = &trace.trace_events;
+    eprintln!("  {} events", trace.trace_events.len());
+    inspect_output(&trace.trace_events, &trace::trace_stem(path), cli)
+}
+
+/// Shared inspect dispatch: computes sections from already-parsed events.
+/// Used by both the CLI (`chperf trace --events ...`) and the REPL.
+pub(crate) fn inspect_output(
+    events: &[trace::TraceEvent],
+    trace_name: &str,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
     let min_ts = inspect::trace_start_us(events);
 
     // Resolve --tid (numeric or "main" → auto-detected main thread).
@@ -451,7 +477,7 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     // Dispatch output format.
     if cli.json {
         let mut obj = serde_json::Map::new();
-        obj.insert("trace".into(), serde_json::json!(trace::trace_stem(path)));
+        obj.insert("trace".into(), serde_json::json!(trace_name));
         if let Some(ref note) = anchor_note {
             obj.insert("anchor".into(), serde_json::json!(note));
         }
@@ -473,7 +499,7 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
     } else {
         let mut out = String::new();
-        out.push_str(&format!("# chperf inspect: {}\n\n", trace::trace_stem(path)));
+        out.push_str(&format!("# chperf inspect: {}\n\n", trace_name));
         if let Some(ref note) = anchor_note {
             out.push_str(&format!("**{}**\n\n", note));
         }
@@ -507,11 +533,12 @@ fn run_single(
         None
     };
 
-    let (mut app, trace_a) = build_app(analyzed_a, b_opt, trace::trace_stem(path_a));
+    let mut app = build_app(&analyzed_a, b_opt.as_ref().map(|(b, n)| (b, n.clone())), trace::trace_stem(path_a));
 
     // Apply throttle: CLI flag takes priority, otherwise auto-detect from trace metadata
     let throttle = cli.throttle.unwrap_or_else(|| {
-        trace_a
+        analyzed_a
+            .trace
             .metadata
             .as_ref()
             .and_then(|m| m.cpu_throttling)
@@ -579,11 +606,13 @@ fn export_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stem = trace::trace_stem(path);
     let analyzed = load_and_analyze(path)?;
-    let (mut app, _trace) = build_app(analyzed, None, stem.clone());
+    let mut app = build_app(&analyzed, None, stem.clone());
 
     // Throttle: CLI flag priority, else auto-detect from trace metadata
     let throttle = throttle.unwrap_or_else(|| {
-        app.metadata
+        analyzed
+            .trace
+            .metadata
             .as_ref()
             .and_then(|m| m.cpu_throttling)
             .unwrap_or(1.0)

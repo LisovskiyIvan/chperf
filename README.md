@@ -50,6 +50,32 @@ chperf traces/
 chperf traces/ --export
 ```
 
+## REPL (interactive)
+
+Load and analyze a trace **once**, then query it live — every command is a
+single pass over the in-memory data, no re-parse:
+
+```sh
+chperf --repl trace.json.gz
+```
+
+```sh
+> names --top 5
+> events RunTask --sort dur --top 10 --around 42555600 --window 1000
+> function render --top 10
+> find setPlayerRespawned --regex
+> worst --task
+> compare after.json.gz        # load second trace, rebuild compare
+> export report.md             # full markdown export of current app
+> summary                      # compare summary (after `compare`)
+> throttle 6 | status | clear | help | quit
+```
+
+Commands mirror the CLI flags (bare words map to flags: `events X` ≡
+`--events X`, `export=file` ≡ `--export=file`); `--around/--window` anchor
+subsequent time-windowed queries. Data is loaded once — a 1.3M-event trace
+loads in ~1.5s and every query answers in tens of milliseconds.
+
 ## Inspect
 
 Granular CLI inspection for questions the summary can't answer — scoped to a
