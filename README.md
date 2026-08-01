@@ -126,6 +126,10 @@ chperf trace.json --find 'frame.*sampleTraceId' --regex
 chperf trace.json --function render --top 10 --json | jq '.sections.functions[0]'
 chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].args'
 
+# Jank clusters: dropped frames / sub-threshold spikes hidden by the summary
+chperf trace.json --jank
+chperf trace.json --jank --top 3 --json | jq '.sections.jank[0]'
+
 # Flags compose: combine --names + --stacks + --function in one run
 ```
 
@@ -144,6 +148,7 @@ chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].ar
 | `--find <pat>` | Search event `args` JSON |
 | `--regex` | Treat `--events`/`--function`/`--find` as regex (not exact/substring) |
 | `--json` | Emit JSON (for jq/pipelines) instead of Markdown |
+| `--jank` | Jank clusters: dropped frames / spikes below the Long Task threshold |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |
 | `--pid <n>` | Restrict to this process |
@@ -165,6 +170,7 @@ chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].ar
 | **Scroll Frames** | Scroll tasks (RunTask containing ULT>50ms or FunctionCall>50ms), avg/P50/P90/P99 duration, bottleneck analysis, per-task breakdown bars (JS/Style/Layout/Paint/Composite/HitTest/Other) |
 | **CPU Profile** | Top functions by self-time from ProfileChunk events, source classification (App/Runtime/Native), stacked distribution bar |
 | **Layout Dirty** | Layout events with dirty/total object counts, avg dirty ratio |
+| **Jank** | Jank clusters: windows with dropped frames or ≥16.7ms spikes (RunTask/FireAnimationFrame/GPUTask) that stay below the 50ms Long Task threshold and disappear in a long trace's average — with the dominating function chain ("what happened") |
 | **Compare** | Side-by-side scroll breakdown bars, key findings (auto-detected regressions/improvements), quick stats diff, style element count comparison, event average diff, CPU profile diff by percentage-point impact |
 
 ### Auto-detected Trace Metadata

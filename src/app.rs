@@ -7,6 +7,7 @@ pub enum Tab {
     ScrollFrames,
     CpuProfile,
     LayoutDirty,
+    Jank,
     Compare,
 }
 
@@ -17,6 +18,7 @@ impl Tab {
             Tab::ScrollFrames,
             Tab::CpuProfile,
             Tab::LayoutDirty,
+            Tab::Jank,
         ];
         if has_compare {
             tabs.push(Tab::Compare);
@@ -30,6 +32,7 @@ impl Tab {
             Tab::ScrollFrames => "Scroll Frames",
             Tab::CpuProfile => "CPU Profile",
             Tab::LayoutDirty => "Layout Dirty",
+            Tab::Jank => "Jank",
             Tab::Compare => "Compare",
         }
     }
@@ -48,6 +51,7 @@ pub struct App {
     pub layout_dirty: LayoutDirtyResult,
     pub style_recalc: StyleRecalcResult,
     pub forced_reflows: ForcedReflowResult,
+    pub jank: JankResult,
     pub compare: Option<CompareResult>,
     pub trace_name_a: String,
     pub trace_name_b: Option<String>,
@@ -63,6 +67,7 @@ impl App {
         layout_dirty: LayoutDirtyResult,
         style_recalc: StyleRecalcResult,
         forced_reflows: ForcedReflowResult,
+        jank: JankResult,
         compare: Option<CompareResult>,
         trace_name_a: String,
         trace_name_b: Option<String>,
@@ -82,6 +87,7 @@ impl App {
             layout_dirty,
             style_recalc,
             forced_reflows,
+            jank,
             compare,
             trace_name_a,
             trace_name_b,
@@ -137,6 +143,7 @@ impl App {
             Tab::ScrollFrames => self.scroll_frames.tasks.len() + 2,
             Tab::CpuProfile => self.cpu_profile.functions.len(),
             Tab::LayoutDirty => self.layout_dirty.entries.len(),
+            Tab::Jank => self.jank.clusters.len(),
             Tab::Compare => self.compare.as_ref().map(|c| c.rows.len()).unwrap_or(0),
         }
     }

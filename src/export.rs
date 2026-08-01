@@ -92,6 +92,9 @@ pub fn export_markdown(app: &App) -> String {
     // ── Forced Reflow ──
     export_forced_reflows(&mut out, &app.forced_reflows);
 
+    // ── Jank Clusters ──
+    export_jank(&mut out, &app.jank);
+
     // ── Event Breakdown ──
     export_event_breakdown(&mut out, &app.summary);
 
@@ -356,6 +359,56 @@ fn export_forced_reflows(out: &mut String, fr: &ForcedReflowResult) {
             fmt_us(e.task_dur_us),
             e.reflow_count,
             fmt_us(e.layout_time_us),
+        ));
+    }
+    out.push('\n');
+}
+
+/// Jank clusters: dropped frames / ≥16.7ms spikes that stay below the 50ms
+/// Long Task threshold and disappear in a long trace's average.
+fn export_jank(out: &mut String, jank: &JankResult) {
+    if jank.clusters.is_empty() && jank.total_dropped == 0 {
+        return;
+    }
+    out.push_str("## Jank Clusters\n\n");
+    out.push_str(&format!(
+        "- **Total dropped frames**: {}\n",
+        jank.total_dropped
+    ));
+    out.push_str(&format!(
+        "- **Bucket size**: {:.0}ms\n\n",
+        jank.bucket_ms
+    ));
+    out.push_str(
+        "Windows where dropped frames or ≥16.7ms spikes (RunTask/FireAnimationFrame/GPUTask)\n\
+         occurred — below the 50ms Long Task threshold, invisible in the summary.\n\n",
+    );
+
+    out.push_str("| # | t | span | busy | max RunTask | max FAF | max GPUTask | dropped | what happened |\n");
+    out.push_str("|---|-----|------|------|-------------|---------|-------------|---------|---------------|\n");
+    for (i, c) in jank.clusters.iter().enumerate() {
+        let calls: String = c
+            .top_calls
+            .iter()
+            .map(|(n, d)| format!("{} ({})", n, fmt_us(*d)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let calls = if calls.is_empty() {
+            "—".to_string()
+        } else {
+            calls
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            i + 1,
+            fmt_us(c.start_us),
+            fmt_us(c.end_us - c.start_us),
+            fmt_us(c.busy_us),
+            fmt_us(c.max_run_us),
+            fmt_us(c.max_faf_us),
+            fmt_us(c.max_gpu_us),
+            c.dropped_frames,
+            calls,
         ));
     }
     out.push('\n');

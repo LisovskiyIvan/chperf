@@ -1021,3 +1021,72 @@ pub fn task_section(
     }
     (out, Value::Array(json_rows))
 }
+
+/// Jank clusters: windows where dropped frames / ≥16.7ms spikes occurred,
+/// even below the 50ms Long Task threshold. See analysis::analyze_jank.
+pub fn jank_section(
+    events: &[TraceEvent],
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    let main_tid = crate::trace::detect_main_thread(events);
+    let res = crate::analysis::analyze_jank(events, main_tid);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Jank Clusters ({} total dropped frames, {}ms buckets)\n\n",
+        res.total_dropped,
+        res.bucket_ms.round() as i64,
+    ));
+    out.push_str(
+        "Windows where dropped frames, ≥16.7ms spikes (RunTask/FireAnimationFrame/GPUTask)\n\
+         or heavy main-thread busy occurred — even below the 50ms Long Task threshold.\n\n",
+    );
+
+    let mut json_rows: Vec<Value> = Vec::new();
+    if res.clusters.is_empty() {
+        out.push_str("No jank clusters found.\n\n");
+        return (out, Value::Array(json_rows));
+    }
+
+    out.push_str("| # | t(ms) | span(ms) | busy(ms) | max RunTask | max FAF | max GPUTask | dropped | what happened |\n");
+    out.push_str("|---|-------|----------|----------|-------------|---------|-------------|---------|---------------|\n");
+    for (i, c) in res.clusters.iter().take(top).enumerate() {
+        let calls: String = c
+            .top_calls
+            .iter()
+            .map(|(n, d)| format!("{} ({:.1}ms)", n, d / 1000.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let calls = if calls.is_empty() {
+            "—".to_string()
+        } else {
+            calls
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            i + 1,
+            fmt_ms(c.start_us - min_ts),
+            fmt_ms(c.end_us - c.start_us),
+            fmt_ms(c.busy_us),
+            fmt_ms(c.max_run_us),
+            fmt_ms(c.max_faf_us),
+            fmt_ms(c.max_gpu_us),
+            c.dropped_frames,
+            calls,
+        ));
+        json_rows.push(json!({
+            "rank": i + 1,
+            "t_us": (c.start_us - min_ts).round(),
+            "span_us": (c.end_us - c.start_us).round(),
+            "busy_us": c.busy_us.round(),
+            "max_run_us": c.max_run_us.round(),
+            "max_faf_us": c.max_faf_us.round(),
+            "max_gpu_us": c.max_gpu_us.round(),
+            "dropped_frames": c.dropped_frames,
+            "top_calls": c.top_calls.iter().map(|(n, d)| json!({"name": n, "dur_us": d.round()})).collect::<Vec<_>>(),
+        }));
+    }
+    out.push('\n');
+    (out, Value::Array(json_rows))
+}

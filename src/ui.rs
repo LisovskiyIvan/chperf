@@ -35,6 +35,17 @@ fn fmt_time(us: f64, factor: f64) -> String {
     }
 }
 
+/// Truncate a long line for table cells (with an ellipsis).
+fn truncate_line(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n).collect();
+        t.push('…');
+        t
+    }
+}
+
 /// Format time with both trace and real time when throttled
 fn fmt_time_dual(us: f64, factor: f64) -> String {
     if factor > 1.0 {
@@ -273,6 +284,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         Tab::ScrollFrames => draw_scroll_frames(frame, app, area),
         Tab::CpuProfile => draw_cpu_profile(frame, app, area),
         Tab::LayoutDirty => draw_layout_dirty(frame, app, area),
+        Tab::Jank => draw_jank(frame, app, area),
         Tab::Compare => draw_compare(frame, app, area),
     }
 }
@@ -1249,6 +1261,100 @@ fn draw_cpu_table(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     frame.render_widget(table, area);
+}
+
+// ── Jank Tab ──
+
+fn draw_jank(frame: &mut Frame, app: &App, area: Rect) {
+    let t = app.throttle_factor;
+    let res = &app.jank;
+    let chunks = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Min(0),
+    ])
+    .split(area);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("  {} jank clusters", res.clusters.len()),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} dropped frames total", res.total_dropped),
+                Style::default().fg(if res.total_dropped > 0 { Color::Red } else { Color::Green }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{}ms buckets", res.bucket_ms.round() as i64),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "  Windows with dropped frames or >=16.7ms spikes (RunTask/FAF/GPUTask) — below the 50ms Long Task threshold",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let rows: Vec<Row> = res
+        .clusters
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let calls: String = c
+                .top_calls
+                .iter()
+                .map(|(n, d)| format!("{} {:.1}ms", n, d / 1000.0 / t))
+                .collect::<Vec<_>>()
+                .join(" → ");
+            Row::new(vec![
+                Cell::from(format!("#{}", i + 1)).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(fmt_time(c.start_us, t)),
+                Cell::from(fmt_time(c.end_us - c.start_us, t)),
+                Cell::from(fmt_time(c.busy_us, t)),
+                Cell::from(fmt_time(c.max_run_us, t))
+                    .style(Style::default().fg(if c.max_run_us > 16_667.0 { Color::Red } else { Color::Yellow })),
+                Cell::from(fmt_time(c.max_faf_us, t))
+                    .style(Style::default().fg(if c.max_faf_us > 16_667.0 { Color::Red } else { Color::Yellow })),
+                Cell::from(fmt_time(c.max_gpu_us, t))
+                    .style(Style::default().fg(if c.max_gpu_us > 16_667.0 { Color::Red } else { Color::Yellow })),
+                Cell::from(format!("{}", c.dropped_frames))
+                    .style(Style::default().fg(if c.dropped_frames > 0 { Color::Red } else { Color::Green })),
+                Cell::from(truncate_line(&calls, 60)),
+            ])
+            .style(row_bg(i))
+        })
+        .collect();
+
+    let visible = visible_rows(&rows, app.scroll_offset, chunks[1].height as usize);
+    let table = Table::new(
+        visible,
+        [
+            Constraint::Length(4),
+            Constraint::Percentage(12),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Length(8),
+            Constraint::Min(20),
+        ],
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Jank Clusters — dropped frames / sub-threshold spikes")
+            .border_style(Style::default().fg(Color::DarkGray)),
+    )
+    .header(
+        Row::new(vec!["#", "t", "span", "busy", "RunTask", "FAF", "GPUTask", "dropped", "what happened"])
+            .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))
+            .bottom_margin(1),
+    );
+    frame.render_widget(table, chunks[1]);
 }
 
 // ── Layout Dirty Tab ──

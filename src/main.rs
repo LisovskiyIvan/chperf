@@ -133,7 +133,11 @@ pub(crate) struct Cli {
 
     /// Inspect: emit JSON (for jq/pipelines) instead of Markdown
     #[arg(long)]
-    pub(crate) json: bool,
+    json: bool,
+
+    /// Inspect: jank clusters (dropped frames / spikes below Long Task threshold)
+    #[arg(long)]
+    jank: bool,
 }
 
 impl Cli {
@@ -149,6 +153,7 @@ impl Cli {
             || self.task
             || self.timeline
             || self.worst
+            || self.jank
     }
 }
 
@@ -165,6 +170,7 @@ pub(crate) struct Analyzed {
     pub(crate) layout_dirty: analysis::LayoutDirtyResult,
     pub(crate) style_recalc: analysis::StyleRecalcResult,
     pub(crate) forced_reflows: analysis::ForcedReflowResult,
+    pub(crate) jank: analysis::JankResult,
 }
 
 pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>> {
@@ -180,7 +186,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
     // The six analysis passes are independent and read-only, so on large
     // traces they run concurrently (each pass itself parallelizes hot work).
     const PARALLEL_THRESHOLD: usize = 200_000;
-    let (summary, scroll_frames, cpu_profile, layout_dirty, style_recalc, forced_reflows) =
+    let (summary, scroll_frames, cpu_profile, layout_dirty, style_recalc, forced_reflows, jank) =
         if events.len() >= PARALLEL_THRESHOLD {
             std::thread::scope(|s| {
                 let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
@@ -189,6 +195,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
                 let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
                 let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
                 let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
+                let g = s.spawn(|| analysis::analyze_jank(events, main_tid));
                 (
                     a.join().unwrap(),
                     b.join().unwrap(),
@@ -196,6 +203,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
                     d.join().unwrap(),
                     e.join().unwrap(),
                     f.join().unwrap(),
+                    g.join().unwrap(),
                 )
             })
         } else {
@@ -206,6 +214,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
                 analysis::analyze_layout_dirty(events, main_tid),
                 analysis::analyze_style_recalc(events, main_tid),
                 analysis::analyze_forced_reflows(events, main_tid),
+                analysis::analyze_jank(events, main_tid),
             )
         };
     Ok(Analyzed {
@@ -215,6 +224,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
         layout_dirty,
         style_recalc,
         forced_reflows,
+        jank,
         trace,
         main_tid,
     })
@@ -253,6 +263,7 @@ fn build_app(
         a.layout_dirty.clone(),
         a.style_recalc.clone(),
         a.forced_reflows.clone(),
+        a.jank.clone(),
         compare_result,
         name_a,
         trace_name_b,
@@ -393,6 +404,12 @@ pub(crate) fn inspect_output(
 
     // Collect sections as (key, markdown, json) triples.
     let mut sections: Vec<(&'static str, String, serde_json::Value)> = Vec::new();
+
+    // --jank: whole-trace cluster detection (dropped frames / sub-threshold spikes).
+    if cli.jank {
+        let (m, j) = inspect::jank_section(events, cli.top, min_ts);
+        sections.push(("jank", m, j));
+    }
 
     if cli.timeline {
         let (m, j) = inspect::timeline_section(events, &scope, cli.bucket, min_ts);
