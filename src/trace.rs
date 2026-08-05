@@ -48,22 +48,30 @@ pub struct TraceEvent {
     #[serde(default)]
     #[allow(dead_code)]
     pub cat: Option<String>,
-    /// Raw `args` JSON, captured without building a Value tree. Most events
-    /// never have their args inspected, so storing the raw bytes keeps the
-    /// load fast and memory low; `args_value()` parses on demand (and caches
-    /// the result, so repeated scans of ProfileChunk payloads stay cheap).
-    #[serde(default)]
-    pub args: Option<Box<serde_json::value::RawValue>>,
+    /// Raw `args` JSON text. The fast tokenizer captures the byte range
+    /// without parsing; serde_json's RawValue would validate (full parse) on
+    /// construction, which is exactly what we're avoiding.
+    #[serde(default, deserialize_with = "deserialize_args_raw")]
+    pub args: Option<String>,
     #[serde(skip)]
     pub(crate) args_cache: std::sync::OnceLock<Option<serde_json::Value>>,
 }
 
+/// Serde fallback: capture the `args` field as raw JSON bytes (zero-copy via
+/// RawValue) and own them as a String. Only used when the fast tokenizer
+/// falls back to serde.
+fn deserialize_args_raw<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<&'de serde_json::value::RawValue>::deserialize(d)?;
+    Ok(raw.map(|r| r.get().to_string()))
+}
+
 /// Test helper: build an event `args` field from a JSON value (stored raw).
 #[cfg(test)]
-pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<serde_json::value::RawValue>> {
-    serde_json::to_string(&v)
-        .ok()
-        .map(|s| serde_json::from_str(&s).expect("raw args json"))
+pub(crate) fn test_args(v: serde_json::Value) -> Option<String> {
+    serde_json::to_string(&v).ok()
 }
 
 impl Clone for TraceEvent {
@@ -90,7 +98,7 @@ impl TraceEvent {
             .get_or_init(|| {
                 self.args
                     .as_deref()
-                    .and_then(|r| serde_json::from_str(r.get()).ok())
+                    .and_then(|r| serde_json::from_str(r).ok())
             })
             .as_ref()
     }
@@ -98,7 +106,370 @@ impl TraceEvent {
     /// Raw `args` JSON text, or `None`.
     #[allow(dead_code)]
     pub fn args_raw(&self) -> Option<&str> {
-        self.args.as_deref().map(|r| r.get())
+        self.args.as_deref()
+    }
+}
+
+/// Fast path: parse all elements in a chunk's byte range [s, e) without
+/// serde. Elements are objects separated by commas (whitespace allowed).
+/// Returns Err when ANY element uses a construct the fast parser bails on
+/// (escaped strings, wrong-typed fields, malformed shapes) — the caller
+/// then falls back to the serde path on the pristine bytes.
+fn parse_events_fast(bytes: &[u8], s: usize, e: usize) -> Result<Vec<TraceEvent>, ()> {
+    // ~200 bytes per event on Chrome traces: reserve to skip reallocs.
+    let mut events: Vec<TraceEvent> = Vec::with_capacity((e - s).max(1) / 200);
+    let mut p = s;
+    loop {
+        p = skip_ws(bytes, p);
+        if p >= e {
+            break;
+        }
+        if bytes[p] == b',' {
+            p += 1;
+            continue;
+        }
+        let (ev, next) = parse_event_fast(bytes, p)?;
+        events.push(ev);
+        p = next;
+    }
+    Ok(events)
+}
+
+/// Parse one event object starting at bytes[p] == b'{'. Returns the event
+/// and the position after its closing '}'.
+fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
+    let len = bytes.len();
+    let mut i = p;
+    if i >= len || bytes[i] != b'{' {
+        return Err(());
+    }
+    let mut ev = TraceEvent {
+        name: String::new(),
+        ph: String::new(),
+        ts: 0.0,
+        dur: None,
+        tid: 0,
+        pid: 0,
+        cat: None,
+        args: None,
+        args_cache: std::sync::OnceLock::new(),
+    };
+    i += 1;
+    loop {
+        i = skip_ws(bytes, i);
+        if i >= len {
+            return Err(());
+        }
+        match bytes[i] {
+            b'}' => return Ok((ev, i + 1)),
+            b',' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let (key, after) = parse_key(bytes, i)?;
+        i = skip_ws(bytes, after);
+        if i >= len || bytes[i] != b':' {
+            return Err(());
+        }
+        i = skip_ws(bytes, i + 1);
+        if i >= len {
+            return Err(());
+        }
+        match key {
+            b"name" => {
+                let (v, a) = parse_string(bytes, i)?;
+                ev.name = v;
+                i = a;
+            }
+            b"ph" => {
+                let (v, a) = parse_string(bytes, i)?;
+                ev.ph = v;
+                i = a;
+            }
+            b"ts" => {
+                let (v, a) = parse_num_f64(bytes, i)?;
+                ev.ts = v;
+                i = a;
+            }
+            b"dur" => {
+                if bytes[i] == b'n' {
+                    if !is_literal_null(bytes, i) {
+                        return Err(());
+                    }
+                    i = skip_value(bytes, i)?;
+                    ev.dur = None;
+                } else {
+                    let (v, a) = parse_num_f64(bytes, i)?;
+                    ev.dur = Some(v);
+                    i = a;
+                }
+            }
+            b"tid" => {
+                let (v, a) = parse_num_u64(bytes, i)?;
+                ev.tid = v;
+                i = a;
+            }
+            b"pid" => {
+                let (v, a) = parse_num_u64(bytes, i)?;
+                ev.pid = v;
+                i = a;
+            }
+            b"cat" => {
+                if bytes[i] == b'n' {
+                    if !is_literal_null(bytes, i) {
+                        return Err(());
+                    }
+                    i = skip_value(bytes, i)?;
+                    ev.cat = None;
+                } else {
+                    let (v, a) = parse_string(bytes, i)?;
+                    ev.cat = Some(v);
+                    i = a;
+                }
+            }
+            b"args" => {
+                if bytes[i] == b'n' {
+                    if !is_literal_null(bytes, i) {
+                        return Err(());
+                    }
+                    i = skip_value(bytes, i)?;
+                    ev.args = None;
+                } else {
+                    let end = skip_value(bytes, i)?;
+                    ev.args = Some(std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?.to_string());
+                    i = end;
+                }
+            }
+            _ => {
+                i = skip_value(bytes, i)?;
+            }
+        }
+        i = skip_ws(bytes, i);
+        if i >= len {
+            return Err(());
+        }
+        match bytes[i] {
+            b',' => i += 1,
+            b'}' => return Ok((ev, i + 1)),
+            _ => return Err(()),
+        }
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut p: usize) -> usize {
+    let len = bytes.len();
+    while p < len && bytes[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    p
+}
+
+/// Raw byte slice of a quoted key (without the quotes). Err on escaped or
+/// unterminated keys.
+fn parse_key(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
+    let len = bytes.len();
+    if p >= len || bytes[p] != b'"' {
+        return Err(());
+    }
+    match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
+        Some(rel) => {
+            let q = p + 1 + rel;
+            if bytes[q] == b'\\' {
+                return Err(());
+            }
+            Ok((&bytes[p + 1..q], q + 1))
+        }
+        None => Err(()),
+    }
+}
+
+/// Unescaped JSON string value (bytes between quotes). Escaped strings are
+/// handled by the serde fallback. Returns (String, pos after closing quote).
+fn parse_string(bytes: &[u8], p: usize) -> Result<(String, usize), ()> {
+    let len = bytes.len();
+    if p >= len || bytes[p] != b'"' {
+        return Err(());
+    }
+    match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
+        Some(rel) => {
+            let q = p + 1 + rel;
+            if bytes[q] == b'\\' {
+                return Err(());
+            }
+            let s = std::str::from_utf8(&bytes[p + 1..q]).map_err(|_| ())?.to_string();
+            Ok((s, q + 1))
+        }
+        None => Err(()),
+    }
+}
+
+/// JSON number as f64. Fast path: pure integer literals (the overwhelmingly
+/// common Chrome form) convert with a single overflow-checked u64→f64 cast
+/// — one correctly-rounded conversion, bit-identical to `str::parse`. Other
+/// forms (fraction, exponent) fall back to `str::parse` on the scanned
+/// slice. Stops at the first char outside the number charset (so ',', '}',
+/// ']' and whitespace end the number). Non-numbers error (serde would too).
+fn parse_num_f64(bytes: &[u8], p: usize) -> Result<(f64, usize), ()> {
+    let len = bytes.len();
+    let mut j = p;
+    let neg = j < len && bytes[j] == b'-';
+    if neg {
+        j += 1;
+    }
+    let dstart = j;
+    while j < len && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j > dstart && !(j < len && matches!(bytes[j], b'.' | b'e' | b'E')) {
+        // Pure integer: single correctly-rounded u64→f64 conversion.
+        let mut acc: u64 = 0;
+        let mut ok = true;
+        for &b in &bytes[dstart..j] {
+            let d = (b - b'0') as u64;
+            if acc > (u64::MAX - d) / 10 {
+                ok = false;
+                break;
+            }
+            acc = acc * 10 + d;
+        }
+        if ok {
+            let v = if neg { -(acc as f64) } else { acc as f64 };
+            return Ok((v, j));
+        }
+    }
+    // Generic: scan the full number charset and delegate to str::parse
+    // (correctly rounded, same as serde_json on real Chrome values).
+    let mut i = p;
+    while i < len && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+        i += 1;
+    }
+    if i == p {
+        return Err(());
+    }
+    let s = std::str::from_utf8(&bytes[p..i]).map_err(|_| ())?;
+    let v: f64 = s.parse().map_err(|_| ())?;
+    Ok((v, i))
+}
+
+/// Unsigned integer value: digits only, no float forms (serde would reject
+/// floats for u64). Err on overflow or empty.
+fn parse_num_u64(bytes: &[u8], p: usize) -> Result<(u64, usize), ()> {
+    let len = bytes.len();
+    let mut i = p;
+    let mut acc: u64 = 0;
+    while i < len && bytes[i].is_ascii_digit() {
+        let d = (bytes[i] - b'0') as u64;
+        if acc > (u64::MAX - d) / 10 {
+            return Err(());
+        }
+        acc = acc * 10 + d;
+        i += 1;
+    }
+    if i == p {
+        return Err(());
+    }
+    if i < len && matches!(bytes[i], b'.' | b'e' | b'E' | b'-' | b'+') {
+        return Err(());
+    }
+    Ok((acc, i))
+}
+
+/// The value starting at p is exactly the literal `null` (not `nullx`).
+fn is_literal_null(bytes: &[u8], p: usize) -> bool {
+    let len = bytes.len();
+    if p + 4 > len || &bytes[p..p + 4] != b"null" {
+        return false;
+    }
+    p + 4 == len || matches!(bytes[p + 4], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Skip one JSON value starting at p (string, object, array, or number /
+/// literal). Returns the position AFTER the value. Err on unterminated.
+fn skip_value(bytes: &[u8], p: usize) -> Result<usize, ()> {
+    let len = bytes.len();
+    if p >= len {
+        return Err(());
+    }
+    match bytes[p] {
+        b'"' => {
+            let mut q = p + 1;
+            loop {
+                let Some(rel) = memchr::memchr(b'"', &bytes[q..]) else {
+                    return Err(());
+                };
+                let idx = q + rel;
+                let mut run = 0usize;
+                let mut k = idx;
+                while k > p && bytes[k - 1] == b'\\' {
+                    run += 1;
+                    k -= 1;
+                }
+                if run.is_multiple_of(2) {
+                    return Ok(idx + 1);
+                }
+                q = idx + 1;
+            }
+        }
+        b'{' | b'[' => {
+            let mut depth = 1i64;
+            let mut in_str = false;
+            let i = p + 1;
+            let mut strings = memchr::memchr3_iter(b'"', b'{', b'[', &bytes[i..]);
+            let mut closes = memchr::memchr2_iter(b'}', b']', &bytes[i..]);
+            let mut q = strings.next();
+            let mut c = closes.next();
+            loop {
+                let (rel, b) = match (q, c) {
+                    (Some(pp), _) if c.is_none_or(|x| pp < x) => {
+                        q = strings.next();
+                        (pp, bytes[i + pp])
+                    }
+                    (_, Some(pp)) => {
+                        c = closes.next();
+                        (pp, bytes[i + pp])
+                    }
+                    _ => return Err(()),
+                };
+                let idx = i + rel;
+                if in_str {
+                    if b == b'"' {
+                        let mut run = 0usize;
+                        let mut k = idx;
+                        while k > p && bytes[k - 1] == b'\\' {
+                            run += 1;
+                            k -= 1;
+                        }
+                        if run.is_multiple_of(2) {
+                            in_str = false;
+                        }
+                    }
+                    continue;
+                }
+                match b {
+                    b'"' => in_str = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(idx + 1);
+                        }
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+        _ => {
+            let mut i = p;
+            while i < len && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                i += 1;
+            }
+            if i == p {
+                return Err(());
+            }
+            Ok(i)
+        }
     }
 }
 
@@ -646,15 +1017,21 @@ fn chunk_work(
         }
     }
 
-    // Separator commas → spaces, in place (disjoint per chunk).
-    for j in &replaced {
-        bytes[*j] = b' ';
-    }
-
     let (s, e) = match (first_start, last_end) {
         (Some(s), e) if e > s => (s, e),
         _ => return Ok((Vec::new(), replaced)),
     };
+
+    // Fast path: hand-rolled tokenizer on the pristine bytes (separator commas
+    // intact). Any failure falls back to the serde stream path below.
+    let t_fast = std::time::Instant::now();
+    let fast = parse_events_fast(bytes, s, e);
+    if let Ok(events) = fast {
+        if std::env::var("CHPERF_DEBUG").is_ok() {
+            eprintln!("  [parse] fast {}..{}: {:.1}ms, {} events", s, e, t_fast.elapsed().as_secs_f64() * 1000.0, events.len());
+        }
+        return Ok((events, Vec::new()));
+    }
 
     // Separator commas → spaces, in place (disjoint per chunk).
     for j in &replaced {
