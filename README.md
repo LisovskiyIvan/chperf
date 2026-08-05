@@ -128,7 +128,32 @@ chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].ar
 
 # Jank clusters: dropped frames / sub-threshold spikes hidden by the summary
 chperf trace.json --jank
-chperf trace.json --jank --top 3 --json | jq '.sections.jank[0]'
+
+# ── Windowed analysis around a semantic anchor (shoot/pre/post) ──
+# --anchor finds the first match in FunctionCall functionName → CPU profile
+# function/URL → event args; the SHOOT window = anchor ± --window (default
+# ±100ms). --delta compares PRE (before) / SHOOT / POST (after) windows:
+# frames, dropped frames, GC, long tasks, CPU samples, busy time.
+chperf trace.json --anchor shoot --delta
+chperf trace.json --anchor weapon.ts --window 250 --stacks --top 10
+
+# Per-frame stats (b/e-paired frame events) + dropped frames, per window.
+chperf trace.json --frames
+chperf trace.json --anchor shoot --frames --window 100
+
+# Inclusive CPU call tree (self + subtree time), pruned to a URL/file or
+# function; ancestors of matches are kept so the path stays visible.
+chperf trace.json --calltree --url weapon.ts --top 40
+
+# GC + long tasks report for the window (--lt sets the long-task threshold).
+chperf trace.json --gc --anchor shoot
+chperf trace.json --gc --lt 30
+
+# Combined search: event args AND CPU profile function names/URLs.
+chperf trace.json --find shoot
+
+# CSV output (every inspector supports it; --json for JSON)
+chperf trace.json --frames --csv | cut -d, -f1,2
 
 # Flags compose: combine --names + --stacks + --function in one run
 ```
@@ -145,9 +170,20 @@ chperf trace.json --jank --top 3 --json | jq '.sections.jank[0]'
 | `--events <a,b,…>` | List events matching these names |
 | `--stats` | Duration distribution (min/avg/p50/p90/p99/max) per event name |
 | `--function <pat>` | Aggregate CPU samples whose function name matches |
-| `--find <pat>` | Search event `args` JSON |
-| `--regex` | Treat `--events`/`--function`/`--find` as regex (not exact/substring) |
+| `--find <pat>` | Search event `args` JSON **and** CPU profile names/URLs |
+| `--calltree` | Inclusive CPU call tree (self + subtree), prune with `--function`/`--url` |
+| `--url <pat>` | Restrict CPU functions/stacks/calltree to source URLs matching |
+| `--gc` | GC (major/minor/other) + long-task report for the window |
+| `--lt <ms>` | Long-task threshold in ms (default 50, with `--gc`/`--delta`) |
+| `--frames` | Per-frame duration stats (b/e-paired) + dropped frames |
+| `--frame-event <name>` | Frame event for `--frames`/`--delta` (default `SubmitCompositorFrameToPresentationCompositorFrame`) |
+| `--anchor <pat>` | Anchor windows on the first FunctionCall/CPU-profile/args match |
+| `--delta` | Compare PRE/SHOOT/POST windows (frames, GC, long tasks, CPU, busy) |
+| `--pre <ms>` | PRE window length before SHOOT (default 500) |
+| `--post <ms>` | POST window length after SHOOT (default 500) |
+| `--regex` | Treat `--events`/`--function`/`--find`/`--anchor`/`--url` as regex |
 | `--json` | Emit JSON (for jq/pipelines) instead of Markdown |
+| `--csv` | Emit CSV (one block per section) instead of Markdown |
 | `--jank` | Jank clusters: dropped frames / spikes below the Long Task threshold |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |

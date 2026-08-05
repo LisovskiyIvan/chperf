@@ -12,8 +12,14 @@ use std::collections::HashMap;
 // ── Time helpers ──
 
 /// Absolute trace start (min `ts` across events), in microseconds.
+/// Metadata events (`thread_name` etc., cat `__metadata`) carry process-start
+/// timestamps and must not define the time base.
 pub fn trace_start_us(events: &[TraceEvent]) -> f64 {
-    events.iter().map(|e| e.ts).fold(f64::INFINITY, f64::min)
+    events
+        .iter()
+        .filter(|e| !crate::trace::is_metadata_event(e))
+        .map(|e| e.ts)
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Absolute trace end (max `ts + dur`), in microseconds.
@@ -21,20 +27,6 @@ fn trace_end_us(events: &[TraceEvent]) -> f64 {
     events
         .iter()
         .fold(0.0f64, |acc, e| acc.max(e.ts + e.dur.unwrap_or(0.0)))
-}
-
-/// An absolute `[lo, hi]` time window in microseconds, derived from
-/// `--around <ms_from_start>` and `--window <half_ms>`.
-pub fn window_us(
-    around_ms: Option<f64>,
-    window_ms: Option<f64>,
-    min_ts: f64,
-) -> Option<(f64, f64)> {
-    let around = around_ms?;
-    let half_ms = window_ms.unwrap_or(100.0); // default ±100ms
-    let center = min_ts + around * 1000.0;
-    let half = half_ms * 1000.0;
-    Some((center - half, center + half))
 }
 
 fn in_window(ts: f64, window: Option<(f64, f64)>) -> bool {
@@ -65,7 +57,7 @@ fn args_compact(args: &Option<Value>, full: bool) -> String {
     }
 }
 
-fn window_label(window: Option<(f64, f64)>) -> &'static str {
+pub(crate) fn window_label(window: Option<(f64, f64)>) -> &'static str {
     match window {
         Some(_) => "windowed",
         None => "full trace",
@@ -102,7 +94,18 @@ impl Scope {
                 .map_or(true, |c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
     }
 
-    fn window_line(&self, min_ts: f64) -> Option<String> {
+    /// Thread/process/category filter without the window check — for CPU
+    /// profile chunks, where per-sample times are attributed individually.
+    pub fn allows_chunk(&self, e: &TraceEvent) -> bool {
+        self.tid.is_none_or(|t| e.tid == t)
+            && self.pid.is_none_or(|p| e.pid == p)
+            && self
+                .cat
+                .as_deref()
+                .map_or(true, |c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
+    }
+
+    pub(crate) fn window_line(&self, min_ts: f64) -> Option<String> {
         self.window.map(|(lo, hi)| {
             format!(
                 "- **Window**: {:.2}ms … {:.2}ms from trace start\n",
@@ -142,14 +145,14 @@ impl Matcher {
         }
     }
 
-    fn matches(&self, s: &str) -> bool {
+    pub(crate) fn matches(&self, s: &str) -> bool {
         match self {
             Matcher::Substr(p) => contains_ignore_case(s, p),
             Matcher::Regex(re) => re.is_match(s),
         }
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Matcher::Substr(p) => format!("`{}`", p),
             Matcher::Regex(re) => format!("/{}/", re.as_str()),
@@ -662,6 +665,44 @@ pub fn find_section(
         ));
     }
     out.push('\n');
+
+    // Combined search: also match CPU profile function names and source URLs.
+    let (node_map, self_times) = crate::analysis::scan_profile_chunks(events, Some(scope), 0);
+    let mut cpu_matches: Vec<(String, String, f64)> = self_times
+        .iter()
+        .filter_map(|(id, t)| node_map.get(id).map(|(n, u, _)| (n.clone(), u.clone(), *t)))
+        .filter(|(n, u, _)| matcher.matches(n) || matcher.matches(u))
+        .collect();
+    cpu_matches.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+    out.push_str(&format!(
+        "### CPU profile matches ({} functions/URLs)\n\n",
+        cpu_matches.len(),
+    ));
+    if cpu_matches.is_empty() {
+        out.push_str("No CPU profile matches.\n\n");
+        return (out, Value::Array(json_rows));
+    }
+    out.push_str("| # | function | self(ms) | url |\n");
+    out.push_str("|---|----------|----------|-----|\n");
+    for (i, (name, url, t)) in cpu_matches.iter().take(top).enumerate() {
+        let short_url = url.rfind('/').map(|i| &url[i + 1..]).unwrap_or(url);
+        let label = if name.is_empty() { "(anonymous)" } else { name };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            i + 1,
+            label,
+            fmt_ms(*t),
+            short_url,
+        ));
+        json_rows.push(json!({
+            "source": "cpu-profile",
+            "function": if name.is_empty() { "(anonymous)" } else { name },
+            "self_us": t.round(),
+            "url": url,
+        }));
+    }
+    out.push('\n');
     (out, Value::Array(json_rows))
 }
 
@@ -1024,13 +1065,16 @@ pub fn task_section(
 
 /// Jank clusters: windows where dropped frames / ≥16.7ms spikes occurred,
 /// even below the 50ms Long Task threshold. See analysis::analyze_jank.
+/// Honors the scope's window: events outside are ignored, and hot buckets
+/// are not merged across the window boundary.
 pub fn jank_section(
     events: &[TraceEvent],
+    scope: &Scope,
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
     let main_tid = crate::trace::detect_main_thread(events);
-    let res = crate::analysis::analyze_jank(events, main_tid);
+    let res = crate::analysis::analyze_jank(events, main_tid, Some(scope));
 
     let mut out = String::new();
     out.push_str(&format!(

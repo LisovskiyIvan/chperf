@@ -5,6 +5,7 @@ mod inspect;
 mod repl;
 mod trace;
 mod ui;
+mod windowed;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::*;
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(name = "chperf", about = "Chrome DevTools Trace JSON analyzer (TUI)")]
@@ -135,9 +137,57 @@ pub(crate) struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Inspect: emit CSV instead of Markdown (--json for JSON)
+    #[arg(long)]
+    pub(crate) csv: bool,
+
     /// Inspect: jank clusters (dropped frames / spikes below Long Task threshold)
     #[arg(long)]
     jank: bool,
+
+    /// Inspect: anchor windows on the first FunctionCall functionName /
+    /// CPU profile function or URL / event-args match of this substring
+    #[arg(long)]
+    pub(crate) anchor: Option<String>,
+
+    /// Inspect: PRE window length in ms before the SHOOT window (default 500)
+    #[arg(long, default_value_t = 500.0)]
+    pub(crate) pre: f64,
+
+    /// Inspect: POST window length in ms after the SHOOT window (default 500)
+    #[arg(long, default_value_t = 500.0)]
+    pub(crate) post: f64,
+
+    /// Inspect: compare PRE / SHOOT / POST windows (frames, dropped frames,
+    /// GC, long tasks, CPU samples, busy time) with deltas
+    #[arg(long)]
+    pub(crate) delta: bool,
+
+    /// Inspect: inclusive CPU call tree (self + subtree time); prune with
+    /// --function / --url
+    #[arg(long)]
+    pub(crate) calltree: bool,
+
+    /// Inspect: restrict CPU functions/stacks/calltree to source URLs
+    /// containing this substring
+    #[arg(long)]
+    pub(crate) url: Option<String>,
+
+    /// Inspect: GC + long-task report for the window
+    #[arg(long)]
+    pub(crate) gc: bool,
+
+    /// Inspect: long-task threshold in ms (default 50, use with --gc/--delta)
+    #[arg(long, default_value_t = 50.0)]
+    pub(crate) lt: f64,
+
+    /// Inspect: per-frame duration stats (b/e-paired events) for the window
+    #[arg(long)]
+    pub(crate) frames: bool,
+
+    /// Inspect: frame event name for --frames/--delta
+    #[arg(long, default_value = "SubmitCompositorFrameToPresentationCompositorFrame")]
+    pub(crate) frame_event: String,
 }
 
 impl Cli {
@@ -154,6 +204,11 @@ impl Cli {
             || self.timeline
             || self.worst
             || self.jank
+            || self.anchor.is_some()
+            || self.delta
+            || self.calltree
+            || self.gc
+            || self.frames
     }
 }
 
@@ -195,7 +250,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
                 let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
                 let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
                 let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
-                let g = s.spawn(|| analysis::analyze_jank(events, main_tid));
+                let g = s.spawn(|| analysis::analyze_jank(events, main_tid, None));
                 (
                     a.join().unwrap(),
                     b.join().unwrap(),
@@ -214,7 +269,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
                 analysis::analyze_layout_dirty(events, main_tid),
                 analysis::analyze_style_recalc(events, main_tid),
                 analysis::analyze_forced_reflows(events, main_tid),
-                analysis::analyze_jank(events, main_tid),
+                analysis::analyze_jank(events, main_tid, None),
             )
         };
     Ok(Analyzed {
@@ -354,30 +409,62 @@ pub(crate) fn inspect_output(
         cat: cli.cat.as_deref().map(|c| c.to_lowercase()),
     };
 
-    // Determine the time anchor: --worst finds the longest RunTask, else --around.
+    // Determine the time anchor, in absolute µs:
+    // --worst (longest RunTask) > --anchor <substring> > --around <ms>.
+    // `ms` values are always relative to the (metadata-free) trace start.
     let mut anchor_note: Option<String> = None;
-    let (around_ms, window_ms) = if cli.worst {
-        match inspect::worst_runtask(events, &scope_nowin) {
-            Some((ts, dur)) => {
-                let a = (ts - min_ts) / 1000.0;
-                let w = cli.window.unwrap_or_else(|| (dur / 1000.0 / 2.0).max(50.0));
+    let mut anchor_ts: Option<f64> = None;
+    let mut window_ms = cli.window;
+    if cli.worst {
+        if let Some((ts, dur)) = inspect::worst_runtask(events, &scope_nowin) {
+            let w = cli.window.unwrap_or_else(|| (dur / 1000.0 / 2.0).max(50.0));
+            window_ms = Some(w);
+            anchor_note = Some(format!(
+                "Anchored at worst RunTask: t={:.2}ms, dur={:.2}ms (window ±{:.0}ms)",
+                (ts - min_ts) / 1000.0,
+                dur / 1000.0,
+                w
+            ));
+            anchor_ts = Some(ts);
+        }
+    } else if let Some(pattern) = &cli.anchor {
+        let m = inspect::Matcher::new(pattern, cli.regex)?;
+        match windowed::find_anchor(events, &m) {
+            Some(a) => {
+                anchor_ts = Some(a.ts);
                 anchor_note = Some(format!(
-                    "Anchored at worst RunTask: t={:.2}ms, dur={:.2}ms (window ±{:.0}ms)",
-                    a,
-                    dur / 1000.0,
-                    w
+                    "Anchored at {} `{}` — t={:.2}ms",
+                    a.kind,
+                    a.label,
+                    (a.ts - min_ts) / 1000.0
                 ));
-                (Some(a), Some(w))
             }
-            None => (cli.around, cli.window),
+            None => {
+                eprintln!("warning: --anchor {} matched nothing", pattern);
+            }
         }
     } else {
-        (cli.around, cli.window)
-    };
+        anchor_ts = cli.around.map(|ms| min_ts + ms * 1000.0);
+    }
 
-    let window = inspect::window_us(around_ms, window_ms, min_ts);
+    // SHOOT = anchor ± window (half-width). PRE and POST sit adjacent and
+    // exist for --delta comparisons.
+    let half_ms = window_ms.unwrap_or(100.0);
+    let shoot = anchor_ts.map(|ts| (ts - half_ms * 1000.0, ts + half_ms * 1000.0));
+    let pre = anchor_ts.map(|ts| {
+        (
+            ts - (cli.pre + half_ms) * 1000.0,
+            ts - half_ms * 1000.0,
+        )
+    });
+    let post = anchor_ts.map(|ts| {
+        (
+            ts + half_ms * 1000.0,
+            ts + (half_ms + cli.post) * 1000.0,
+        )
+    });
     let scope = inspect::Scope {
-        window,
+        window: shoot,
         tid,
         pid: cli.pid,
         cat: scope_nowin.cat.clone(),
@@ -406,8 +493,9 @@ pub(crate) fn inspect_output(
     let mut sections: Vec<(&'static str, String, serde_json::Value)> = Vec::new();
 
     // --jank: whole-trace cluster detection (dropped frames / sub-threshold spikes).
+    // With a window scope, detection is restricted to the window.
     if cli.jank {
-        let (m, j) = inspect::jank_section(events, cli.top, min_ts);
+        let (m, j) = inspect::jank_section(events, &scope, cli.top, min_ts);
         sections.push(("jank", m, j));
     }
 
@@ -467,10 +555,59 @@ pub(crate) fn inspect_output(
         let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), &scope, cli.top, min_ts);
         sections.push(("stacks", md, j));
     }
+    if cli.calltree {
+        let url_matcher = if let Some(p) = &cli.url {
+            Some(inspect::Matcher::new(p, cli.regex)?)
+        } else {
+            None
+        };
+        let (md, j) = windowed::calltree_section(
+            events,
+            &scope,
+            func_matcher.as_ref(),
+            url_matcher.as_ref(),
+            cli.top,
+            min_ts,
+        );
+        sections.push(("calltree", md, j));
+    }
+    if cli.gc {
+        let (md, j) = windowed::gc_section(events, &scope, cli.lt, min_ts);
+        sections.push(("gc", md, j));
+    }
+    if cli.frames {
+        let (md, j) = windowed::frames_section(events, &scope, &cli.frame_event, min_ts);
+        sections.push(("frames", md, j));
+    }
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
         let (md, j) = inspect::find_section(events, &m, &scope, cli.full_args, cli.top, min_ts);
         sections.push(("find", md, j));
+    }
+
+    // --delta: PRE/SHOOT/POST comparison around the anchor.
+    if cli.delta {
+        match (pre, shoot, post, anchor_ts) {
+            (Some(p), Some(s), Some(q), Some(a)) => {
+                let (md, j) = windowed::delta_section(
+                    events,
+                    p,
+                    s,
+                    q,
+                    a,
+                    &cli.frame_event,
+                    cli.lt,
+                    min_ts,
+                );
+                sections.push(("delta", md, j));
+            }
+            _ => sections.push((
+                "delta",
+                "**--delta requires an anchor: --anchor <substr>, --around <ms> or --worst.**\n\n"
+                    .to_string(),
+                Value::Null,
+            )),
+        }
     }
 
     // --worst with no other section: default to listing RunTask around the anchor.
@@ -500,7 +637,7 @@ pub(crate) fn inspect_output(
         }
         obj.insert(
             "window".into(),
-            match window {
+            match shoot {
                 Some((lo, hi)) => serde_json::json!([
                     ((lo - min_ts) / 1000.0).round(),
                     ((hi - min_ts) / 1000.0).round(),
@@ -514,13 +651,34 @@ pub(crate) fn inspect_output(
         }
         obj.insert("sections".into(), serde_json::Value::Object(secs));
         println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
+    } else if cli.csv {
+        // One CSV block per section, prefixed by a `# section` comment line.
+        // Sections that emit an object (e.g. --delta) render each array
+        // field as its own block.
+        for (k, _, j) in &sections {
+            match j {
+                Value::Array(rows) => {
+                    println!("# {}", k);
+                    print!("{}", windowed::rows_to_csv(rows));
+                }
+                Value::Object(o) => {
+                    for (field, v) in o {
+                        if let Value::Array(rows) = v {
+                            println!("# {}.{}", k, field);
+                            print!("{}", windowed::rows_to_csv(rows));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     } else {
         let mut out = String::new();
         out.push_str(&format!("# chperf inspect: {}\n\n", trace_name));
         if let Some(ref note) = anchor_note {
             out.push_str(&format!("**{}**\n\n", note));
         }
-        if let Some((lo, hi)) = window {
+        if let Some((lo, hi)) = shoot {
             out.push_str(&format!(
                 "**Window**: {:.2}ms … {:.2}ms from trace start\n\n",
                 (lo - min_ts) / 1000.0,

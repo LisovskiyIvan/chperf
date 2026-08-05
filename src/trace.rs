@@ -697,6 +697,17 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     Ok(trace)
 }
 
+/// Metadata events (`thread_name`/`process_name`/…, cat `__metadata`) carry
+/// `ts` from process start — often far before the actual session. They must be
+/// excluded from time-base computations, or every "ms from trace start" window
+/// lands in dead time.
+pub fn is_metadata_event(e: &TraceEvent) -> bool {
+    matches!(
+        e.name.as_str(),
+        "thread_name" | "process_name" | "thread_sort_index" | "process_sort_index"
+    ) || e.cat.as_deref() == Some("__metadata")
+}
+
 /// Detect main thread: first RunTask with dur > 500ms
 pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     for e in events {

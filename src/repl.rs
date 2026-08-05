@@ -294,6 +294,8 @@ fn print_help() {
     println!("  names [--top N] | threads [--top N] | timeline [--around MS] [--window MS] [--bucket MS]");
     println!("  stats <names> | function <pat> [--regex] | find <pat> [--regex] [--full-args] | jank [--top N]");
     println!("  worst [--task] [--stacks] [--top N] | task [--top N] | stacks [--function P] [--top N] | flame [--function P]");
+    println!("  anchor <pat> [--delta] [--pre MS] [--post MS] [--window MS] | delta | calltree [--url P] [--function P]");
+    println!("  gc [--lt MS] | frames [--frame-event NAME] | csv (add --csv to any query)");
     println!("  compare <file2> | export [file] | summary | throttle N | status | clear | help | quit");
     println!("  every query also accepts [--json] for jq/pipelines");
     println!();

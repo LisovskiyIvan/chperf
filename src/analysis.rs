@@ -53,6 +53,9 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
     let mut max_ts = 0.0f64;
 
     for e in events {
+        if crate::trace::is_metadata_event(e) {
+            continue;
+        }
         let end = e.ts + e.dur.unwrap_or(0.0);
         if e.ts < min_ts {
             min_ts = e.ts;
@@ -362,18 +365,23 @@ pub fn scan_profile_chunks(
     reserve_threads: usize,
 ) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
     const MIN_CHUNK_WORK: usize = 64_000;
+    // Sample times are reconstructed from a sequential walk over chunks
+    // (see `profile_chunk_bases`), so they're independent of this split.
+    let bases = profile_chunk_bases(events);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(reserve_threads).max(1))
         .unwrap_or(1);
     let threads = threads.max(1);
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
-        return scan_profile_chunk(events, scope);
+        return scan_profile_chunk(events, 0, scope, &bases);
     }
     let chunk = events.len().div_ceil(threads);
+    let bases = &bases;
     std::thread::scope(|s| {
         let handles: Vec<_> = events
             .chunks(chunk)
-            .map(|c| s.spawn(|| scan_profile_chunk(c, scope)))
+            .enumerate()
+            .map(|(ci, c)| s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases)))
             .collect();
         let mut nodes: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
         let mut times: HashMap<u64, f64> = HashMap::new();
@@ -390,15 +398,63 @@ pub fn scan_profile_chunks(
     })
 }
 
+/// Sequential walk over ProfileChunks: absolute sample times are not
+/// derivable from a chunk alone. `timeDeltas` are *inter-sample* gaps:
+/// delta[0] = gap since the previous chunk's last sample (or the profile
+/// start), delta[i] = gap between sample i−1 and sample i. Each delta is
+/// therefore the weight of its sample, and the absolute time of sample i is
+/// `base + sum(deltas[0..=i])`, where `base` = time of the previous chunk's
+/// last sample + this chunk's first delta. The walk is anchored per process
+/// on the `Profile` (ph=P) event's ts. Returns the base per event index.
+fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
+    let mut starts: HashMap<u64, f64> = HashMap::new();
+    for e in events {
+        if e.name == "Profile" && e.ph == "P" {
+            starts.entry(e.pid).or_insert(e.ts);
+        }
+    }
+    let mut bases: HashMap<usize, f64> = HashMap::new();
+    let mut prev_last: HashMap<u64, f64> = HashMap::new(); // last sample time per pid
+    for (idx, e) in events.iter().enumerate() {
+        if e.name != "ProfileChunk" {
+            continue;
+        }
+        let Some(td) = e
+            .args
+            .as_ref()
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.get("timeDeltas"))
+            .and_then(|t| t.as_array())
+        else {
+            continue;
+        };
+        let Some(first) = td.first().and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        let pl = prev_last
+            .get(&e.pid)
+            .copied()
+            .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
+        bases.insert(idx, pl + first);
+        let sum: f64 = td.iter().filter_map(|v| v.as_f64()).sum();
+        prev_last.insert(e.pid, pl + sum);
+    }
+    bases
+}
+
 /// Single-threaded scan of one events slice, shared by the parallel helper.
+/// `global_offset` maps slice-local indices back to event indices for the
+/// chunk bases lookup.
 fn scan_profile_chunk(
     events: &[TraceEvent],
+    global_offset: usize,
     scope: Option<&Scope>,
+    bases: &HashMap<usize, f64>,
 ) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
     let mut node_map: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
     let mut self_times: HashMap<u64, f64> = HashMap::new();
 
-    for e in events {
+    for (i, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
             continue;
         }
@@ -435,18 +491,42 @@ fn scan_profile_chunk(
         }
 
         if let Some(scope) = scope {
-            if !scope.allows_event(e) {
+            if !scope.allows_chunk(e) {
                 continue;
             }
         }
         let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
         let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
 
+        // Each `timeDeltas[i]` is the interval its sample represents (gap to
+        // the previous sample; the first is the gap from the previous
+        // chunk). Sample i lives at `base + prefix(deltas[0..=i])`. The old
+        // code summed deltas directly (cumulative-sum inflation, ~83x on
+        // long traces) and filtered chunks by the chunk's own ts, not the
+        // samples'. Windowed scopes now attribute per-sample by absolute
+        // sample time.
         if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
-            for (sample, delta) in samples.iter().zip(deltas.iter()) {
-                let node_id = sample.as_u64().unwrap_or(0);
-                let dt = delta.as_f64().unwrap_or(0.0);
-                *self_times.entry(node_id).or_default() += dt;
+            let n = samples.len().min(deltas.len());
+            if n == 0 {
+                continue;
+            }
+            let base = bases.get(&(global_offset + i)).copied().unwrap_or(0.0);
+            let mut sample_ts = base;
+            for k in 0..n {
+                let weight = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
+                if let Some(scope) = scope {
+                    if let Some((lo, hi)) = scope.window {
+                        if sample_ts < lo || sample_ts > hi {
+                            sample_ts += weight;
+                            continue;
+                        }
+                    }
+                }
+                if weight > 0.0 {
+                    let node_id = samples[k].as_u64().unwrap_or(0);
+                    *self_times.entry(node_id).or_default() += weight;
+                }
+                sample_ts += weight;
             }
         }
     }
@@ -1175,9 +1255,15 @@ fn bucket_hot(busy: f64, max_run: f64, max_faf: f64, max_gpu: f64, dropped: u32)
 /// clusters, ranked by dropped frames → worst spike → busy. For each top
 /// cluster, the dominating FunctionCalls are collected (the "what happened"
 /// chain). This catches spikes that the 50ms Long Task summary misses.
-pub fn analyze_jank(events: &[TraceEvent], main_tid: u64) -> JankResult {
-    let min_ts = events.iter().map(|e| e.ts).fold(f64::INFINITY, f64::min);
-    let max_ts = events.iter().fold(0.0f64, |acc, e| acc.max(e.ts + e.dur.unwrap_or(0.0)));
+pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>) -> JankResult {
+    let min_ts = events
+        .iter()
+        .filter(|e| !crate::trace::is_metadata_event(e))
+        .map(|e| e.ts)
+        .fold(f64::INFINITY, f64::min);
+    let max_ts = events
+        .iter()
+        .fold(0.0f64, |acc, e| acc.max(e.ts + e.dur.unwrap_or(0.0)));
     let span_us = (max_ts - min_ts).max(1.0);
 
     let bucket_ms = (span_us / 1000.0 / 2000.0).clamp(50.0, 1000.0);
@@ -1189,7 +1275,20 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64) -> JankResult {
     let mut max_gpu = vec![0.0f64; n];
     let mut dropped = vec![0u32; n];
 
+    // When scoped, events outside the window are ignored entirely: hot-bucket
+    // merging must not cross the window boundary either.
+    let win_lo = scope.and_then(|s| s.window).map(|(lo, _)| lo);
+    let win_hi = scope.and_then(|s| s.window).map(|(_, hi)| hi);
+
     for e in events {
+        if e.ts < min_ts || e.ts > max_ts {
+            continue;
+        }
+        if let (Some(lo), Some(hi)) = (win_lo, win_hi) {
+            if e.ts < lo || e.ts > hi {
+                continue;
+            }
+        }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         match e.name.as_str() {
             "RunTask" if e.ph == "X" && e.tid == main_tid => {
@@ -1234,6 +1333,18 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64) -> JankResult {
     let mut accs: Vec<Acc> = Vec::new();
     for b in 0..n {
         let hot = bucket_hot(busy[b], max_run[b], max_faf[b], max_gpu[b], dropped[b]);
+        if !hot {
+            continue;
+        }
+        if scope.and_then(|s| s.window).is_some() {
+            // Windowed: never merge across buckets outside the window.
+            let b_lo = min_ts + b as f64 * bucket_us;
+            let b_hi = b_lo + bucket_us;
+            let in_win = win_lo.is_none_or(|w| b_hi > w) && win_hi.is_none_or(|w| b_lo < w);
+            if !in_win {
+                continue;
+            }
+        }
         match (accs.last_mut(), hot) {
             (Some(a), true) if a.end + 1 == b => {
                 a.end = b;
@@ -1279,6 +1390,11 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64) -> JankResult {
     for e in events {
         if e.name != "FunctionCall" || e.ph != "X" {
             continue;
+        }
+        if let (Some(lo), Some(hi)) = (win_lo, win_hi) {
+            if e.ts < lo || e.ts > hi {
+                continue;
+            }
         }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         if let Some(ci) = in_cluster[b] {
