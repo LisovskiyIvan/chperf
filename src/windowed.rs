@@ -743,6 +743,95 @@ fn delta_windows_stats(
     (out[0].clone(), out[1].clone(), out[2].clone())
 }
 
+// ── Delta data (raw, shared by the per-trace section and windowed compare) ──
+
+/// One metric row of the PRE/SHOOT/POST comparison in raw units: µs for
+/// `ms` metrics, counts for `n` metrics.
+#[derive(Clone)]
+pub struct DeltaRow {
+    pub metric: String,
+    pub unit: &'static str,
+    pub pre: f64,
+    pub shoot: f64,
+    pub post: f64,
+}
+
+impl DeltaRow {
+    pub fn delta_pre(&self) -> f64 {
+        self.shoot - self.pre
+    }
+    pub fn delta_post(&self) -> f64 {
+        self.post - self.shoot
+    }
+}
+
+/// Raw delta analysis for one trace.
+#[derive(Clone)]
+pub struct DeltaData {
+    pub rows: Vec<DeltaRow>,
+    /// Top CPU self-time (function, µs) per window: [PRE, SHOOT, POST].
+    pub top_cpu: [Vec<(String, f64)>; 3],
+    pub anchor_us: f64,
+    pub pre: (f64, f64),
+    pub shoot: (f64, f64),
+    pub post: (f64, f64),
+}
+
+/// Compute the PRE/SHOOT/POST metric rows for one trace (frames, dropped
+/// frames, GC, long tasks, busy/JS time, CPU samples) in raw units.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_data(
+    events: &[TraceEvent],
+    pre: (f64, f64),
+    shoot: (f64, f64),
+    post: (f64, f64),
+    anchor_ts: f64,
+    frame_event: &str,
+    lt_ms: f64,
+) -> DeltaData {
+    let main_tid = crate::trace::detect_main_thread(events);
+    let (s_pre, s_shoot, s_post) =
+        delta_windows_stats(events, pre, shoot, post, frame_event, lt_ms, main_tid);
+
+    let mut rows: Vec<DeltaRow> = Vec::new();
+    let mut push = |metric: &str, unit: &'static str, pre: f64, shoot: f64, post: f64| {
+        rows.push(DeltaRow {
+            metric: metric.to_string(),
+            unit,
+            pre,
+            shoot,
+            post,
+        });
+    };
+    push("frames", "n", s_pre.frames_n as f64, s_shoot.frames_n as f64, s_post.frames_n as f64);
+    for (i, name) in ["frame p50", "frame p90", "frame p99", "frame max"].iter().enumerate() {
+        push(name, "ms", s_pre.frames[i], s_shoot.frames[i], s_post.frames[i]);
+    }
+    push("dropped frames", "n", s_pre.dropped as f64, s_shoot.dropped as f64, s_post.dropped as f64);
+    push(
+        &format!("long tasks ≥{:.0}ms", lt_ms),
+        "n",
+        s_pre.lt_count as f64,
+        s_shoot.lt_count as f64,
+        s_post.lt_count as f64,
+    );
+    push("long task time", "ms", s_pre.lt_us, s_shoot.lt_us, s_post.lt_us);
+    push("main busy (RunTask)", "ms", s_pre.runtask_us, s_shoot.runtask_us, s_post.runtask_us);
+    push("JS (FunctionCall)", "ms", s_pre.js_us, s_shoot.js_us, s_post.js_us);
+    push("GC (Major+Minor)", "ms", s_pre.gc_us, s_shoot.gc_us, s_post.gc_us);
+    push("GC count", "n", s_pre.gc_count as f64, s_shoot.gc_count as f64, s_post.gc_count as f64);
+    push("CPU samples", "ms", s_pre.cpu_us, s_shoot.cpu_us, s_post.cpu_us);
+
+    DeltaData {
+        rows,
+        top_cpu: [s_pre.top_cpu, s_shoot.top_cpu, s_post.top_cpu],
+        anchor_us: anchor_ts,
+        pre,
+        shoot,
+        post,
+    }
+}
+
 /// Compare PRE / SHOOT / POST windows around an anchor: frame stats, dropped
 /// frames, GC, long tasks, main-thread busy/JS and CPU sample totals, plus
 /// SHOOT−PRE and POST−SHOOT deltas.
@@ -757,120 +846,12 @@ pub fn delta_section(
     lt_ms: f64,
     min_ts: f64,
 ) -> (String, Value) {
-    let main_tid = crate::trace::detect_main_thread(events);
-    let (s_pre, s_shoot, s_post) =
-        delta_windows_stats(events, pre, shoot, post, frame_event, lt_ms, main_tid);
+    let data = delta_data(events, pre, shoot, post, anchor_ts, frame_event, lt_ms);
 
     let ms = |v: f64| format!("{:.1}", v / 1000.0);
     let dms = |a: f64, b: f64| format!("{:+.1}", (b - a) / 1000.0);
-    let dcount = |a: usize, b: usize| format!("{:+}", b as i64 - a as i64);
-
-    let mut rows: Vec<(String, String, String, String, String, String, String)> = Vec::new();
-    let mut push = |metric: &str, unit: &str, pre_v: String, shoot_v: String, post_v: String, dpre: String, dpost: String| {
-        rows.push((
-            metric.to_string(),
-            unit.to_string(),
-            pre_v,
-            shoot_v,
-            post_v,
-            dpre,
-            dpost,
-        ));
-    };
-
-    push(
-        "frames",
-        "n",
-        s_pre.frames_n.to_string(),
-        s_shoot.frames_n.to_string(),
-        s_post.frames_n.to_string(),
-        dcount(s_pre.frames_n, s_shoot.frames_n),
-        dcount(s_shoot.frames_n, s_post.frames_n),
-    );
-    for (i, name) in ["frame p50", "frame p90", "frame p99", "frame max"].iter().enumerate() {
-        push(
-            name,
-            "ms",
-            ms(s_pre.frames[i]),
-            ms(s_shoot.frames[i]),
-            ms(s_post.frames[i]),
-            dms(s_pre.frames[i], s_shoot.frames[i]),
-            dms(s_shoot.frames[i], s_post.frames[i]),
-        );
-    }
-    push(
-        "dropped frames",
-        "n",
-        s_pre.dropped.to_string(),
-        s_shoot.dropped.to_string(),
-        s_post.dropped.to_string(),
-        dcount(s_pre.dropped, s_shoot.dropped),
-        dcount(s_shoot.dropped, s_post.dropped),
-    );
-    let lt_label = format!("long tasks ≥{:.0}ms", lt_ms);
-    push(
-        &lt_label,
-        "n",
-        s_pre.lt_count.to_string(),
-        s_shoot.lt_count.to_string(),
-        s_post.lt_count.to_string(),
-        dcount(s_pre.lt_count, s_shoot.lt_count),
-        dcount(s_shoot.lt_count, s_post.lt_count),
-    );
-    push(
-        "long task time",
-        "ms",
-        ms(s_pre.lt_us),
-        ms(s_shoot.lt_us),
-        ms(s_post.lt_us),
-        dms(s_pre.lt_us, s_shoot.lt_us),
-        dms(s_shoot.lt_us, s_post.lt_us),
-    );
-    push(
-        "main busy (RunTask)",
-        "ms",
-        ms(s_pre.runtask_us),
-        ms(s_shoot.runtask_us),
-        ms(s_post.runtask_us),
-        dms(s_pre.runtask_us, s_shoot.runtask_us),
-        dms(s_shoot.runtask_us, s_post.runtask_us),
-    );
-    push(
-        "JS (FunctionCall)",
-        "ms",
-        ms(s_pre.js_us),
-        ms(s_shoot.js_us),
-        ms(s_post.js_us),
-        dms(s_pre.js_us, s_shoot.js_us),
-        dms(s_shoot.js_us, s_post.js_us),
-    );
-    push(
-        "GC (Major+Minor)",
-        "ms",
-        ms(s_pre.gc_us),
-        ms(s_shoot.gc_us),
-        ms(s_post.gc_us),
-        dms(s_pre.gc_us, s_shoot.gc_us),
-        dms(s_shoot.gc_us, s_post.gc_us),
-    );
-    push(
-        "GC count",
-        "n",
-        s_pre.gc_count.to_string(),
-        s_shoot.gc_count.to_string(),
-        s_post.gc_count.to_string(),
-        dcount(s_pre.gc_count, s_shoot.gc_count),
-        dcount(s_shoot.gc_count, s_post.gc_count),
-    );
-    push(
-        "CPU samples",
-        "ms",
-        ms(s_pre.cpu_us),
-        ms(s_shoot.cpu_us),
-        ms(s_post.cpu_us),
-        dms(s_pre.cpu_us, s_shoot.cpu_us),
-        dms(s_shoot.cpu_us, s_post.cpu_us),
-    );
+    let dcount = |a: f64, b: f64| format!("{:+}", b as i64 - a as i64);
+    let num = |v: f64| (v / 1000.0 * 10.0).round() / 10.0; // ms, 1 decimal
 
     let mut out = String::new();
     out.push_str("## Delta: PRE → SHOOT → POST\n\n");
@@ -893,20 +874,38 @@ pub fn delta_section(
     out.push_str("| metric | PRE | SHOOT | POST | SHOOT−PRE | POST−SHOOT |\n");
     out.push_str("|--------|-----|-------|------|-----------|------------|\n");
     let mut json_rows: Vec<Value> = Vec::new();
-    for (metric, unit, pre_v, shoot_v, post_v, dpre, dpost) in &rows {
+    for r in &data.rows {
+        let dpre = r.delta_pre();
+        let dpost = r.delta_post();
+        let (pv, sv, pvv, dprev, dpostv) = if r.unit == "n" {
+            (
+                format!("{:.0}", r.pre),
+                format!("{:.0}", r.shoot),
+                format!("{:.0}", r.post),
+                dcount(r.pre, r.shoot),
+                dcount(r.shoot, r.post),
+            )
+        } else {
+            (
+                ms(r.pre),
+                ms(r.shoot),
+                ms(r.post),
+                dms(r.pre, r.shoot),
+                dms(r.shoot, r.post),
+            )
+        };
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
-            metric, pre_v, shoot_v, post_v, dpre, dpost,
+            r.metric, pv, sv, pvv, dprev, dpostv,
         ));
-        let num = |s: &str| s.parse::<f64>().ok();
         json_rows.push(json!({
-            "metric": metric,
-            "unit": unit,
-            "pre": num(pre_v),
-            "shoot": num(shoot_v),
-            "post": num(post_v),
-            "delta_pre": num(dpre),
-            "delta_post": num(dpost),
+            "metric": r.metric,
+            "unit": r.unit,
+            "pre": if r.unit == "n" { r.pre } else { num(r.pre) },
+            "shoot": if r.unit == "n" { r.shoot } else { num(r.shoot) },
+            "post": if r.unit == "n" { r.post } else { num(r.post) },
+            "delta_pre": if r.unit == "n" { dpre } else { num(dpre) },
+            "delta_post": if r.unit == "n" { dpost } else { num(dpost) },
         }));
     }
     out.push('\n');
@@ -914,12 +913,11 @@ pub fn delta_section(
     // Top CPU self-time per window.
     out.push_str("| window | top CPU self-time |\n");
     out.push_str("|--------|-------------------|\n");
-    for (label, stats) in [("PRE", &s_pre), ("SHOOT", &s_shoot), ("POST", &s_post)] {
-        let top: String = if stats.top_cpu.is_empty() {
+    for (label, top_cpu) in [("PRE", &data.top_cpu[0]), ("SHOOT", &data.top_cpu[1]), ("POST", &data.top_cpu[2])] {
+        let top: String = if top_cpu.is_empty() {
             "—".to_string()
         } else {
-            stats
-                .top_cpu
+            top_cpu
                 .iter()
                 .map(|(n, t)| format!("{} ({:.1}ms)", n, t / 1000.0))
                 .collect::<Vec<_>>()
@@ -929,10 +927,9 @@ pub fn delta_section(
     }
     out.push('\n');
 
-    let top_json = |stats: &WindowStats| -> Value {
+    let top_json = |top_cpu: &[(String, f64)]| -> Value {
         Value::Array(
-            stats
-                .top_cpu
+            top_cpu
                 .iter()
                 .map(|(n, t)| json!({"function": n, "self_us": t.round()}))
                 .collect(),
@@ -947,9 +944,9 @@ pub fn delta_section(
     }));
     obj.insert("metrics".into(), Value::Array(json_rows));
     obj.insert("top_cpu".into(), json!({
-        "pre": top_json(&s_pre),
-        "shoot": top_json(&s_shoot),
-        "post": top_json(&s_post),
+        "pre": top_json(&data.top_cpu[0]),
+        "shoot": top_json(&data.top_cpu[1]),
+        "post": top_json(&data.top_cpu[2]),
     }));
     (out, Value::Object(obj))
 }

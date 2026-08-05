@@ -89,6 +89,34 @@ fn smoke_json_csv() {
 }
 
 #[test]
+fn smoke_compare_windowed() {
+    let o = ok(&[FIXTURE, "--compare", FIXTURE, "--anchor", "shoot", "--delta"]);
+    assert!(o.stdout.contains("## Windowed compare: SHOOT & SHOOT\u{2212}PRE"), "missing compare table:\n{}", o.stdout);
+    assert!(o.stdout.contains("## Trace A:"), "missing trace A sections");
+    assert!(o.stdout.contains("## Trace B:"), "missing trace B sections");
+    assert!(o.stdout.contains("B\u{2212}A SHOOT"), "missing B\u{2212}A columns");
+
+    let o = ok(&[FIXTURE, "--compare", FIXTURE, "--anchor", "shoot", "--delta", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    assert_eq!(v["trace_a"], "tiny");
+    assert!(v["compare"]["rows"].as_array().unwrap().len() >= 5);
+    // Self-comparison: every B\u{2212}A delta is zero.
+    for row in v["compare"]["rows"].as_array().unwrap() {
+        assert_eq!(row["diff_shoot"], 0.0, "self-compare diff for {}", row["metric"]);
+        assert_eq!(row["diff_delta"], 0.0, "self-compare delta for {}", row["metric"]);
+    }
+
+    let o = ok(&[FIXTURE, "--compare", FIXTURE, "--anchor", "shoot", "--delta", "--csv"]);
+    assert!(o.stdout.contains("# compare"), "missing compare csv block");
+    assert!(o.stdout.contains("# a.delta.metrics"), "missing trace-A delta csv");
+    assert!(o.stdout.contains("# b.delta.metrics"), "missing trace-B delta csv");
+
+    // Other sections run on both traces too.
+    contains(&[FIXTURE, "--compare", FIXTURE, "--frames"], "## Trace A:");
+    contains(&[FIXTURE, "--compare", FIXTURE, "--anchor", "shoot", "--gc"], "windowed");
+}
+
+#[test]
 fn smoke_regex_and_errors() {
     contains(&[FIXTURE, "--regex", "--events", "Run.*Task"], "## Events");
     exits_nonzero(&[FIXTURE, "--regex", "--function", "("]); // invalid regex

@@ -380,18 +380,263 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
     eprintln!("  {} events", trace.trace_events.len());
-    inspect_output(&trace.trace_events, &trace::trace_stem(path), cli)
+    let name_a = trace::trace_stem(path);
+    let Some(path_b) = cli.compare.as_deref().map(Path::new) else {
+        return inspect_output(&trace.trace_events, &name_a, cli);
+    };
+    eprintln!("Loading {}...", path_b.display());
+    let trace_b = trace::parse_trace(path_b)?;
+    eprintln!("  {} events", trace_b.trace_events.len());
+    inspect_compare_output(
+        &trace.trace_events,
+        &name_a,
+        &trace_b.trace_events,
+        &trace::trace_stem(path_b),
+        cli,
+    )
+}
+
+/// Windowed comparison of two traces: run every requested section on both,
+/// and when `--delta` is set, merge the PRE/SHOOT/POST metric rows into a
+/// single A-vs-B table (SHOOT, SHOOT−PRE, and the inter-trace deltas).
+fn inspect_compare_output(
+    events_a: &[trace::TraceEvent],
+    name_a: &str,
+    events_b: &[trace::TraceEvent],
+    name_b: &str,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let min_ts_a = inspect::trace_start_us(events_a);
+    let min_ts_b = inspect::trace_start_us(events_b);
+    let ws_a = resolve_windows(events_a, min_ts_a, cli)?;
+    let ws_b = resolve_windows(events_b, min_ts_b, cli)?;
+
+    // --flame: folded stacks for both traces, concatenated (one flamegraph).
+    if cli.flame {
+        let matcher = cli
+            .function
+            .as_deref()
+            .map(|p| inspect::Matcher::new(p, cli.regex))
+            .transpose()?;
+        print!("{}", inspect::stacks_folded(events_a, matcher.as_ref(), &ws_a.scope));
+        print!("{}", inspect::stacks_folded(events_b, matcher.as_ref(), &ws_b.scope));
+        return Ok(());
+    }
+
+    let sections_a = build_sections(events_a, min_ts_a, &ws_a, cli)?;
+    let sections_b = build_sections(events_b, min_ts_b, &ws_b, cli)?;
+
+    // Merged delta rows (raw units): None when either trace lacks windows.
+    let compare = if cli.delta {
+        match (
+            ws_a.pre, ws_a.shoot, ws_a.post, ws_a.anchor_ts,
+            ws_b.pre, ws_b.shoot, ws_b.post, ws_b.anchor_ts,
+        ) {
+            (Some(pa), Some(sa), Some(qa), Some(aa), Some(pb), Some(sb), Some(qb), Some(ab)) => {
+                let da = windowed::delta_data(events_a, pa, sa, qa, aa, &cli.frame_event, cli.lt);
+                let db = windowed::delta_data(events_b, pb, sb, qb, ab, &cli.frame_event, cli.lt);
+                Some((da, db))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if cli.json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("trace_a".into(), serde_json::json!(name_a));
+        obj.insert("trace_b".into(), serde_json::json!(name_b));
+        if let Some(ref note) = ws_a.anchor_note {
+            obj.insert("anchor_a".into(), serde_json::json!(note));
+        }
+        if let Some(ref note) = ws_b.anchor_note {
+            obj.insert("anchor_b".into(), serde_json::json!(note));
+        }
+        let mut secs_a = serde_json::Map::new();
+        for (k, _, j) in &sections_a {
+            secs_a.insert((*k).into(), j.clone());
+        }
+        let mut secs_b = serde_json::Map::new();
+        for (k, _, j) in &sections_b {
+            secs_b.insert((*k).into(), j.clone());
+        }
+        obj.insert("sections_a".into(), serde_json::Value::Object(secs_a));
+        obj.insert("sections_b".into(), serde_json::Value::Object(secs_b));
+        obj.insert("compare".into(), compare_json(&compare));
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
+        return Ok(());
+    }
+
+    if cli.csv {
+        csv_blocks(&sections_a, Some("a"));
+        csv_blocks(&sections_b, Some("b"));
+        if let Some((da, db)) = &compare {
+            println!("# compare");
+            print!("{}", windowed::rows_to_csv(&compare_csv_rows(da, db)));
+        }
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("# chperf inspect compare: {} vs {}\n\n", name_a, name_b));
+    if let Some(ref note) = ws_a.anchor_note {
+        out.push_str(&format!("**A ({}):** {}\n", name_a, note));
+    }
+    if let Some(ref note) = ws_b.anchor_note {
+        out.push_str(&format!("**B ({}):** {}\n", name_b, note));
+    }
+    out.push('\n');
+    out.push_str(&format!("## Trace A: {}\n\n", name_a));
+    for (_, m, _) in &sections_a {
+        out.push_str(m);
+    }
+    out.push_str(&format!("## Trace B: {}\n\n", name_b));
+    for (_, m, _) in &sections_b {
+        out.push_str(m);
+    }
+    match &compare {
+        Some((da, db)) => {
+            out.push_str("## Windowed compare: SHOOT & SHOOT−PRE\n\n");
+            out.push_str(&format!(
+                "- **A SHOOT**: {:.2}ms … {:.2}ms from trace start\n",
+                (da.shoot.0 - min_ts_a) / 1000.0,
+                (da.shoot.1 - min_ts_a) / 1000.0,
+            ));
+            out.push_str(&format!(
+                "- **B SHOOT**: {:.2}ms … {:.2}ms from trace start\n\n",
+                (db.shoot.0 - min_ts_b) / 1000.0,
+                (db.shoot.1 - min_ts_b) / 1000.0,
+            ));
+            out.push_str("| metric | A SHOOT | A Δ | B SHOOT | B Δ | B−A SHOOT | B−A Δ |\n");
+            out.push_str("|--------|---------|-----|---------|-----|-----------|-------|\n");
+            // Render rows from raw data: n = counts, else ms.
+            for row in &da.rows {
+                let rb = db.rows.iter().find(|b| b.metric == row.metric);
+                let Some(rb) = rb else { continue };
+                let counts = row.unit == "n";
+                let fmt = |v: f64, counts: bool| {
+                    if counts { format!("{:.0}", v) } else { format!("{:.1}", v / 1000.0) }
+                };
+                let dfmt = |v: f64, counts: bool| {
+                    if counts { format!("{:+}", v as i64) } else { format!("{:+.1}", v / 1000.0) }
+                };
+                let diff_shoot = rb.shoot - row.shoot;
+                let diff_delta = rb.delta_pre() - row.delta_pre();
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    row.metric,
+                    fmt(row.shoot, counts),
+                    dfmt(row.delta_pre(), counts),
+                    fmt(rb.shoot, counts),
+                    dfmt(rb.delta_pre(), counts),
+                    dfmt(diff_shoot, counts),
+                    dfmt(diff_delta, counts),
+                ));
+            }
+            out.push('\n');
+        }
+        None => {
+            if cli.delta {
+                out.push_str(
+                    "**--delta requires an anchor in both traces: --anchor <substr>, --around <ms> or --worst.**\n\n",
+                );
+            }
+        }
+    }
+    print!("{}", out);
+    Ok(())
+}
+
+/// Raw compare rows as JSON values (µs for `ms` metrics, counts for `n`).
+fn compare_csv_rows(
+    da: &windowed::DeltaData,
+    db: &windowed::DeltaData,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for row in &da.rows {
+        let Some(rb) = db.rows.iter().find(|b| b.metric == row.metric) else { continue };
+        rows.push(serde_json::json!({
+            "metric": row.metric,
+            "unit": row.unit,
+            "a_shoot": row.shoot,
+            "a_delta": row.delta_pre(),
+            "b_shoot": rb.shoot,
+            "b_delta": rb.delta_pre(),
+            "diff_shoot": rb.shoot - row.shoot,
+            "diff_delta": rb.delta_pre() - row.delta_pre(),
+        }));
+    }
+    rows
+}
+
+fn compare_json(compare: &Option<(windowed::DeltaData, windowed::DeltaData)>) -> Value {
+    match compare {
+        Some((da, db)) => {
+            let rows = compare_csv_rows(da, db);
+            serde_json::json!({
+                "anchor_a_us": da.anchor_us.round(),
+                "anchor_b_us": db.anchor_us.round(),
+                "windows_a": {
+                    "pre": [da.pre.0.round(), da.pre.1.round()],
+                    "shoot": [da.shoot.0.round(), da.shoot.1.round()],
+                    "post": [da.post.0.round(), da.post.1.round()],
+                },
+                "windows_b": {
+                    "pre": [db.pre.0.round(), db.pre.1.round()],
+                    "shoot": [db.shoot.0.round(), db.shoot.1.round()],
+                    "post": [db.post.0.round(), db.post.1.round()],
+                },
+                "rows": rows,
+            })
+        }
+        None => Value::Null,
+    }
 }
 
 /// Shared inspect dispatch: computes sections from already-parsed events.
-/// Used by both the CLI (`chperf trace --events ...`) and the REPL.
+/// Used by the CLI (`chperf trace --events ...`), the REPL, and (with
+/// `--compare`) the windowed two-trace comparison.
 pub(crate) fn inspect_output(
     events: &[trace::TraceEvent],
     trace_name: &str,
     cli: &Cli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let min_ts = inspect::trace_start_us(events);
+    let ws = resolve_windows(events, min_ts, cli)?;
 
+    // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown/json).
+    if cli.flame {
+        let matcher = cli
+            .function
+            .as_deref()
+            .map(|p| inspect::Matcher::new(p, cli.regex))
+            .transpose()?;
+        print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &ws.scope));
+        return Ok(());
+    }
+
+    let sections = build_sections(events, min_ts, &ws, cli)?;
+    dispatch_output(&sections, trace_name, min_ts, &ws, cli)
+}
+
+/// Resolved anchor/window state, shared by single-trace and compare output.
+struct WindowState {
+    scope: inspect::Scope,
+    pre: Option<(f64, f64)>,
+    shoot: Option<(f64, f64)>,
+    post: Option<(f64, f64)>,
+    anchor_ts: Option<f64>,
+    anchor_note: Option<String>,
+}
+
+/// Determine the time anchor (--worst > --anchor > --around, all relative to
+/// the metadata-free trace start) and derive the SHOOT/PRE/POST windows.
+fn resolve_windows(
+    events: &[trace::TraceEvent],
+    min_ts: f64,
+    cli: &Cli,
+) -> Result<WindowState, Box<dyn std::error::Error>> {
     // Resolve --tid (numeric or "main" → auto-detected main thread).
     let tid = match &cli.tid {
         None => None,
@@ -409,9 +654,6 @@ pub(crate) fn inspect_output(
         cat: cli.cat.as_deref().map(|c| c.to_lowercase()),
     };
 
-    // Determine the time anchor, in absolute µs:
-    // --worst (longest RunTask) > --anchor <substring> > --around <ms>.
-    // `ms` values are always relative to the (metadata-free) trace start.
     let mut anchor_note: Option<String> = None;
     let mut anchor_ts: Option<f64> = None;
     let mut window_ms = cli.window;
@@ -470,6 +712,27 @@ pub(crate) fn inspect_output(
         cat: scope_nowin.cat.clone(),
     };
 
+    Ok(WindowState {
+        scope,
+        pre,
+        shoot,
+        post,
+        anchor_ts,
+        anchor_note,
+    })
+}
+
+/// One inspect section: stable key, Markdown, JSON rows.
+type Section = (&'static str, String, Value);
+
+/// Build all requested inspect sections for one trace, scoped to `ws`.
+fn build_sections(
+    events: &[trace::TraceEvent],
+    min_ts: f64,
+    ws: &WindowState,
+    cli: &Cli,
+) -> Result<Vec<Section>, Box<dyn std::error::Error>> {
+    let scope = &ws.scope;
     let sort = match cli.sort.as_deref() {
         Some("dur") => inspect::Sort::Dur,
         Some("name") => inspect::Sort::Name,
@@ -478,41 +741,29 @@ pub(crate) fn inspect_output(
     };
     let min_dur_us = cli.min_dur.unwrap_or(0.0);
 
-    // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown/json).
-    if cli.flame {
-        let matcher = cli
-            .function
-            .as_deref()
-            .map(|p| inspect::Matcher::new(p, cli.regex))
-            .transpose()?;
-        print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &scope));
-        return Ok(());
-    }
-
-    // Collect sections as (key, markdown, json) triples.
-    let mut sections: Vec<(&'static str, String, serde_json::Value)> = Vec::new();
+    let mut sections: Vec<Section> = Vec::new();
 
     // --jank: whole-trace cluster detection (dropped frames / sub-threshold spikes).
     // With a window scope, detection is restricted to the window.
     if cli.jank {
-        let (m, j) = inspect::jank_section(events, &scope, cli.top, min_ts);
+        let (m, j) = inspect::jank_section(events, scope, cli.top, min_ts);
         sections.push(("jank", m, j));
     }
 
     if cli.timeline {
-        let (m, j) = inspect::timeline_section(events, &scope, cli.bucket, min_ts);
+        let (m, j) = inspect::timeline_section(events, scope, cli.bucket, min_ts);
         sections.push(("timeline", m, j));
     }
     if cli.task {
-        let (m, j) = inspect::task_section(events, &scope, cli.top, min_ts);
+        let (m, j) = inspect::task_section(events, scope, cli.top, min_ts);
         sections.push(("task", m, j));
     }
     if cli.names {
-        let (m, j) = inspect::names_section(events, &scope, sort, cli.top, min_ts);
+        let (m, j) = inspect::names_section(events, scope, sort, cli.top, min_ts);
         sections.push(("names", m, j));
     }
     if cli.threads {
-        let (m, j) = inspect::threads_section(events, &scope, cli.top, min_ts);
+        let (m, j) = inspect::threads_section(events, scope, cli.top, min_ts);
         sections.push(("threads", m, j));
     }
 
@@ -524,13 +775,13 @@ pub(crate) fn inspect_output(
             .collect();
         let filter = inspect::NameFilter::new(&names, cli.regex)?;
         let (m, j) = if cli.stats {
-            inspect::stats_section(events, &filter, names_raw.trim(), &scope, min_dur_us, min_ts)
+            inspect::stats_section(events, &filter, names_raw.trim(), scope, min_dur_us, min_ts)
         } else {
             inspect::events_section(
                 events,
                 &filter,
                 names_raw.trim(),
-                &scope,
+                scope,
                 min_dur_us,
                 sort,
                 cli.full_args,
@@ -548,11 +799,11 @@ pub(crate) fn inspect_output(
         None
     };
     if let Some(m) = &func_matcher {
-        let (md, j) = inspect::functions_section(events, m, &scope, cli.top, min_ts);
+        let (md, j) = inspect::functions_section(events, m, scope, cli.top, min_ts);
         sections.push(("functions", md, j));
     }
     if cli.stacks {
-        let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), &scope, cli.top, min_ts);
+        let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), scope, cli.top, min_ts);
         sections.push(("stacks", md, j));
     }
     if cli.calltree {
@@ -563,7 +814,7 @@ pub(crate) fn inspect_output(
         };
         let (md, j) = windowed::calltree_section(
             events,
-            &scope,
+            scope,
             func_matcher.as_ref(),
             url_matcher.as_ref(),
             cli.top,
@@ -572,22 +823,22 @@ pub(crate) fn inspect_output(
         sections.push(("calltree", md, j));
     }
     if cli.gc {
-        let (md, j) = windowed::gc_section(events, &scope, cli.lt, min_ts);
+        let (md, j) = windowed::gc_section(events, scope, cli.lt, min_ts);
         sections.push(("gc", md, j));
     }
     if cli.frames {
-        let (md, j) = windowed::frames_section(events, &scope, &cli.frame_event, min_ts);
+        let (md, j) = windowed::frames_section(events, scope, &cli.frame_event, min_ts);
         sections.push(("frames", md, j));
     }
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
-        let (md, j) = inspect::find_section(events, &m, &scope, cli.full_args, cli.top, min_ts);
+        let (md, j) = inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts);
         sections.push(("find", md, j));
     }
 
     // --delta: PRE/SHOOT/POST comparison around the anchor.
     if cli.delta {
-        match (pre, shoot, post, anchor_ts) {
+        match (ws.pre, ws.shoot, ws.post, ws.anchor_ts) {
             (Some(p), Some(s), Some(q), Some(a)) => {
                 let (md, j) = windowed::delta_section(
                     events,
@@ -618,7 +869,7 @@ pub(crate) fn inspect_output(
             events,
             &filter,
             "RunTask",
-            &scope,
+            scope,
             0.0,
             inspect::Sort::Dur,
             cli.full_args,
@@ -628,16 +879,27 @@ pub(crate) fn inspect_output(
         sections.push(("events", md, j));
     }
 
-    // Dispatch output format.
+    Ok(sections)
+}
+
+/// Render collected sections as JSON / CSV / Markdown.
+fn dispatch_output(
+    sections: &[Section],
+    trace_name: &str,
+    min_ts: f64,
+    ws: &WindowState,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut out = String::new();
     if cli.json {
         let mut obj = serde_json::Map::new();
         obj.insert("trace".into(), serde_json::json!(trace_name));
-        if let Some(ref note) = anchor_note {
+        if let Some(ref note) = ws.anchor_note {
             obj.insert("anchor".into(), serde_json::json!(note));
         }
         obj.insert(
             "window".into(),
-            match shoot {
+            match ws.shoot {
                 Some((lo, hi)) => serde_json::json!([
                     ((lo - min_ts) / 1000.0).round(),
                     ((hi - min_ts) / 1000.0).round(),
@@ -646,51 +908,60 @@ pub(crate) fn inspect_output(
             },
         );
         let mut secs = serde_json::Map::new();
-        for (k, _, j) in &sections {
+        for (k, _, j) in sections {
             secs.insert((*k).into(), j.clone());
         }
         obj.insert("sections".into(), serde_json::Value::Object(secs));
         println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
-    } else if cli.csv {
-        // One CSV block per section, prefixed by a `# section` comment line.
-        // Sections that emit an object (e.g. --delta) render each array
-        // field as its own block.
-        for (k, _, j) in &sections {
-            match j {
-                Value::Array(rows) => {
-                    println!("# {}", k);
-                    print!("{}", windowed::rows_to_csv(rows));
-                }
-                Value::Object(o) => {
-                    for (field, v) in o {
-                        if let Value::Array(rows) = v {
-                            println!("# {}.{}", k, field);
-                            print!("{}", windowed::rows_to_csv(rows));
-                        }
+        return Ok(());
+    }
+    if cli.csv {
+        csv_blocks(sections, None);
+        return Ok(());
+    }
+    out.push_str(&format!("# chperf inspect: {}\n\n", trace_name));
+    if let Some(ref note) = ws.anchor_note {
+        out.push_str(&format!("**{}**\n\n", note));
+    }
+    if let Some((lo, hi)) = ws.shoot {
+        out.push_str(&format!(
+            "**Window**: {:.2}ms … {:.2}ms from trace start\n\n",
+            (lo - min_ts) / 1000.0,
+            (hi - min_ts) / 1000.0,
+        ));
+    }
+    for (_, m, _) in sections {
+        out.push_str(m);
+    }
+    print!("{}", out);
+    Ok(())
+}
+
+/// Emit one CSV block per section, prefixed by a `# <prefix><key>` comment
+/// line. Sections that emit an object (e.g. --delta) render each array
+/// field as its own block.
+fn csv_blocks(sections: &[Section], prefix: Option<&str>) {
+    for (k, _, j) in sections {
+        let label = match prefix {
+            Some(p) => format!("{}.{}", p, k),
+            None => (*k).to_string(),
+        };
+        match j {
+            Value::Array(rows) => {
+                println!("# {}", label);
+                print!("{}", windowed::rows_to_csv(rows));
+            }
+            Value::Object(o) => {
+                for (field, v) in o {
+                    if let Value::Array(rows) = v {
+                        println!("# {}.{}", label, field);
+                        print!("{}", windowed::rows_to_csv(rows));
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
-    } else {
-        let mut out = String::new();
-        out.push_str(&format!("# chperf inspect: {}\n\n", trace_name));
-        if let Some(ref note) = anchor_note {
-            out.push_str(&format!("**{}**\n\n", note));
-        }
-        if let Some((lo, hi)) = shoot {
-            out.push_str(&format!(
-                "**Window**: {:.2}ms … {:.2}ms from trace start\n\n",
-                (lo - min_ts) / 1000.0,
-                (hi - min_ts) / 1000.0,
-            ));
-        }
-        for (_, m, _) in &sections {
-            out.push_str(m);
-        }
-        print!("{}", out);
     }
-    Ok(())
 }
 
 /// Load, analyze, then export or launch TUI for a single (optionally compared) trace.
@@ -910,6 +1181,7 @@ fn run_tui(mut app: app::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{compare_csv_rows, compare_json};
     use crate::analysis;
     use crate::inspect::{self, Scope};
     use crate::trace::TraceEvent;
@@ -1002,6 +1274,39 @@ mod tests {
             1_000_000.0,
         );
         assert!(md.contains("CPU profile matches (2"));
+    }
+
+    /// Windowed compare: two identical analyses yield zero deltas, and the
+    /// merged rows carry raw units.
+    #[test]
+    fn compare_rows_self_diff_is_zero() {
+        let events = fixture_events();
+        let da = windowed::delta_data(
+            &events,
+            (300_000.0, 900_000.0),
+            (1_000_000.0, 1_030_000.0),
+            (2_000_000.0, 2_500_000.0),
+            1_010_000.0,
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            50.0,
+        );
+        let rows = compare_csv_rows(&da, &da);
+        assert_eq!(rows.len(), 13);
+        for r in &rows {
+            assert_eq!(r["diff_shoot"], 0.0, "{}", r["metric"]);
+            assert_eq!(r["diff_delta"], 0.0, "{}", r["metric"]);
+        }
+        let j = compare_json(&Some((da.clone(), da)));
+        assert_eq!(j["rows"].as_array().unwrap().len(), 13);
+        assert!(j["anchor_a_us"].is_number());
+        // CPU samples are raw µs: 6 × 5ms samples with ts ≤ 1_030_000.
+        let cpu = j["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["metric"] == "CPU samples")
+            .unwrap();
+        assert_eq!(cpu["a_shoot"], 30_000.0);
     }
 
     /// Deterministic pseudo-fuzzing: structurally-valid but adversarial

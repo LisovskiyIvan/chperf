@@ -28,6 +28,13 @@ chperf trace.json.gz --export
 # Compare two traces
 chperf before.json --compare after.json
 
+# Windowed compare: PRE/SHOOT/POST of both traces side by side + inter-trace
+# deltas (SHOOT and SHOOT−PRE per trace, then B−A for both)
+chperf before.json --compare after.json --anchor shoot --delta
+
+# Any inspect query runs on both traces in compare mode
+chperf before.json --compare after.json --frames --gc
+
 # Export as Markdown (to stdout)
 chperf trace.json --export
 
