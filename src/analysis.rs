@@ -47,7 +47,7 @@ fn target_key(name: &str) -> Option<&'static str> {
 pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
     // Single pass over the trace: duration bounds, long tasks, busy time, stats.
     let mut long_task_durs: Vec<f64> = Vec::new();
-    let mut stats_map: HashMap<&'static str, (f64, usize)> = HashMap::new();
+    let mut stats_map: rustc_hash::FxHashMap<&'static str, (f64, usize)> = rustc_hash::FxHashMap::default();
     let mut main_thread_busy_us = 0.0f64;
     let mut min_ts = f64::INFINITY;
     let mut max_ts = 0.0f64;
@@ -298,9 +298,11 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
 // ── CPU Profile ──
 
 /// CPU-profile node id -> (function name, source URL, parent id), first-wins.
-pub type ProfileNodes = HashMap<u64, (String, String, Option<u64>)>;
+/// FxHash: u64 keys on hot scan paths; SipHash costs ~2-4x on millions of
+/// per-sample lookups.
+pub type ProfileNodes = rustc_hash::FxHashMap<u64, (String, String, Option<u64>)>;
 /// CPU-profile node id -> sampled self-time (µs).
-pub type ProfileSelfTimes = HashMap<u64, f64>;
+pub type ProfileSelfTimes = rustc_hash::FxHashMap<u64, f64>;
 
 #[derive(Clone)]
 pub struct FunctionTime {
@@ -407,7 +409,7 @@ fn scan_profile_chunks_core(
     let bases = if any_window {
         profile_chunk_bases(events)
     } else {
-        HashMap::new()
+        HashMap::default()
     };
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
         return scan_profile_chunk(events, 0, scope, &bases, windows);
@@ -420,9 +422,9 @@ fn scan_profile_chunks_core(
             .enumerate()
             .map(|(ci, c)| s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases, windows)))
             .collect();
-        let mut nodes: ProfileNodes = HashMap::new();
+        let mut nodes: ProfileNodes = ProfileNodes::default();
         let mut times: Vec<ProfileSelfTimes> =
-            (0..windows.len()).map(|_| HashMap::new()).collect();
+            (0..windows.len()).map(|_| ProfileSelfTimes::default()).collect();
         for h in handles {
             let (n, t) = h.join().unwrap();
             for (id, v) in n {
@@ -451,14 +453,14 @@ fn scan_profile_chunks_core(
 /// stay inside the trace bounds — if Chrome ever changes `timeDeltas`
 /// semantics, the drift shows up here instead of silently skewing windows.
 fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
-    let mut starts: HashMap<u64, f64> = HashMap::new();
+    let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "Profile" && e.ph == "P" {
             starts.entry(e.pid).or_insert(e.ts);
         }
     }
     let mut bases: HashMap<usize, f64> = HashMap::new();
-    let mut prev_last: HashMap<u64, f64> = HashMap::new(); // last sample time per pid
+    let mut prev_last: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default(); // last sample time per pid
     // Sample-time bounds (first sample of the walk, last sample per pid) for
     // the CHPERF_CHECK sanity pass.
     let mut sample_min = f64::INFINITY;
@@ -468,8 +470,7 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
             continue;
         }
         let Some(td) = e
-            .args
-            .as_ref()
+            .args_value()
             .and_then(|a| a.get("data"))
             .and_then(|d| d.get("timeDeltas"))
             .and_then(|t| t.as_array())
@@ -545,15 +546,15 @@ fn scan_profile_chunk(
     bases: &HashMap<usize, f64>,
     windows: &[Option<(f64, f64)>],
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
-    let mut node_map: ProfileNodes = HashMap::new();
+    let mut node_map: ProfileNodes = ProfileNodes::default();
     let mut self_times: Vec<ProfileSelfTimes> =
-        (0..windows.len()).map(|_| HashMap::new()).collect();
+        (0..windows.len()).map(|_| ProfileSelfTimes::default()).collect();
 
     for (i, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
             continue;
         }
-        let args = match &e.args {
+        let args = match e.args_value() {
             Some(a) => a,
             None => continue,
         };
@@ -712,8 +713,7 @@ pub fn analyze_style_recalc(events: &[TraceEvent], main_tid: u64) -> StyleRecalc
             continue;
         }
         let element_count = e
-            .args
-            .as_ref()
+            .args_value()
             .and_then(|a| a.get("elementCount"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
@@ -767,7 +767,7 @@ pub fn analyze_layout_dirty(events: &[TraceEvent], main_tid: u64) -> LayoutDirty
         if e.tid != main_tid || e.name != "Layout" || e.ph != "X" {
             continue;
         }
-        let args = match &e.args {
+        let args = match e.args_value() {
             Some(a) => a,
             None => continue,
         };
@@ -1035,13 +1035,13 @@ pub fn analyze_compare(
     let total_a = cpu_a.total_sample_time_us;
     let total_b = cpu_b.total_sample_time_us;
 
-    let mut func_map_a: HashMap<(&str, &str), &FunctionTime> = HashMap::new();
+    let mut func_map_a: rustc_hash::FxHashMap<(&str, &str), &FunctionTime> = rustc_hash::FxHashMap::default();
     for f in &cpu_a.functions {
         func_map_a
             .entry((&f.function_name, &f.url))
             .or_insert(f);
     }
-    let mut func_map_b: HashMap<(&str, &str), &FunctionTime> = HashMap::new();
+    let mut func_map_b: rustc_hash::FxHashMap<(&str, &str), &FunctionTime> = rustc_hash::FxHashMap::default();
     for f in &cpu_b.functions {
         func_map_b
             .entry((&f.function_name, &f.url))
@@ -1487,7 +1487,7 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
     for (ci, a) in top.iter().enumerate() {
         in_cluster[a.start..=a.end].fill(Some(ci));
     }
-    let mut calls: Vec<HashMap<String, f64>> = (0..top.len()).map(|_| HashMap::new()).collect();
+    let mut calls: Vec<rustc_hash::FxHashMap<String, f64>> = (0..top.len()).map(|_| rustc_hash::FxHashMap::default()).collect();
     for e in events {
         if e.name != "FunctionCall" || e.ph != "X" {
             continue;
@@ -1500,8 +1500,7 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         if let Some(ci) = in_cluster[b]
             && let Some(d) = e.dur
                 && let Some(name) = e
-                    .args
-                    .as_ref()
+                    .args_value()
                     .and_then(|a| a.get("data"))
                     .and_then(|d| d.get("functionName"))
                     .and_then(|v| v.as_str())
@@ -1553,6 +1552,7 @@ mod tests {
             pid: 2,
             cat: None,
             args: None,
+            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1571,12 +1571,13 @@ mod tests {
             tid: 65,
             pid: 2,
             cat: None,
-            args: Some(serde_json::json!({
+            args: crate::trace::test_args(serde_json::json!({
                 "data": {
                     "cpuProfile": {"nodes": nodes_json, "samples": samples},
                     "timeDeltas": deltas,
                 }
             })),
+            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1590,6 +1591,7 @@ mod tests {
             pid: 2,
             cat: None,
             args: None,
+            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1614,7 +1616,7 @@ mod tests {
         ]
     }
 
-    fn total(times: &HashMap<u64, f64>) -> f64 {
+    fn total(times: &ProfileSelfTimes) -> f64 {
         times.values().sum()
     }
 

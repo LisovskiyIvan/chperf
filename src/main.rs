@@ -1090,7 +1090,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
 
             // Full scan: totals finite and non-negative.
-            let (nodes, full) = analysis::scan_profile_chunks(&events, None, 0);
+            let (_nodes, full) = analysis::scan_profile_chunks(&events, None, 0);
             let full_total: f64 = full.values().sum();
             assert!(full_total.is_finite() && full_total >= 0.0, "iter {}: bad full total {}", iter, full_total);
 

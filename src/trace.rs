@@ -30,7 +30,7 @@ pub struct TraceFile {
     pub metadata: Option<TraceMetadata>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 pub struct TraceEvent {
     #[serde(default)]
     pub name: String,
@@ -48,8 +48,58 @@ pub struct TraceEvent {
     #[serde(default)]
     #[allow(dead_code)]
     pub cat: Option<String>,
+    /// Raw `args` JSON, captured without building a Value tree. Most events
+    /// never have their args inspected, so storing the raw bytes keeps the
+    /// load fast and memory low; `args_value()` parses on demand (and caches
+    /// the result, so repeated scans of ProfileChunk payloads stay cheap).
     #[serde(default)]
-    pub args: Option<serde_json::Value>,
+    pub args: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip)]
+    pub(crate) args_cache: std::sync::OnceLock<Option<serde_json::Value>>,
+}
+
+/// Test helper: build an event `args` field from a JSON value (stored raw).
+#[cfg(test)]
+pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<serde_json::value::RawValue>> {
+    serde_json::to_string(&v)
+        .ok()
+        .map(|s| serde_json::from_str(&s).expect("raw args json"))
+}
+
+impl Clone for TraceEvent {
+    fn clone(&self) -> Self {
+        TraceEvent {
+            name: self.name.clone(),
+            ph: self.ph.clone(),
+            ts: self.ts,
+            dur: self.dur,
+            tid: self.tid,
+            pid: self.pid,
+            cat: self.cat.clone(),
+            args: self.args.clone(),
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl TraceEvent {
+    /// Parsed `args` JSON, or `None` when the event carries no args. The
+    /// first call per event parses and caches the raw bytes.
+    pub fn args_value(&self) -> Option<&serde_json::Value> {
+        self.args_cache
+            .get_or_init(|| {
+                self.args
+                    .as_deref()
+                    .and_then(|r| serde_json::from_str(r.get()).ok())
+            })
+            .as_ref()
+    }
+
+    /// Raw `args` JSON text, or `None`.
+    #[allow(dead_code)]
+    pub fn args_raw(&self) -> Option<&str> {
+        self.args.as_deref().map(|r| r.get())
+    }
 }
 
 /// Byte ranges of the top-level `traceEvents` array and the `metadata`
@@ -605,6 +655,12 @@ fn chunk_work(
         (Some(s), e) if e > s => (s, e),
         _ => return Ok((Vec::new(), replaced)),
     };
+
+    // Separator commas → spaces, in place (disjoint per chunk).
+    for j in &replaced {
+        bytes[*j] = b' ';
+    }
+
     let events = serde_json::Deserializer::from_slice(&bytes[s..e])
         .into_iter()
         .collect::<Result<Vec<TraceEvent>, _>>()
@@ -616,6 +672,7 @@ fn chunk_work(
         })?;
     Ok((events, replaced))
 }
+
 
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
@@ -698,7 +755,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         if meta.page_url.is_none() {
             for e in &trace.trace_events {
                 if e.name == "TracingStartedInBrowser" {
-                    if let Some(ref args) = e.args
+                    if let Some(args) = e.args_value()
                         && let Some(frames) = args
                             .get("data")
                             .and_then(|d| d.get("frames"))
@@ -742,7 +799,7 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
                 }
     }
     // Fallback: tid with most RunTask events
-    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut counts: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "RunTask" && e.ph == "X" {
             *counts.entry(e.tid).or_default() += 1;

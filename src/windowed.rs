@@ -57,8 +57,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             continue;
         }
         let Some(fn_name) = e
-            .args
-            .as_ref()
+            .args_value()
             .and_then(|a| a.get("data"))
             .and_then(|d| d.get("functionName"))
             .and_then(|v| v.as_str())
@@ -80,19 +79,19 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // Pass 2: CPU profile node names / URLs, by earliest sample time.
     // Sample times walk the chunk sequence anchored on the per-process
     // `Profile` (ph=P) event; timeDeltas are inter-sample gaps.
-    let mut starts: HashMap<u64, f64> = HashMap::new();
+    let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "Profile" && e.ph == "P" {
             starts.entry(e.pid).or_insert(e.ts);
         }
     }
-    let mut node_first: HashMap<u64, (f64, String, String)> = HashMap::new();
-    let mut prev_last: HashMap<u64, f64> = HashMap::new();
+    let mut node_first: rustc_hash::FxHashMap<u64, (f64, String, String)> = rustc_hash::FxHashMap::default();
+    let mut prev_last: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name != "ProfileChunk" {
             continue;
         }
-        let args = match &e.args {
+        let args = match e.args_value() {
             Some(a) => a,
             None => continue,
         };
@@ -187,7 +186,12 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // Pass 3: any event args.
     let mut args_best: Option<Anchor> = None;
     for e in events {
-        let Some(args) = &e.args else { continue };
+        let Some(raw) = e.args_raw() else { continue };
+        if let Matcher::Substr(p) = matcher
+            && !crate::inspect::contains_ignore_case(raw, p) {
+                continue;
+            }
+        let Some(args) = e.args_value() else { continue };
         if let Some(text) = value_match_text(args, matcher)
             && args_best.as_ref().is_none_or(|b| e.ts < b.ts) {
                 args_best = Some(Anchor {
@@ -429,7 +433,7 @@ pub fn calltree_section(
     let self_time = cpu.leaf_time;
 
     // Children map + roots.
-    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut children: rustc_hash::FxHashMap<u64, Vec<u64>> = rustc_hash::FxHashMap::default();
     let mut roots: Vec<u64> = Vec::new();
     for (id, (_, _, parent)) in &nodes {
         match parent {
@@ -459,7 +463,7 @@ pub fn calltree_section(
     }
 
     // Inclusive time: reverse DFS order accumulates children into parents.
-    let mut inclusive: HashMap<u64, f64> = self_time.clone();
+    let mut inclusive: crate::analysis::ProfileSelfTimes = self_time.clone();
     for &id in order.iter().rev() {
         let Some(Some(p)) = nodes.get(&id).map(|n| n.2) else { continue };
         if nodes.contains_key(&p) {
@@ -477,7 +481,7 @@ pub fn calltree_section(
     let has_filter = name_matcher.is_some() || url_matcher.is_some();
 
     // has_match: node itself or any descendant matches.
-    let mut has_match: HashMap<u64, bool> = HashMap::new();
+    let mut has_match: rustc_hash::FxHashMap<u64, bool> = rustc_hash::FxHashMap::default();
     for &id in order.iter().rev() {
         let m = matched(nodes.get(&id).unwrap());
         let kids = children
@@ -1014,7 +1018,8 @@ mod tests {
             tid: 1,
             pid: 2,
             cat: None,
-            args,
+            args: args.and_then(crate::trace::test_args),
+            args_cache: std::sync::OnceLock::new(),
         }
     }
 

@@ -7,7 +7,6 @@
 
 use crate::trace::TraceEvent;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 
 // ── Time helpers ──
 
@@ -47,11 +46,10 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-fn args_compact(args: &Option<Value>, full: bool) -> String {
-    match args {
-        Some(v) => {
-            let s = serde_json::to_string(v).unwrap_or_default();
-            if full { truncate(&s, 2000) } else { truncate(&s, 160) }
+fn args_compact(raw: Option<&str>, full: bool) -> String {
+    match raw {
+        Some(s) => {
+            if full { truncate(s, 2000) } else { truncate(s, 160) }
         }
         None => String::new(),
     }
@@ -118,7 +116,7 @@ impl Scope {
 
 /// Allocation-free ASCII case-insensitive substring check; falls back to the
 /// Unicode `to_lowercase` path for non-ASCII needles (identical semantics).
-fn contains_ignore_case(hay: &str, needle: &str) -> bool {
+pub(crate) fn contains_ignore_case(hay: &str, needle: &str) -> bool {
     if needle.is_ascii() {
         hay.len() >= needle.len()
             && hay
@@ -255,7 +253,7 @@ pub fn events_section(
             e.name,
             e.tid,
             e.pid,
-            args_compact(&e.args, full_args),
+            args_compact(e.args_raw(), full_args),
         ));
         json_rows.push(json!({
             "t_us": (e.ts - min_ts).round(),
@@ -263,7 +261,7 @@ pub fn events_section(
             "name": e.name,
             "tid": e.tid,
             "pid": e.pid,
-            "args": e.args.clone().unwrap_or(Value::Null),
+            "args": e.args_value().cloned().unwrap_or(Value::Null),
         }));
     }
     if total > top {
@@ -285,7 +283,7 @@ pub fn stats_section(
     min_dur_us: f64,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut groups: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut groups: rustc_hash::FxHashMap<&str, Vec<f64>> = rustc_hash::FxHashMap::default();
     for e in events {
         if !filter.matches(&e.name) || !scope.allows_event(e) {
             continue;
@@ -421,8 +419,8 @@ pub fn functions_section(
 
 /// node id -> (name, url, parent)
 pub struct CpuProfile {
-    pub nodes: HashMap<u64, (String, String, Option<u64>)>,
-    pub leaf_time: HashMap<u64, f64>,
+    pub nodes: crate::analysis::ProfileNodes,
+    pub leaf_time: crate::analysis::ProfileSelfTimes,
 }
 
 /// Register all CPU profile nodes, and accumulate per-leaf sample time from
@@ -432,7 +430,7 @@ pub fn collect_cpu_profile(events: &[TraceEvent], scope: &Scope) -> CpuProfile {
     CpuProfile { nodes, leaf_time }
 }
 
-fn node_chain_names(nodes: &HashMap<u64, (String, String, Option<u64>)>, leaf: u64) -> Vec<String> {
+fn node_chain_names(nodes: &crate::analysis::ProfileNodes, leaf: u64) -> Vec<String> {
     let mut ids: Vec<u64> = Vec::new();
     let mut cur = Some(leaf);
     while let Some(id) = cur {
@@ -596,7 +594,15 @@ pub fn find_section(
         if !scope.allows_event(e) {
             continue;
         }
-        let args = match &e.args {
+        let Some(raw) = e.args_raw() else { continue };
+        // Fast pre-filter on the raw JSON bytes: substring needles can't
+        // match an event whose raw args don't contain them, so skip the
+        // parse (and the cache fill) entirely.
+        if let Matcher::Substr(p) = matcher
+            && !contains_ignore_case(raw, p) {
+                continue;
+            }
+        let args = match e.args_value() {
             Some(v) => v,
             None => continue,
         };
@@ -656,7 +662,7 @@ pub fn find_section(
             "dur_us": e.dur.unwrap_or(0.0).round(),
             "name": e.name,
             "tid": e.tid,
-            "args": e.args.clone().unwrap_or(Value::Null),
+            "args": e.args_value().cloned().unwrap_or(Value::Null),
         }));
     }
     if total > top {
@@ -722,7 +728,7 @@ pub fn names_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut stats: HashMap<&str, (usize, f64)> = HashMap::new();
+    let mut stats: rustc_hash::FxHashMap<&str, (usize, f64)> = rustc_hash::FxHashMap::default();
     for e in events {
         if !scope.allows_event(e) {
             continue;
@@ -796,7 +802,7 @@ pub fn threads_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut tids: HashMap<u64, (usize, f64, HashMap<&str, usize>)> = HashMap::new();
+    let mut tids: rustc_hash::FxHashMap<u64, (usize, f64, rustc_hash::FxHashMap<&str, usize>)> = rustc_hash::FxHashMap::default();
     for e in events {
         if !scope.allows_event(e) {
             continue;
@@ -990,7 +996,7 @@ pub fn task_section(
         let rt_end = rt.ts + rt.dur.unwrap();
         let rt_dur = rt.dur.unwrap();
 
-        let mut groups: HashMap<String, (usize, f64)> = HashMap::new();
+        let mut groups: rustc_hash::FxHashMap<String, (usize, f64)> = rustc_hash::FxHashMap::default();
         let mut top_fc: Option<(String, f64)> = None;
         for e in events {
             if e.tid != rt.tid || e.name == "RunTask" || e.ts < rt_ts || e.ts > rt_end {
@@ -1002,8 +1008,7 @@ pub fn task_section(
             g.1 += d;
             if e.name == "FunctionCall" && top_fc.as_ref().is_none_or(|(_, dd)| d > *dd) {
                 let fn_name = e
-                    .args
-                    .as_ref()
+                    .args_value()
                     .and_then(|a| a.get("data"))
                     .and_then(|d| d.get("functionName"))
                     .and_then(|v| v.as_str())
@@ -1151,6 +1156,7 @@ mod tests {
             pid: 1,
             cat: cat.map(|s| s.to_string()),
             args: None,
+            args_cache: std::sync::OnceLock::new(),
         }
     }
 
