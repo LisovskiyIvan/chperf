@@ -53,16 +53,14 @@ pub fn export_markdown(app: &App) -> String {
         if let Some(ref start) = meta.start_time {
             out.push_str(&format!("- **Recorded**: {}\n", start));
         }
-        if let Some(cpu) = meta.cpu_throttling {
-            if cpu > 1.0 {
+        if let Some(cpu) = meta.cpu_throttling
+            && cpu > 1.0 {
                 out.push_str(&format!("- **CPU Throttle**: {:.0}x (divide times by {:.0} for real-world)\n", cpu, cpu));
             }
-        }
-        if let Some(ref net) = meta.network_throttling {
-            if !net.is_empty() && net != "No throttling" {
+        if let Some(ref net) = meta.network_throttling
+            && !net.is_empty() && net != "No throttling" {
                 out.push_str(&format!("- **Network**: {}\n", net));
             }
-        }
         if let Some(dpr) = meta.host_dpr {
             out.push_str(&format!("- **DPR**: {}\n", dpr));
         }
@@ -566,8 +564,8 @@ fn export_compare_summary(
 
     // IntersectionObserver from event rows (scroll-related)
     let io_name = "IntersectionObserverController::computeIntersections";
-    if let Some(r) = cmp.rows.iter().find(|r| r.event_name == io_name) {
-        if r.avg_a_us > 0.0 || r.avg_b_us > 0.0 {
+    if let Some(r) = cmp.rows.iter().find(|r| r.event_name == io_name)
+        && (r.avg_a_us > 0.0 || r.avg_b_us > 0.0) {
             root_cause_rows.push(format!(
                 "| IO (avg) | {} | {} | {} |",
                 fmt_us(r.avg_a_us),
@@ -575,7 +573,6 @@ fn export_compare_summary(
                 fmt_change(r.avg_a_us, r.avg_b_us),
             ));
         }
-    }
 
     if !root_cause_rows.is_empty() {
         out.push_str("### Root Cause\n\n");
@@ -633,7 +630,7 @@ fn export_compare_summary(
 
     // Long Tasks
     let lt_change = if sa.long_task_count > 0 {
-        format!("{}", pct_diff(sa.long_task_count as f64, sb.long_task_count as f64))
+        pct_diff(sa.long_task_count as f64, sb.long_task_count as f64).to_string()
     } else {
         "-".to_string()
     };
@@ -652,15 +649,14 @@ fn export_compare_summary(
     // GC (MajorGC + MinorGC)
     let gc_names = ["MajorGC", "MinorGC"];
     for gc_name in &gc_names {
-        if let Some(r) = cmp.rows.iter().find(|r| r.event_name == *gc_name) {
-            if r.avg_a_us > 0.0 || r.avg_b_us > 0.0 {
+        if let Some(r) = cmp.rows.iter().find(|r| r.event_name == *gc_name)
+            && (r.avg_a_us > 0.0 || r.avg_b_us > 0.0) {
                 notes.push(format!(
                     "{}: avg {} → {} ({})",
                     gc_name, fmt_us(r.avg_a_us), fmt_us(r.avg_b_us),
                     pct_diff(r.avg_a_us, r.avg_b_us),
                 ));
             }
-        }
     }
 
     if !notes.is_empty() {
@@ -742,7 +738,7 @@ fn export_compare(
         "| Layout Dirty (avg) | {:.0} | {:.0} | {} |\n",
         cmp.layout_a.avg_dirty,
         cmp.layout_b.avg_dirty,
-        pct_diff(cmp.layout_a.avg_dirty as f64, cmp.layout_b.avg_dirty as f64),
+        pct_diff(cmp.layout_a.avg_dirty, cmp.layout_b.avg_dirty),
     ));
     if cmp.style_recalc_a.total_count > 0 || cmp.style_recalc_b.total_count > 0 {
         out.push_str(&format!(

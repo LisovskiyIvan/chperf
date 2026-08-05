@@ -162,12 +162,11 @@ fn map_bare(tokens: &mut Vec<String>) {
         tokens.push("--stats".to_string());
         return;
     }
-    if let Some((name, val)) = t.split_once('=') {
-        if let Some((_, flag)) = BARE.iter().find(|(n, _)| *n == name) {
+    if let Some((name, val)) = t.split_once('=')
+        && let Some((_, flag)) = BARE.iter().find(|(n, _)| *n == name) {
             tokens[0] = format!("{}={}", flag, val);
             return;
         }
-    }
     if let Some((_, flag)) = BARE.iter().find(|(n, _)| *n == t) {
         tokens[0] = flag.to_string();
     }

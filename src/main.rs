@@ -866,36 +866,31 @@ fn run_tui(mut app: app::App) -> Result<(), Box<dyn std::error::Error>> {
                     let max = app.row_count().saturating_sub(1);
                     app.scroll_offset = max;
                 }
-                KeyCode::Char('1') => {
-                    if !app.tabs.is_empty() {
+                KeyCode::Char('1')
+                    if !app.tabs.is_empty() => {
                         app.tab = app.tabs[0];
                         app.scroll_offset = 0;
                     }
-                }
-                KeyCode::Char('2') => {
-                    if app.tabs.len() > 1 {
+                KeyCode::Char('2')
+                    if app.tabs.len() > 1 => {
                         app.tab = app.tabs[1];
                         app.scroll_offset = 0;
                     }
-                }
-                KeyCode::Char('3') => {
-                    if app.tabs.len() > 2 {
+                KeyCode::Char('3')
+                    if app.tabs.len() > 2 => {
                         app.tab = app.tabs[2];
                         app.scroll_offset = 0;
                     }
-                }
-                KeyCode::Char('4') => {
-                    if app.tabs.len() > 3 {
+                KeyCode::Char('4')
+                    if app.tabs.len() > 3 => {
                         app.tab = app.tabs[3];
                         app.scroll_offset = 0;
                     }
-                }
-                KeyCode::Char('5') => {
-                    if app.tabs.len() > 4 {
+                KeyCode::Char('5')
+                    if app.tabs.len() > 4 => {
                         app.tab = app.tabs[4];
                         app.scroll_offset = 0;
                     }
-                }
                 _ => {}
             }
         }

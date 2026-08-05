@@ -154,7 +154,7 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
                     run += 1;
                     kk -= 1;
                 }
-                if run % 2 == 0 {
+                if run.is_multiple_of(2) {
                     nq += 1;
                 }
             }
@@ -288,7 +288,7 @@ fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
                         run += 1;
                         kk -= 1;
                     }
-                    if run % 2 == 0 {
+                    if run.is_multiple_of(2) {
                         s = false;
                     }
                 }
@@ -340,7 +340,7 @@ fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
                         run += 1;
                         k -= 1;
                     }
-                    if run % 2 == 0 {
+                    if run.is_multiple_of(2) {
                         s = false;
                     }
                 }
@@ -385,6 +385,10 @@ fn parse_thread_count(n: &usize) -> usize {
         .max(1)
 }
 
+/// One thread's parse result: events plus the separator-comma positions it
+/// replaced (for restore on failure).
+type ChunkResult = Result<(Vec<TraceEvent>, Vec<usize>), String>;
+
 /// Parse the `traceEvents` array in parallel. Each thread walks its own byte
 /// range (starting from a block boundary with known exact state), finds the
 /// element ranges, replaces their separator commas with spaces in-place
@@ -399,7 +403,7 @@ fn parse_parallel(bytes: &mut [u8], layout: &Layout, blocks: &Blocks) -> Result<
     let t_scope = std::time::Instant::now();
 
     // Per-thread: (events, comma positions for restore).
-    let results: Vec<Result<(Vec<TraceEvent>, Vec<usize>), String>> = if threads <= 1 {
+    let results: Vec<ChunkResult> = if threads <= 1 {
         let r = chunk_work(bytes, blocks, layout.arr_open, layout.arr_close);
         vec![r]
     } else {
@@ -530,7 +534,7 @@ fn chunk_work(
                     run += 1;
                     k -= 1;
                 }
-                if run % 2 == 0 {
+                if run.is_multiple_of(2) {
                     in_string = false;
                 }
             }
@@ -552,8 +556,6 @@ fn chunk_work(
                         // belongs to the next chunk — stopping here keeps
                         // its separator comma outside this slice.
                         if e >= to {
-                            finished_last = true;
-                            d -= 1;
                             break;
                         }
                         if first_start.is_none() {
@@ -684,7 +686,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
 
     // Extract page URL from TracingStartedInBrowser event
     {
-        let meta = trace.metadata.get_or_insert_with(|| TraceMetadata {
+        let meta = trace.metadata.get_or_insert(TraceMetadata {
             cpu_throttling: None,
             source: None,
             start_time: None,
@@ -696,22 +698,20 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         if meta.page_url.is_none() {
             for e in &trace.trace_events {
                 if e.name == "TracingStartedInBrowser" {
-                    if let Some(ref args) = e.args {
-                        if let Some(frames) = args
+                    if let Some(ref args) = e.args
+                        && let Some(frames) = args
                             .get("data")
                             .and_then(|d| d.get("frames"))
                             .and_then(|f| f.as_array())
                         {
                             for frame in frames {
-                                if let Some(url) = frame.get("url").and_then(|u| u.as_str()) {
-                                    if !url.is_empty() && url != "about:blank" {
+                                if let Some(url) = frame.get("url").and_then(|u| u.as_str())
+                                    && !url.is_empty() && url != "about:blank" {
                                         meta.page_url = Some(url.to_string());
                                         break;
                                     }
-                                }
                             }
                         }
-                    }
                     break;
                 }
             }
@@ -735,13 +735,11 @@ pub fn is_metadata_event(e: &TraceEvent) -> bool {
 /// Detect main thread: first RunTask with dur > 500ms
 pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     for e in events {
-        if e.name == "RunTask" && e.ph == "X" {
-            if let Some(dur) = e.dur {
-                if dur > 500_000.0 {
+        if e.name == "RunTask" && e.ph == "X"
+            && let Some(dur) = e.dur
+                && dur > 500_000.0 {
                     return e.tid;
                 }
-            }
-        }
     }
     // Fallback: tid with most RunTask events
     let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();

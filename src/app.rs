@@ -60,6 +60,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         summary: SummaryResult,
         scroll_frames: ScrollFrameResult,

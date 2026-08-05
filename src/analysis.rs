@@ -66,21 +66,19 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         if e.tid != main_tid || e.ph != "X" {
             continue;
         }
-        if e.name == "RunTask" {
-            if let Some(d) = e.dur {
+        if e.name == "RunTask"
+            && let Some(d) = e.dur {
                 main_thread_busy_us += d;
                 if d > 50_000.0 {
                     long_task_durs.push(d);
                 }
             }
-        }
-        if let Some(key) = target_key(&e.name) {
-            if let Some(d) = e.dur {
+        if let Some(key) = target_key(&e.name)
+            && let Some(d) = e.dur {
                 let entry = stats_map.entry(key).or_default();
                 entry.0 += d;
                 entry.1 += 1;
             }
-        }
     }
 
     long_task_durs.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -299,6 +297,11 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
 
 // ── CPU Profile ──
 
+/// CPU-profile node id -> (function name, source URL, parent id), first-wins.
+pub type ProfileNodes = HashMap<u64, (String, String, Option<u64>)>;
+/// CPU-profile node id -> sampled self-time (µs).
+pub type ProfileSelfTimes = HashMap<u64, f64>;
+
 #[derive(Clone)]
 pub struct FunctionTime {
     pub function_name: String,
@@ -363,7 +366,7 @@ pub fn scan_profile_chunks(
     events: &[TraceEvent],
     scope: Option<&Scope>,
     reserve_threads: usize,
-) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
+) -> (ProfileNodes, ProfileSelfTimes) {
     let windows = [scope.and_then(|s| s.window)];
     let threads = scan_threads(reserve_threads);
     let (nodes, mut times) = scan_profile_chunks_core(events, scope, &windows, threads);
@@ -378,7 +381,7 @@ pub fn scan_profile_chunks_windows(
     scope: Option<&Scope>,
     windows: &[Option<(f64, f64)>],
     reserve_threads: usize,
-) -> (HashMap<u64, (String, String, Option<u64>)>, Vec<HashMap<u64, f64>>) {
+) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     scan_profile_chunks_core(events, scope, windows, scan_threads(reserve_threads))
 }
 
@@ -398,7 +401,7 @@ fn scan_profile_chunks_core(
     scope: Option<&Scope>,
     windows: &[Option<(f64, f64)>],
     threads: usize,
-) -> (HashMap<u64, (String, String, Option<u64>)>, Vec<HashMap<u64, f64>>) {
+) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     const MIN_CHUNK_WORK: usize = 64_000;
     let any_window = windows.iter().any(|w| w.is_some());
     let bases = if any_window {
@@ -417,8 +420,8 @@ fn scan_profile_chunks_core(
             .enumerate()
             .map(|(ci, c)| s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases, windows)))
             .collect();
-        let mut nodes: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-        let mut times: Vec<HashMap<u64, f64>> =
+        let mut nodes: ProfileNodes = HashMap::new();
+        let mut times: Vec<ProfileSelfTimes> =
             (0..windows.len()).map(|_| HashMap::new()).collect();
         for h in handles {
             let (n, t) = h.join().unwrap();
@@ -541,9 +544,9 @@ fn scan_profile_chunk(
     scope: Option<&Scope>,
     bases: &HashMap<usize, f64>,
     windows: &[Option<(f64, f64)>],
-) -> (HashMap<u64, (String, String, Option<u64>)>, Vec<HashMap<u64, f64>>) {
-    let mut node_map: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-    let mut self_times: Vec<HashMap<u64, f64>> =
+) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
+    let mut node_map: ProfileNodes = HashMap::new();
+    let mut self_times: Vec<ProfileSelfTimes> =
         (0..windows.len()).map(|_| HashMap::new()).collect();
 
     for (i, e) in events.iter().enumerate() {
@@ -582,11 +585,10 @@ fn scan_profile_chunk(
             }
         }
 
-        if let Some(scope) = scope {
-            if !scope.allows_chunk(e) {
+        if let Some(scope) = scope
+            && !scope.allows_chunk(e) {
                 continue;
             }
-        }
         let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
         let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
 
@@ -724,7 +726,7 @@ pub fn analyze_style_recalc(events: &[TraceEvent], main_tid: u64) -> StyleRecalc
         }
     }
 
-    entries.sort_by(|a, b| b.element_count.cmp(&a.element_count));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.element_count));
 
     let n = entries.len().max(1) as f64;
     let avg_elements = entries.iter().map(|e| e.element_count as f64).sum::<f64>() / n;
@@ -791,7 +793,7 @@ pub fn analyze_layout_dirty(events: &[TraceEvent], main_tid: u64) -> LayoutDirty
         });
     }
 
-    entries.sort_by(|a, b| b.dirty_count.cmp(&a.dirty_count));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.dirty_count));
 
     let n = entries.len().max(1) as f64;
     let avg_dirty = entries.iter().map(|e| e.dirty_count as f64).sum::<f64>() / n;
@@ -887,7 +889,7 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
         }
     }
 
-    entries.sort_by(|a, b| b.reflow_count.cmp(&a.reflow_count));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.reflow_count));
 
     let total_reflows: usize = entries.iter().map(|e| e.reflow_count).sum();
     let total_layout_time_us: f64 = entries.iter().map(|e| e.layout_time_us).sum();
@@ -968,6 +970,7 @@ fn pct_diff(a: f64, b: f64) -> f64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn analyze_compare(
     summary_a: &SummaryResult,
     summary_b: &SummaryResult,
@@ -1244,7 +1247,7 @@ pub fn analyze_compare(
     }
 
     // Layout dirty
-    let dirty_diff = pct_diff(layout_a.avg_dirty as f64, layout_b.avg_dirty as f64);
+    let dirty_diff = pct_diff(layout_a.avg_dirty, layout_b.avg_dirty);
     if dirty_diff.abs() > 15.0 {
         findings.push(Finding {
             severity: if dirty_diff < 0.0 {
@@ -1387,11 +1390,10 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         if e.ts < min_ts || e.ts > max_ts {
             continue;
         }
-        if let (Some(lo), Some(hi)) = (win_lo, win_hi) {
-            if e.ts < lo || e.ts > hi {
+        if let (Some(lo), Some(hi)) = (win_lo, win_hi)
+            && (e.ts < lo || e.ts > hi) {
                 continue;
             }
-        }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         match e.name.as_str() {
             "RunTask" if e.ph == "X" && e.tid == main_tid => {
@@ -1403,18 +1405,16 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
                 }
             }
             "FireAnimationFrame" if e.ph == "X" && e.tid == main_tid => {
-                if let Some(d) = e.dur {
-                    if d > max_faf[b] {
+                if let Some(d) = e.dur
+                    && d > max_faf[b] {
                         max_faf[b] = d;
                     }
-                }
             }
             "GPUTask" if e.ph == "X" => {
-                if let Some(d) = e.dur {
-                    if d > max_gpu[b] {
+                if let Some(d) = e.dur
+                    && d > max_gpu[b] {
                         max_gpu[b] = d;
                     }
-                }
             }
             "DroppedFrame" => {
                 dropped[b] += 1;
@@ -1485,36 +1485,29 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
     // FunctionCalls per cluster in one extra pass.
     let mut in_cluster: Vec<Option<usize>> = vec![None; n];
     for (ci, a) in top.iter().enumerate() {
-        for b in a.start..=a.end {
-            in_cluster[b] = Some(ci);
-        }
+        in_cluster[a.start..=a.end].fill(Some(ci));
     }
     let mut calls: Vec<HashMap<String, f64>> = (0..top.len()).map(|_| HashMap::new()).collect();
     for e in events {
         if e.name != "FunctionCall" || e.ph != "X" {
             continue;
         }
-        if let (Some(lo), Some(hi)) = (win_lo, win_hi) {
-            if e.ts < lo || e.ts > hi {
+        if let (Some(lo), Some(hi)) = (win_lo, win_hi)
+            && (e.ts < lo || e.ts > hi) {
                 continue;
             }
-        }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
-        if let Some(ci) = in_cluster[b] {
-            if let Some(d) = e.dur {
-                if let Some(name) = e
+        if let Some(ci) = in_cluster[b]
+            && let Some(d) = e.dur
+                && let Some(name) = e
                     .args
                     .as_ref()
                     .and_then(|a| a.get("data"))
                     .and_then(|d| d.get("functionName"))
                     .and_then(|v| v.as_str())
-                {
-                    if !name.is_empty() {
+                    && !name.is_empty() {
                         *calls[ci].entry(name.to_string()).or_default() += d;
                     }
-                }
-            }
-        }
     }
 
     let clusters: Vec<JankCluster> = top

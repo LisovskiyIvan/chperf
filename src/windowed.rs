@@ -141,13 +141,11 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             for (i, s) in samples.iter().enumerate().take(n) {
                 sample_ts += deltas[i].as_f64().unwrap_or(0.0);
                 let id = s.as_u64().unwrap_or(0);
-                if id != 0 {
-                    if let Some(entry) = node_first.get_mut(&id) {
-                        if sample_ts < entry.0 {
+                if id != 0
+                    && let Some(entry) = node_first.get_mut(&id)
+                        && sample_ts < entry.0 {
                             entry.0 = sample_ts;
                         }
-                    }
-                }
             }
             prev_last.insert(e.pid, sample_ts);
         }
@@ -156,7 +154,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // `shoot` also hits module URLs (`src/games/shooterX/...`) that appear
     // long before the first actual shoot call.
     let mut cpu_best: Option<Anchor> = None;
-    for (_id, (t, name, _url)) in &node_first {
+    for (t, name, _url) in node_first.values() {
         if *t == f64::INFINITY || !matcher.matches(name) {
             continue;
         }
@@ -169,7 +167,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
         }
     }
     if cpu_best.is_none() {
-        for (_id, (t, _name, url)) in &node_first {
+        for (t, _name, url) in node_first.values() {
             if *t == f64::INFINITY || !matcher.matches(url) {
                 continue;
             }
@@ -190,15 +188,14 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     let mut args_best: Option<Anchor> = None;
     for e in events {
         let Some(args) = &e.args else { continue };
-        if let Some(text) = value_match_text(args, matcher) {
-            if args_best.as_ref().is_none_or(|b| e.ts < b.ts) {
+        if let Some(text) = value_match_text(args, matcher)
+            && args_best.as_ref().is_none_or(|b| e.ts < b.ts) {
                 args_best = Some(Anchor {
                     ts: e.ts,
                     kind: "args",
                     label: text.to_string(),
                 });
             }
-        }
     }
     args_best
 }
@@ -215,21 +212,18 @@ fn paired_durations(events: &[TraceEvent], name: &str, window: Option<(f64, f64)
         if e.name != name {
             continue;
         }
-        if let Some((lo, hi)) = window {
-            if e.ts < lo || e.ts > hi {
+        if let Some((lo, hi)) = window
+            && (e.ts < lo || e.ts > hi) {
                 continue;
             }
-        }
         match e.ph.as_str() {
             "b" => stacks.entry(e.tid).or_default().push(e.ts),
             "e" => {
-                if let Some(st) = stacks.get_mut(&e.tid) {
-                    if let Some(t) = st.pop() {
-                        if e.ts > t {
+                if let Some(st) = stacks.get_mut(&e.tid)
+                    && let Some(t) = st.pop()
+                        && e.ts > t {
                             durs.push(e.ts - t);
                         }
-                    }
-                }
             }
             _ => {}
         }

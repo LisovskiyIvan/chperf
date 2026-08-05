@@ -91,7 +91,7 @@ impl Scope {
             && self
                 .cat
                 .as_deref()
-                .map_or(true, |c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
+                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
     }
 
     /// Thread/process/category filter without the window check — for CPU
@@ -102,7 +102,7 @@ impl Scope {
             && self
                 .cat
                 .as_deref()
-                .map_or(true, |c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
+                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
     }
 
     pub(crate) fn window_line(&self, min_ts: f64) -> Option<String> {
@@ -199,6 +199,7 @@ pub enum Sort {
 // ── Inspectors (each returns (markdown, json)) ──
 
 /// List events matching the filter, scoped, filtered by min duration, sorted.
+#[allow(clippy::too_many_arguments)]
 pub fn events_section(
     events: &[TraceEvent],
     filter: &NameFilter,
@@ -736,7 +737,7 @@ pub fn names_section(
         .map(|(n, (c, d))| (n.to_string(), c, d))
         .collect();
     match sort {
-        Sort::Count => rows.sort_by(|a, b| b.1.cmp(&a.1)),
+        Sort::Count => rows.sort_by_key(|b| std::cmp::Reverse(b.1)),
         Sort::Name => rows.sort_by(|a, b| a.0.cmp(&b.0)),
         _ => rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0))),
     }
@@ -888,7 +889,7 @@ pub fn timeline_section(
     }
 
     let span_ms = (end - start) / 1000.0;
-    let bucket_ms = bucket_ms.unwrap_or_else(|| (span_ms / 40.0).round().max(10.0).min(500.0));
+    let bucket_ms = bucket_ms.unwrap_or_else(|| (span_ms / 40.0).round().clamp(10.0, 500.0));
     let bucket_us = (bucket_ms * 1000.0).max(1.0);
     let n_buckets = (((end - start) / bucket_us).ceil() as usize).max(1);
     let mut runtask = vec![0.0f64; n_buckets];
@@ -999,7 +1000,7 @@ pub fn task_section(
             let g = groups.entry(e.name.clone()).or_default();
             g.0 += 1;
             g.1 += d;
-            if e.name == "FunctionCall" && top_fc.as_ref().map_or(true, |(_, dd)| d > *dd) {
+            if e.name == "FunctionCall" && top_fc.as_ref().is_none_or(|(_, dd)| d > *dd) {
                 let fn_name = e
                     .args
                     .as_ref()

@@ -180,7 +180,7 @@ fn frame_budget_ratio(us: f64, factor: f64) -> f64 {
 
 /// Alternating row background
 fn row_bg(idx: usize) -> Style {
-    if idx % 2 == 0 {
+    if idx.is_multiple_of(2) {
         Style::default()
     } else {
         Style::default().bg(Color::Rgb(30, 30, 40))
@@ -228,8 +228,8 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )];
     // Metadata badges
-    if let Some(ref meta) = app.metadata {
-        if let Some(ref start) = meta.start_time {
+    if let Some(ref meta) = app.metadata
+        && let Some(ref start) = meta.start_time {
             // Show date portion only
             let date_str = if start.len() >= 10 { &start[..10] } else { start };
             title_spans.push(Span::styled(
@@ -237,7 +237,6 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-    }
     if app.is_throttled() {
         title_spans.push(Span::styled(
             format!(" CPU {:.0}x ", app.throttle_factor),
@@ -247,9 +246,9 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(ref meta) = app.metadata {
-        if let Some(ref net) = meta.network_throttling {
-            if !net.is_empty() && net != "No throttling" {
+    if let Some(ref meta) = app.metadata
+        && let Some(ref net) = meta.network_throttling
+            && !net.is_empty() && net != "No throttling" {
                 title_spans.push(Span::styled(
                     format!(" Net:{} ", net),
                     Style::default()
@@ -258,8 +257,6 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-        }
-    }
 
     let tabs = Tabs::new(titles)
         .block(
@@ -354,8 +351,8 @@ fn draw_metadata_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // CPU throttle
-    if let Some(cpu) = meta.cpu_throttling {
-        if cpu > 1.0 {
+    if let Some(cpu) = meta.cpu_throttling
+        && cpu > 1.0 {
             spans.push(Span::styled(
                 format!("CPU: {:.0}x ", cpu),
                 Style::default()
@@ -363,7 +360,6 @@ fn draw_metadata_bar(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-    }
 
     // DPR
     if let Some(dpr) = meta.hardware_concurrency {
@@ -1895,8 +1891,8 @@ fn draw_compare_metrics(
         ),
         (
             "Layout Dirty",
-            cmp.layout_a.avg_dirty as f64,
-            cmp.layout_b.avg_dirty as f64,
+            cmp.layout_a.avg_dirty,
+            cmp.layout_b.avg_dirty,
             false,
         ),
     ];
@@ -2121,7 +2117,7 @@ fn format_diff(pct: f64) -> (String, Color) {
 }
 
 fn diff_bar(pct: f64, half_width: usize) -> String {
-    let clamped = pct.max(-100.0).min(100.0);
+    let clamped = pct.clamp(-100.0, 100.0);
     let chars = (clamped.abs() / 100.0 * half_width as f64).round() as usize;
     let chars = chars.min(half_width);
 
