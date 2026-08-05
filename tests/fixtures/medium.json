@@ -1,0 +1,45 @@
+{
+  "traceEvents": [
+    {"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 0},
+    {"name": "process_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 0},
+    {"name": "Profile", "ph": "P", "ts": 1000000, "pid": 2, "tid": 65},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1000000, "dur": 600000, "pid": 2, "tid": 1},
+    {"name": "MajorGC", "cat": "devtools.timeline", "ph": "X", "ts": 1002000, "dur": 5000, "pid": 2, "tid": 1},
+    {"name": "DroppedFrame", "ph": "I", "ts": 1003000, "pid": 2, "tid": 7},
+    {"name": "DroppedFrame", "ph": "I", "ts": 1004000, "pid": 2, "tid": 7},
+    {"name": "FunctionCall", "cat": "devtools.timeline", "ph": "X", "ts": 1005000, "dur": 40000, "pid": 2, "tid": 1, "args": {"data": {"functionName": "handleInput"}}},
+    {"name": "WebSocketSend", "cat": "devtools.timeline", "ph": "X", "ts": 1006000, "dur": 500, "pid": 2, "tid": 1, "args": {"data": {"msg": "player_shoot"}}},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1008000, "dur": 60000, "pid": 2, "tid": 1},
+    {"name": "MinorGC", "cat": "devtools.timeline", "ph": "X", "ts": 1010000, "dur": 1000, "pid": 2, "tid": 1},
+    {"name": "V8.GCScavenger", "cat": "devtools.timeline", "ph": "X", "ts": 1011000, "dur": 500, "pid": 2, "tid": 1},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1000000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1016000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1017000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1037000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1050000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1070000, "pid": 2, "tid": 7},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1050000, "dur": 20000, "pid": 2, "tid": 1},
+    {"name": "ProfileChunk", "ph": "P", "ts": 1060000, "pid": 2, "tid": 65, "args": {"data": {"cpuProfile": {
+      "nodes": [
+        {"id": 1, "callFrame": {"functionName": "(root)", "url": ""}, "parent": null},
+        {"id": 2, "callFrame": {"functionName": "shoot", "url": "http://x/src/weapon.ts"}, "parent": 1},
+        {"id": 3, "callFrame": {"functionName": "update", "url": "http://x/src/game.ts"}, "parent": 1}
+      ],
+      "samples": [2, 3, 2, 3, 2, 3, 2]
+    }, "timeDeltas": [5000, 5000, 5000, 5000, 5000, 5000, 5000]}}},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1100000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1120000, "pid": 2, "tid": 7},
+    {"name": "ProfileChunk", "ph": "P", "ts": 1100000, "pid": 2, "tid": 65, "args": {"data": {"cpuProfile": {
+      "nodes": [
+        {"id": 1, "callFrame": {"functionName": "(root)", "url": ""}, "parent": null},
+        {"id": 4, "callFrame": {"functionName": "shoot", "url": "http://x/src/weapon.ts"}, "parent": 1}
+      ],
+      "samples": [4, 4, 4, 4]
+    }, "timeDeltas": [4000, 3000, -1000, 4000]}}},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1100000, "dur": 80000, "pid": 2, "tid": 3},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1200000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1250000, "pid": 2, "tid": 7},
+    {"name": "MinorGC", "cat": "devtools.timeline", "ph": "X", "ts": 1200000, "dur": 2000, "pid": 2, "tid": 1},
+    {"name": "CppGC.MarkAtomicPrologue", "cat": "devtools.timeline", "ph": "X", "ts": 1200500, "dur": 300, "pid": 2, "tid": 1}
+  ]
+}
