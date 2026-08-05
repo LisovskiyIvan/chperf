@@ -364,16 +364,50 @@ pub fn scan_profile_chunks(
     scope: Option<&Scope>,
     reserve_threads: usize,
 ) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
-    const MIN_CHUNK_WORK: usize = 64_000;
-    // Sample times are reconstructed from a sequential walk over chunks
-    // (see `profile_chunk_bases`), so they're independent of this split.
-    let bases = profile_chunk_bases(events);
-    let threads = std::thread::available_parallelism()
+    let windows = [scope.and_then(|s| s.window)];
+    let threads = scan_threads(reserve_threads);
+    let (nodes, mut times) = scan_profile_chunks_core(events, scope, &windows, threads);
+    (nodes, times.remove(0))
+}
+
+/// Like `scan_profile_chunks` but attributes each sample to every window it
+/// falls into, returning one self-time map per window. The windows are time
+/// filters only; `scope` (if any) supplies the tid/pid/cat filters.
+pub fn scan_profile_chunks_windows(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    windows: &[Option<(f64, f64)>],
+    reserve_threads: usize,
+) -> (HashMap<u64, (String, String, Option<u64>)>, Vec<HashMap<u64, f64>>) {
+    scan_profile_chunks_core(events, scope, windows, scan_threads(reserve_threads))
+}
+
+fn scan_threads(reserve_threads: usize) -> usize {
+    std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(reserve_threads).max(1))
-        .unwrap_or(1);
-    let threads = threads.max(1);
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Shared scan core. `windows` may be empty (attribute nothing) or contain
+/// one window per output map; a `None` window matches every sample. The
+/// sequential `profile_chunk_bases` walk only runs when at least one window
+/// needs sample times.
+fn scan_profile_chunks_core(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    windows: &[Option<(f64, f64)>],
+    threads: usize,
+) -> (HashMap<u64, (String, String, Option<u64>)>, Vec<HashMap<u64, f64>>) {
+    const MIN_CHUNK_WORK: usize = 64_000;
+    let any_window = windows.iter().any(|w| w.is_some());
+    let bases = if any_window {
+        profile_chunk_bases(events)
+    } else {
+        HashMap::new()
+    };
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
-        return scan_profile_chunk(events, 0, scope, &bases);
+        return scan_profile_chunk(events, 0, scope, &bases, windows);
     }
     let chunk = events.len().div_ceil(threads);
     let bases = &bases;
@@ -381,17 +415,20 @@ pub fn scan_profile_chunks(
         let handles: Vec<_> = events
             .chunks(chunk)
             .enumerate()
-            .map(|(ci, c)| s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases)))
+            .map(|(ci, c)| s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases, windows)))
             .collect();
         let mut nodes: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-        let mut times: HashMap<u64, f64> = HashMap::new();
+        let mut times: Vec<HashMap<u64, f64>> =
+            (0..windows.len()).map(|_| HashMap::new()).collect();
         for h in handles {
             let (n, t) = h.join().unwrap();
             for (id, v) in n {
                 nodes.entry(id).or_insert(v);
             }
-            for (id, dt) in t {
-                *times.entry(id).or_default() += dt;
+            for (wi, m) in t.into_iter().enumerate() {
+                for (id, dt) in m {
+                    *times[wi].entry(id).or_default() += dt;
+                }
             }
         }
         (nodes, times)
@@ -406,6 +443,10 @@ pub fn scan_profile_chunks(
 /// `base + sum(deltas[0..=i])`, where `base` = time of the previous chunk's
 /// last sample + this chunk's first delta. The walk is anchored per process
 /// on the `Profile` (ph=P) event's ts. Returns the base per event index.
+///
+/// With `CHPERF_CHECK` set, also verifies that reconstructed sample times
+/// stay inside the trace bounds — if Chrome ever changes `timeDeltas`
+/// semantics, the drift shows up here instead of silently skewing windows.
 fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
     let mut starts: HashMap<u64, f64> = HashMap::new();
     for e in events {
@@ -415,6 +456,10 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
     }
     let mut bases: HashMap<usize, f64> = HashMap::new();
     let mut prev_last: HashMap<u64, f64> = HashMap::new(); // last sample time per pid
+    // Sample-time bounds (first sample of the walk, last sample per pid) for
+    // the CHPERF_CHECK sanity pass.
+    let mut sample_min = f64::INFINITY;
+    let mut sample_max = f64::NEG_INFINITY;
     for (idx, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
             continue;
@@ -435,11 +480,56 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
             .get(&e.pid)
             .copied()
             .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
-        bases.insert(idx, pl + first);
+        let base = pl + first;
         let sum: f64 = td.iter().filter_map(|v| v.as_f64()).sum();
         prev_last.insert(e.pid, pl + sum);
+        if check_enabled() {
+            if base < sample_min {
+                sample_min = base;
+            }
+            let last = pl + sum;
+            if last > sample_max {
+                sample_max = last;
+            }
+        }
+        bases.insert(idx, base);
+    }
+    if check_enabled() {
+        // Compare sample bounds against the trace's own event bounds (skipping
+        // metadata events, which carry process-start timestamps).
+        let mut ev_min = f64::INFINITY;
+        let mut ev_max = f64::NEG_INFINITY;
+        for e in events {
+            if crate::trace::is_metadata_event(e) {
+                continue;
+            }
+            let end = e.ts + e.dur.unwrap_or(0.0);
+            if e.ts < ev_min {
+                ev_min = e.ts;
+            }
+            if end > ev_max {
+                ev_max = end;
+            }
+        }
+        const SLACK_US: f64 = 30_000_000.0; // 30s: profiling may start/stop before/after UI events
+        if sample_min < ev_min - SLACK_US || sample_max > ev_max + SLACK_US {
+            eprintln!(
+                "[CHPERF_CHECK] CPU sample times {:.3}s..{:.3}s outside trace bounds {:.3}s..{:.3}s \
+                 — timeDeltas semantics may have changed",
+                sample_min / 1e6,
+                sample_max / 1e6,
+                ev_min / 1e6,
+                ev_max / 1e6,
+            );
+        }
     }
     bases
+}
+
+/// Cached check of the `CHPERF_CHECK` env flag.
+fn check_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CHPERF_CHECK").is_ok())
 }
 
 /// Single-threaded scan of one events slice, shared by the parallel helper.
@@ -450,9 +540,11 @@ fn scan_profile_chunk(
     global_offset: usize,
     scope: Option<&Scope>,
     bases: &HashMap<usize, f64>,
-) -> (HashMap<u64, (String, String, Option<u64>)>, HashMap<u64, f64>) {
+    windows: &[Option<(f64, f64)>],
+) -> (HashMap<u64, (String, String, Option<u64>)>, Vec<HashMap<u64, f64>>) {
     let mut node_map: HashMap<u64, (String, String, Option<u64>)> = HashMap::new();
-    let mut self_times: HashMap<u64, f64> = HashMap::new();
+    let mut self_times: Vec<HashMap<u64, f64>> =
+        (0..windows.len()).map(|_| HashMap::new()).collect();
 
     for (i, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
@@ -504,29 +596,40 @@ fn scan_profile_chunk(
         // code summed deltas directly (cumulative-sum inflation, ~83x on
         // long traces) and filtered chunks by the chunk's own ts, not the
         // samples'. Windowed scopes now attribute per-sample by absolute
-        // sample time.
+        // sample time. With no window in play, the tight loop skips the
+        // sample-time math entirely.
         if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
             let n = samples.len().min(deltas.len());
             if n == 0 {
                 continue;
             }
+            let windowed = windows.iter().any(|w| w.is_some());
+            if !windowed {
+                let t0 = &mut self_times[0];
+                for k in 0..n {
+                    let weight = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
+                    if weight > 0.0 {
+                        let node_id = samples[k].as_u64().unwrap_or(0);
+                        *t0.entry(node_id).or_default() += weight;
+                    }
+                }
+                continue;
+            }
             let base = bases.get(&(global_offset + i)).copied().unwrap_or(0.0);
             let mut sample_ts = base;
             for k in 0..n {
+                // Weights clamp negative deltas (V8 sampling jitter); the
+                // time walk uses the raw deltas so timestamps stay true.
                 let weight = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
-                if let Some(scope) = scope {
-                    if let Some((lo, hi)) = scope.window {
-                        if sample_ts < lo || sample_ts > hi {
-                            sample_ts += weight;
-                            continue;
+                if weight > 0.0 {
+                    let node_id = samples[k].as_u64().unwrap_or(0);
+                    for (wi, w) in windows.iter().enumerate() {
+                        if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts <= hi) {
+                            *self_times[wi].entry(node_id).or_default() += weight;
                         }
                     }
                 }
-                if weight > 0.0 {
-                    let node_id = samples[k].as_u64().unwrap_or(0);
-                    *self_times.entry(node_id).or_default() += weight;
-                }
-                sample_ts += weight;
+                sample_ts += deltas[k].as_f64().unwrap_or(0.0);
             }
         }
     }
@@ -1439,5 +1542,178 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         clusters,
         total_dropped,
         bucket_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::TraceEvent;
+
+    fn profile_event(ts: f64) -> TraceEvent {
+        TraceEvent {
+            name: "Profile".into(),
+            ph: "P".into(),
+            ts,
+            dur: None,
+            tid: 65,
+            pid: 2,
+            cat: None,
+            args: None,
+        }
+    }
+
+    fn chunk_event(ts: f64, nodes: &[(u64, &str, Option<u64>)], samples: &[u64], deltas: &[f64]) -> TraceEvent {
+        let nodes_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(id, name, parent)| {
+                serde_json::json!({"id": id, "callFrame": {"functionName": name, "url": ""}, "parent": parent})
+            })
+            .collect();
+        TraceEvent {
+            name: "ProfileChunk".into(),
+            ph: "P".into(),
+            ts,
+            dur: None,
+            tid: 65,
+            pid: 2,
+            cat: None,
+            args: Some(serde_json::json!({
+                "data": {
+                    "cpuProfile": {"nodes": nodes_json, "samples": samples},
+                    "timeDeltas": deltas,
+                }
+            })),
+        }
+    }
+
+    fn plain_event(ts: f64, name: &str) -> TraceEvent {
+        TraceEvent {
+            name: name.into(),
+            ph: "X".into(),
+            ts,
+            dur: Some(100.0),
+            tid: 1,
+            pid: 2,
+            cat: None,
+            args: None,
+        }
+    }
+
+    const NODES_ABC: [(u64, &str, Option<u64>); 3] =
+        [(1, "(root)", None), (2, "shoot", Some(1)), (3, "update", Some(1))];
+
+    /// Fixture mirroring tests/fixtures/tiny.json: profile starts at 1e6,
+    /// chunk 1 = 7 samples of 5ms (shoot/update alternating), chunk 2 has a
+    /// negative delta that must be clamped. Expected totals:
+    /// total 46ms, shoot 26ms (15 + 11), update 15ms.
+    fn fixture_events() -> Vec<TraceEvent> {
+        vec![
+            profile_event(1_000_000.0),
+            chunk_event(1_055_000.0, &NODES_ABC, &[2, 3, 2, 3, 2, 3, 2], &[5000.0; 7]),
+            chunk_event(
+                1_095_000.0,
+                &[(1, "(root)", None), (4, "shoot", Some(1))],
+                &[4, 4, 4, 4],
+                &[4000.0, 3000.0, -1000.0, 4000.0],
+            ),
+            plain_event(1_000_000.0, "RunTask"),
+        ]
+    }
+
+    fn total(times: &HashMap<u64, f64>) -> f64 {
+        times.values().sum()
+    }
+
+    #[test]
+    fn scan_attribution_weights_are_per_sample_deltas() {
+        // Regression: the old code summed cumulative deltas (~83x inflation);
+        // weights must be the deltas themselves, clamped at zero.
+        let events = fixture_events();
+        let (nodes, times) = scan_profile_chunks(&events, None, 0);
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(total(&times), 46_000.0);
+        assert_eq!(*times.get(&2).unwrap_or(&0.0), 20_000.0); // 4 × 5ms (idx 0,2,4,6)
+        assert_eq!(*times.get(&3).unwrap_or(&0.0), 15_000.0);
+        // Node 4: 4000 + 3000 + clamp(-1000 → 0) + 4000.
+        assert_eq!(*times.get(&4).unwrap_or(&0.0), 11_000.0);
+    }
+
+    #[test]
+    fn scan_windowed_attributes_by_sample_time_not_chunk_ts() {
+        let events = fixture_events();
+        let scope = Scope {
+            window: Some((1_000_000.0, 1_030_000.0)),
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (_, times) = scan_profile_chunks(&events, Some(&scope), 0);
+        assert_eq!(total(&times), 30_000.0); // 6 × 5ms samples ending at 1_030_000
+
+        let scope2 = Scope {
+            window: Some((1_040_000.0, 1_050_000.0)),
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (_, times2) = scan_profile_chunks(&events, Some(&scope2), 0);
+        assert_eq!(total(&times2), 7_000.0); // 3000 + 0 + 4000 (negative clamped)
+
+        // Windowed totals never exceed the full-trace total.
+        assert!(total(&times) <= 46_000.0 && total(&times2) <= 46_000.0);
+    }
+
+    #[test]
+    fn scan_multi_window_shares_one_walk() {
+        let events = fixture_events();
+        let windows: [Option<(f64, f64)>; 2] = [
+            Some((1_000_000.0, 1_030_000.0)),
+            Some((1_040_000.0, 1_050_000.0)),
+        ];
+        let (_, times) = scan_profile_chunks_windows(&events, None, &windows, 0);
+        assert_eq!(times.len(), 2);
+        assert_eq!(total(&times[0]), 30_000.0);
+        assert_eq!(total(&times[1]), 7_000.0);
+        // A None window matches everything (tid-filter-only scopes).
+        let (_, times) = scan_profile_chunks_windows(&events, None, &[None], 0);
+        assert_eq!(total(&times[0]), 46_000.0);
+    }
+
+    #[test]
+    fn scan_parallel_matches_serial_exactly() {
+        // Deterministic LCG data big enough to engage the parallel split
+        // (MIN_CHUNK_WORK = 64k events), with per-chunk reset deltas and
+        // occasional negative values.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut rng = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u64
+        };
+        let mut events: Vec<TraceEvent> = Vec::new();
+        for i in 0..22_000u64 {
+            let samples: Vec<u64> = (0..8).map(|_| (rng() % 4) + 1).collect();
+            let deltas: Vec<f64> = (0..8).map(|_| (rng() % 11) as f64 - 1.0).collect();
+            events.push(chunk_event(
+                1_000_000.0 + i as f64 * 10_000.0,
+                &[(1, "(root)", None), (2, "a", Some(1)), (3, "b", Some(1)), (4, "c", Some(1))],
+                &samples,
+                &deltas,
+            ));
+            events.push(plain_event(1_000_000.0 + i as f64 * 10_000.0, "RunTask"));
+            events.push(plain_event(1_000_000.0 + i as f64 * 10_000.0 + 1.0, "Paint"));
+        }
+        assert!(events.len() >= 64_000);
+
+        let (nodes_serial, times_serial) = scan_profile_chunks_core(&events, None, &[None], 1);
+        let (nodes_par, times_par) = scan_profile_chunks_core(&events, None, &[None], 8);
+        assert_eq!(nodes_serial.len(), nodes_par.len());
+        for (id, v) in &nodes_serial {
+            assert_eq!(nodes_par.get(id), Some(v));
+        }
+        assert_eq!(times_serial[0].len(), times_par[0].len());
+        for (id, t) in &times_serial[0] {
+            assert_eq!(times_par[0].get(id), Some(t), "node {} self-time diverged", id);
+        }
     }
 }

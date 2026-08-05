@@ -547,6 +547,15 @@ fn chunk_work(
             b'}' | b']' => {
                 if b == b'}' && d == 3 {
                     if let Some(e) = elem_start.take() {
+                        // A chunk owns elements whose start is inside
+                        // [from, to). An element starting at/after `to`
+                        // belongs to the next chunk — stopping here keeps
+                        // its separator comma outside this slice.
+                        if e >= to {
+                            finished_last = true;
+                            d -= 1;
+                            break;
+                        }
                         if first_start.is_none() {
                             first_start = Some(e);
                         }
@@ -561,9 +570,19 @@ fn chunk_work(
                         if j < bytes.len() && bytes[j] == b',' && j < to {
                             replaced.push(j);
                         }
+                        // Stop at the first element boundary at/after `to`
+                        // even when the element *containing* `to` started
+                        // before `from` (it belongs to the previous chunk):
+                        // otherwise the walk grabs the next element, which
+                        // the following chunk also owns — boundary elements
+                        // get parsed twice.
                         if i >= to {
                             finished_last = true;
                         }
+                    } else if i >= to {
+                        // Element started before `from` (previous chunk's)
+                        // but spans at least to `to`: stop here.
+                        finished_last = true;
                     }
                 }
                 d -= 1;
@@ -587,7 +606,12 @@ fn chunk_work(
     let events = serde_json::Deserializer::from_slice(&bytes[s..e])
         .into_iter()
         .collect::<Result<Vec<TraceEvent>, _>>()
-        .map_err(|e| format!("{}", e))?;
+        .map_err(|err| {
+            if std::env::var("CHPERF_DEBUG").is_ok() {
+                eprintln!("  [dbg] slice [{s}..{e}): {}", String::from_utf8_lossy(&bytes[s..e]));
+            }
+            format!("{}", err)
+        })?;
     Ok((events, replaced))
 }
 

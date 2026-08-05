@@ -131,12 +131,15 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
         let deltas = data.get("timeDeltas").and_then(|t| t.as_array());
         if let (Some(samples), Some(deltas)) = (samples, deltas) {
             let n = samples.len().min(deltas.len());
+            // Sample i lives at `prev_last + sum(deltas[0..=i])`: advance
+            // before recording so the first sample lands on `prev_last +
+            // delta[0]` (same walk as `profile_chunk_bases`).
             let mut sample_ts = prev_last
                 .get(&e.pid)
                 .copied()
                 .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
             for (i, s) in samples.iter().enumerate().take(n) {
-                let weight = deltas[i].as_f64().unwrap_or(0.0).max(0.0);
+                sample_ts += deltas[i].as_f64().unwrap_or(0.0);
                 let id = s.as_u64().unwrap_or(0);
                 if id != 0 {
                     if let Some(entry) = node_first.get_mut(&id) {
@@ -145,7 +148,6 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                         }
                     }
                 }
-                sample_ts += weight;
             }
             prev_last.insert(e.pid, sample_ts);
         }
@@ -603,6 +605,7 @@ fn fmt_ms(us: f64) -> String {
 
 // ── Delta: PRE / SHOOT / POST (--delta) ──
 
+#[derive(Clone)]
 struct WindowStats {
     frames_n: usize,
     frames: [f64; 4], // p50, p90, p99, max
@@ -617,87 +620,129 @@ struct WindowStats {
     top_cpu: Vec<(String, f64)>,
 }
 
-fn window_stats(
-    events: &[TraceEvent],
-    window: (f64, f64),
-    frame_event: &str,
-    lt_ms: f64,
-    main_tid: u64,
+fn window_stats_from_acc(
+    acc: &WindowAcc,
+    frames: &[f64],
+    cpu_us: f64,
+    top_cpu: Vec<(String, f64)>,
 ) -> WindowStats {
-    let lt_us = lt_ms * 1000.0;
-    let (lo, hi) = window;
-
-    let mut runtask_us = 0.0f64;
-    let mut js_us = 0.0f64;
-    let mut gc_us = 0.0f64;
-    let mut gc_count = 0usize;
-    let mut lt_count = 0usize;
-    let mut lt_us_total = 0.0f64;
-    let mut dropped = 0usize;
-
-    for e in events {
-        if e.ts < lo || e.ts > hi {
-            continue;
-        }
-        if e.ph == "X" && e.tid == main_tid {
-            match e.name.as_str() {
-                "RunTask" => {
-                    if let Some(d) = e.dur {
-                        runtask_us += d;
-                        if d >= lt_us {
-                            lt_count += 1;
-                            lt_us_total += d;
-                        }
-                    }
-                }
-                "FunctionCall" => js_us += e.dur.unwrap_or(0.0),
-                _ => {}
-            }
-        }
-        match e.name.as_str() {
-            "MajorGC" | "MinorGC" if e.ph == "X" => {
-                gc_us += e.dur.unwrap_or(0.0);
-                gc_count += 1;
-            }
-            "DroppedFrame" => dropped += 1,
-            _ => {}
-        }
-    }
-
-    let mut frames = paired_durations(events, frame_event, Some(window));
-    frames.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let frames_n = frames.len();
-    let (p50, p90, p99, max) = percentiles(&frames);
-
-    let scope = Scope {
-        window: Some(window),
-        tid: None,
-        pid: None,
-        cat: None,
-    };
-    let (node_map, self_times) = crate::analysis::scan_profile_chunks(events, Some(&scope), 0);
-    let cpu_us: f64 = self_times.values().sum();
-    let mut top_cpu: Vec<(String, f64)> = self_times
-        .iter()
-        .filter_map(|(id, t)| node_map.get(id).map(|(n, _, _)| (n.clone(), *t)))
-        .filter(|(n, _)| !n.is_empty())
-        .collect();
-    top_cpu.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    top_cpu.truncate(3);
-
+    let mut sorted = frames.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let (p50, p90, p99, max) = percentiles(&sorted);
     WindowStats {
-        frames_n,
+        frames_n: sorted.len(),
         frames: [p50, p90, p99, max],
-        dropped,
-        runtask_us,
-        js_us,
-        gc_us,
-        gc_count,
-        lt_count,
-        lt_us: lt_us_total,
+        dropped: acc.dropped,
+        runtask_us: acc.runtask,
+        js_us: acc.js,
+        gc_us: acc.gc,
+        gc_count: acc.gc_count,
+        lt_count: acc.lt_count,
+        lt_us: acc.lt_us,
         cpu_us,
         top_cpu,
     }
+}
+
+struct WindowAcc {
+    dropped: usize,
+    runtask: f64,
+    js: f64,
+    gc: f64,
+    gc_count: usize,
+    lt_count: usize,
+    lt_us: f64,
+}
+
+/// Compute PRE/SHOOT/POST stats in one sweep: a single event pass for the
+/// counter metrics and a single multi-window CPU profile scan (the three
+/// windows share one chunk-bases walk and one parallel scan).
+#[allow(clippy::too_many_arguments)]
+fn delta_windows_stats(
+    events: &[TraceEvent],
+    pre: (f64, f64),
+    shoot: (f64, f64),
+    post: (f64, f64),
+    frame_event: &str,
+    lt_ms: f64,
+    main_tid: u64,
+) -> (WindowStats, WindowStats, WindowStats) {
+    let lt_us = lt_ms * 1000.0;
+    let wins = [pre, shoot, post];
+    let mut accs = [
+        WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
+        WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
+        WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
+    ];
+
+    for e in events {
+        let ts = e.ts;
+        for (wi, (lo, hi)) in wins.iter().enumerate() {
+            if ts < *lo || ts > *hi {
+                continue;
+            }
+            if e.ph == "X" && e.tid == main_tid {
+                match e.name.as_str() {
+                    "RunTask" => {
+                        if let Some(d) = e.dur {
+                            accs[wi].runtask += d;
+                            if d >= lt_us {
+                                accs[wi].lt_count += 1;
+                                accs[wi].lt_us += d;
+                            }
+                        }
+                    }
+                    "FunctionCall" => accs[wi].js += e.dur.unwrap_or(0.0),
+                    _ => {}
+                }
+            }
+            match e.name.as_str() {
+                "MajorGC" | "MinorGC" if e.ph == "X" => {
+                    accs[wi].gc += e.dur.unwrap_or(0.0);
+                    accs[wi].gc_count += 1;
+                }
+                "DroppedFrame" => accs[wi].dropped += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let frame_wins = [
+        paired_durations(events, frame_event, Some(pre)),
+        paired_durations(events, frame_event, Some(shoot)),
+        paired_durations(events, frame_event, Some(post)),
+    ];
+
+    let windows: [Option<(f64, f64)>; 3] = [Some(pre), Some(shoot), Some(post)];
+    let (node_map, times) =
+        crate::analysis::scan_profile_chunks_windows(events, None, &windows, 0);
+
+    let mut out: [WindowStats; 3] = std::array::from_fn(|_| WindowStats {
+        frames_n: 0,
+        frames: [0.0; 4],
+        dropped: 0,
+        runtask_us: 0.0,
+        js_us: 0.0,
+        gc_us: 0.0,
+        gc_count: 0,
+        lt_count: 0,
+        lt_us: 0.0,
+        cpu_us: 0.0,
+        top_cpu: Vec::new(),
+    });
+    for wi in 0..3 {
+        let times_map = &times[wi];
+        let cpu_us: f64 = times_map.values().sum();
+        let mut top_cpu: Vec<(String, f64)> = times_map
+            .iter()
+            .filter_map(|(id, t)| node_map.get(id).map(|(n, _, _)| (n.clone(), *t)))
+            .filter(|(n, _)| !n.is_empty())
+            .collect();
+        top_cpu.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        top_cpu.truncate(3);
+        out[wi] = window_stats_from_acc(&accs[wi], &frame_wins[wi], cpu_us, top_cpu);
+    }
+    (out[0].clone(), out[1].clone(), out[2].clone())
 }
 
 /// Compare PRE / SHOOT / POST windows around an anchor: frame stats, dropped
@@ -715,9 +760,8 @@ pub fn delta_section(
     min_ts: f64,
 ) -> (String, Value) {
     let main_tid = crate::trace::detect_main_thread(events);
-    let s_pre = window_stats(events, pre, frame_event, lt_ms, main_tid);
-    let s_shoot = window_stats(events, shoot, frame_event, lt_ms, main_tid);
-    let s_post = window_stats(events, post, frame_event, lt_ms, main_tid);
+    let (s_pre, s_shoot, s_post) =
+        delta_windows_stats(events, pre, shoot, post, frame_event, lt_ms, main_tid);
 
     let ms = |v: f64| format!("{:.1}", v / 1000.0);
     let dms = |a: f64, b: f64| format!("{:+.1}", (b - a) / 1000.0);
@@ -960,4 +1004,177 @@ pub fn rows_to_csv(rows: &[Value]) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::TraceEvent;
+
+    fn ev(name: &str, ph: &str, ts: f64, dur: Option<f64>, args: Option<serde_json::Value>) -> TraceEvent {
+        TraceEvent {
+            name: name.into(),
+            ph: ph.into(),
+            ts,
+            dur,
+            tid: 1,
+            pid: 2,
+            cat: None,
+            args,
+        }
+    }
+
+    fn chunk(ts: f64, nodes: &[(u64, &str, &str, Option<u64>)], samples: &[u64], deltas: &[f64]) -> TraceEvent {
+        let nodes_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(id, name, url, parent)| {
+                serde_json::json!({"id": id, "callFrame": {"functionName": name, "url": url}, "parent": parent})
+            })
+            .collect();
+        ev(
+            "ProfileChunk",
+            "P",
+            ts,
+            None,
+            Some(serde_json::json!({
+                "data": {"cpuProfile": {"nodes": nodes_json, "samples": samples}, "timeDeltas": deltas}
+            })),
+        )
+    }
+
+    fn fc(ts: f64, fn_name: &str) -> TraceEvent {
+        ev("FunctionCall", "X", ts, Some(1000.0), Some(serde_json::json!({"data": {"functionName": fn_name}})))
+    }
+
+    /// Anchor priority: FunctionCall functionName beats cpu-profile beats args.
+    #[test]
+    fn anchor_prefers_functioncall_then_cpu_then_args() {
+        let events = vec![
+            ev("Profile", "P", 1_000_000.0, None, None),
+            // args match only, earliest of all
+            ev("WebSocketSend", "X", 1_000_100.0, Some(10.0), Some(serde_json::json!({"data": {"msg": "player_shoot"}}))),
+            // cpu-profile node "shoot" first sampled at 1_001_000
+            chunk(
+                1_002_000.0,
+                &[(1, "(root)", "", None), (9, "shoot", "http://x/weapon.ts", Some(1))],
+                &[9, 9],
+                &[1000.0, 1000.0],
+            ),
+            // FunctionCall shoot — latest, but pass 1 wins by priority
+            fc(2_000_000.0, "shoot"),
+        ];
+        let m = Matcher::new("shoot", false).unwrap();
+        let a = find_anchor(&events, &m).expect("anchor");
+        assert_eq!(a.kind, "FunctionCall");
+        assert_eq!(a.ts, 2_000_000.0);
+
+        // No FunctionCall match → cpu-profile by earliest sample time.
+        let m2 = Matcher::new("weapon.ts", false).unwrap();
+        let a2 = find_anchor(&events, &m2).expect("anchor");
+        assert_eq!(a2.kind, "cpu-profile");
+        assert_eq!(a2.ts, 1_001_000.0);
+
+        // Function names preferred over URL-only matches (shooterX trap).
+        let events2 = vec![
+            ev("Profile", "P", 1_000_000.0, None, None),
+            chunk(
+                1_002_000.0,
+                &[(1, "(root)", "", None), (7, "setup", "http://x/games/shooterX/game.ts", Some(1)), (8, "handleShoot", "http://x/weapon.ts", Some(1))],
+                &[7, 7, 8],
+                &[1000.0, 1000.0, 1000.0],
+            ),
+        ];
+        let a3 = find_anchor(&events2, &m).expect("anchor");
+        assert_eq!(a3.label, "handleShoot");
+        assert_eq!(a3.ts, 1_003_000.0);
+
+        // Only args match → args anchor.
+        let m4 = Matcher::new("player_shoot", false).unwrap();
+        let a4 = find_anchor(&events, &m4).expect("anchor");
+        assert_eq!(a4.kind, "args");
+        assert_eq!(a4.ts, 1_000_100.0);
+    }
+
+    /// Frame b/e pairing golden: durations 16ms and 20ms, 2 dropped frames.
+    #[test]
+    fn frames_section_golden() {
+        let events = vec![
+            ev("SubmitCompositorFrameToPresentationCompositorFrame", "b", 1_000_000.0, None, None),
+            ev("SubmitCompositorFrameToPresentationCompositorFrame", "e", 1_016_000.0, None, None),
+            ev("SubmitCompositorFrameToPresentationCompositorFrame", "b", 1_017_000.0, None, None),
+            ev("SubmitCompositorFrameToPresentationCompositorFrame", "e", 1_037_000.0, None, None),
+            ev("DroppedFrame", "I", 1_003_000.0, None, None),
+            ev("DroppedFrame", "I", 1_004_000.0, None, None),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let (md, json) = frames_section(&events, &scope, "SubmitCompositorFrameToPresentationCompositorFrame", 1_000_000.0);
+        assert!(md.contains("2 paired"), "md: {}", md);
+        assert!(md.contains("Dropped frames**: 2"), "md: {}", md);
+        let row = json.as_array().unwrap()[0].clone();
+        assert_eq!(row["count"], 2);
+        assert_eq!(row["p50_us"], 20_000.0); // nearest-rank index round(0.5 * 1) = 1
+        assert_eq!(row["max_us"], 20_000.0);
+        assert_eq!(row["dropped_frames"], 2);
+    }
+
+    /// GC golden: 1 Major (5ms), 1 Minor (1ms), 1 long task ≥50ms (600ms).
+    #[test]
+    fn gc_section_golden() {
+        let events = vec![
+            ev("MajorGC", "X", 1_002_000.0, Some(5000.0), None),
+            ev("MinorGC", "X", 1_010_000.0, Some(1000.0), None),
+            ev("RunTask", "X", 1_000_000.0, Some(600_000.0), None),
+            ev("RunTask", "X", 1_050_000.0, Some(20_000.0), None),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let (md, json) = gc_section(&events, &scope, 50.0, 1_000_000.0);
+        assert!(md.contains("| MajorGC | 1 | 5.00 | 5.00 |"));
+        assert!(md.contains("Long tasks ≥50ms**: 1 total, 600.0ms combined"));
+        let row = json.as_array().unwrap()[0].clone();
+        assert_eq!(row["gc"][0]["count"], 1);
+        assert_eq!(row["gc"][0]["total_us"], 5000.0);
+        assert_eq!(row["long_tasks"]["count"], 1);
+        assert_eq!(row["long_tasks"]["total_us"], 600_000.0);
+    }
+
+    /// Delta compares three windows in one sweep (golden totals from the
+    /// fixture semantics: chunk1 samples 1_005_000..1_035_000).
+    #[test]
+    fn delta_section_golden() {
+        let events = vec![
+            ev("Profile", "P", 1_000_000.0, None, None),
+            chunk(
+                1_055_000.0,
+                &[(1, "(root)", "", None), (2, "shoot", "", Some(1)), (3, "update", "", Some(1))],
+                &[2, 3, 2, 3, 2, 3, 2],
+                &[5000.0; 7],
+            ),
+        ];
+        // SHOOT = [1_000_000, 1_030_000]; PRE/POST empty.
+        let (md, json) = delta_section(
+            &events,
+            (300_000.0, 900_000.0),
+            (1_000_000.0, 1_030_000.0),
+            (2_000_000.0, 2_500_000.0),
+            1_010_000.0,
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            50.0,
+            1_000_000.0,
+        );
+        assert!(md.contains("Delta: PRE → SHOOT → POST"));
+        let obj = json.as_object().unwrap();
+        let metrics = obj["metrics"].as_array().unwrap();
+        let cpu = metrics.iter().find(|m| m["metric"] == "CPU samples").unwrap();
+        assert_eq!(cpu["pre"], 0.0);
+        assert_eq!(cpu["shoot"], 30.0); // ms in the delta table
+        assert_eq!(cpu["delta_pre"], 30.0); // 30ms
+    }
+
+    /// CSV escaping: commas, quotes and newlines inside fields.
+    #[test]
+    fn csv_escapes_fields() {
+        let rows = serde_json::from_str::<Vec<Value>>(r#"[{"a": "x,y", "b": 1}, {"a": "say \"hi\"", "b": 2}]"#).unwrap();
+        let csv = rows_to_csv(&rows);
+        assert_eq!(csv, "a,b\n\"x,y\",1\n\"say \"\"hi\"\"\",2\n");
+    }
 }

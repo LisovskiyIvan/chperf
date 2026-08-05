@@ -1,0 +1,34 @@
+{
+  "traceEvents": [
+    {"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 0, "args": {"name": "CrRendererMain"}},
+    {"name": "process_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 0, "args": {"name": "Renderer"}},
+    {"name": "Profile", "ph": "P", "ts": 1000000, "pid": 2, "tid": 65},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1000000, "dur": 600000, "pid": 2, "tid": 1, "args": {"data": {"functionName": "big"}}},
+    {"name": "FunctionCall", "cat": "devtools.timeline", "ph": "X", "ts": 1005000, "dur": 40000, "pid": 2, "tid": 1, "args": {"data": {"functionName": "shoot"}}},
+    {"name": "MajorGC", "cat": "devtools.timeline", "ph": "X", "ts": 1002000, "dur": 5000, "pid": 2, "tid": 1},
+    {"name": "MinorGC", "cat": "devtools.timeline", "ph": "X", "ts": 1010000, "dur": 1000, "pid": 2, "tid": 1},
+    {"name": "DroppedFrame", "ph": "I", "ts": 1003000, "pid": 2, "tid": 7},
+    {"name": "DroppedFrame", "ph": "I", "ts": 1004000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1000000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1016000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "b", "ts": 1017000, "pid": 2, "tid": 7},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "ph": "e", "ts": 1037000, "pid": 2, "tid": 7},
+    {"name": "WebSocketSend", "cat": "devtools.timeline", "ph": "X", "ts": 1006000, "dur": 500, "pid": 2, "tid": 1, "args": {"data": {"msg": "player_shoot"}}},
+    {"name": "ProfileChunk", "ph": "P", "ts": 1055000, "pid": 2, "tid": 65, "args": {"data": {"cpuProfile": {
+      "nodes": [
+        {"id": 1, "callFrame": {"functionName": "(root)", "url": ""}, "parent": null},
+        {"id": 2, "callFrame": {"functionName": "shoot", "url": "http://x/src/weapon.ts"}, "parent": 1},
+        {"id": 3, "callFrame": {"functionName": "update", "url": "http://x/src/game.ts"}, "parent": 1}
+      ],
+      "samples": [2, 3, 2, 3, 2, 3, 2]
+    }, "timeDeltas": [5000, 5000, 5000, 5000, 5000, 5000, 5000]}}},
+    {"name": "ProfileChunk", "ph": "P", "ts": 1095000, "pid": 2, "tid": 65, "args": {"data": {"cpuProfile": {
+      "nodes": [
+        {"id": 1, "callFrame": {"functionName": "(root)", "url": ""}, "parent": null},
+        {"id": 4, "callFrame": {"functionName": "shoot", "url": "http://x/src/weapon.ts"}, "parent": 1}
+      ],
+      "samples": [4, 4, 4, 4]
+    }, "timeDeltas": [4000, 3000, -1000, 4000]}}},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1050000, "dur": 20000, "pid": 2, "tid": 1}
+  ]
+}

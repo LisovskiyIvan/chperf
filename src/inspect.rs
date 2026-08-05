@@ -1134,3 +1134,35 @@ pub fn jank_section(
     out.push('\n');
     (out, Value::Array(json_rows))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::TraceEvent;
+
+    fn ev(ts: f64, name: &str, cat: Option<&str>) -> TraceEvent {
+        TraceEvent {
+            name: name.into(),
+            ph: "X".into(),
+            ts,
+            dur: None,
+            tid: 1,
+            pid: 1,
+            cat: cat.map(|s| s.to_string()),
+            args: None,
+        }
+    }
+
+    #[test]
+    fn trace_start_skips_metadata_events() {
+        // Regression: thread_name etc. carry process-start ts (here 0) and
+        // used to anchor every window into dead time.
+        let events = vec![
+            ev(0.0, "thread_name", Some("__metadata")),
+            ev(0.0, "process_name", Some("__metadata")),
+            ev(3_100_000_000.0, "RunTask", Some("devtools.timeline")),
+            ev(3_100_100_000.0, "Paint", None),
+        ];
+        assert_eq!(trace_start_us(&events), 3_100_000_000.0);
+    }
+}
