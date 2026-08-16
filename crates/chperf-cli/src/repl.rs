@@ -3,7 +3,7 @@
 //! keeps the parsed events and the fully analyzed `App`, so every query is a
 //! single pass over memory instead of a re-parse of the file.
 
-use crate::{Cli, Analyzed, app::App, build_app, inspect_output, load_and_analyze};
+use crate::{Analyzed, app::App, build_app, cli::Cli, inspect::inspect_output, load_and_analyze};
 use chperf_core::trace;
 use clap::Parser;
 use std::io::{self, Write};
