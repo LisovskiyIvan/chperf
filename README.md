@@ -1,17 +1,15 @@
 # chperf
 
-Chrome DevTools Performance trace analyzer with TUI. Parses `{ "traceEvents": [...] }` JSON and surfaces actionable performance insights.
+Chrome DevTools Performance trace analyzer, command-line only. Parses `{ "traceEvents": [...] }` JSON and surfaces actionable performance insights.
 
 Accepts plain `.json` and gzipped `.json.gz` traces — a single file, or a directory (list / batch export).
 
 Chrome DevTools trace JSON files are massive and impractical to read by hand. chperf structures and summarizes the trace, then exports it as Markdown. Feed the exported result directly to an LLM like Claude Code for instant bottleneck identification and improvement suggestions.
 
-![TUI Screenshot](capture.png)
-
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --path crates/chperf-cli
 ```
 
 Requires Rust 2024 edition (1.85+).
@@ -19,7 +17,7 @@ Requires Rust 2024 edition (1.85+).
 ## Usage
 
 ```sh
-# Single trace analysis (TUI)
+# Single trace analysis (prints a Markdown report to stdout)
 chperf trace.json
 
 # Gzipped traces are supported transparently (.json.gz)
@@ -205,17 +203,6 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 
 ## Features
 
-### Tabs
-
-| Tab | What it shows |
-|-----|---------------|
-| **Summary** | Trace metadata, main thread busy %, long tasks (>50ms) with histogram, event breakdown table, forced reflow detection, style recalc element counts |
-| **Scroll Frames** | Scroll tasks (RunTask containing ULT>50ms or FunctionCall>50ms), avg/P50/P90/P99 duration, bottleneck analysis, per-task breakdown bars (JS/Style/Layout/Paint/Composite/HitTest/Other) |
-| **CPU Profile** | Top functions by self-time from ProfileChunk events, source classification (App/Runtime/Native), stacked distribution bar |
-| **Layout Dirty** | Layout events with dirty/total object counts, avg dirty ratio |
-| **Jank** | Jank clusters: windows with dropped frames or ≥16.7ms spikes (RunTask/FireAnimationFrame/GPUTask) that stay below the 50ms Long Task threshold and disappear in a long trace's average — with the dominating function chain ("what happened") |
-| **Compare** | Side-by-side scroll breakdown bars, key findings (auto-detected regressions/improvements), quick stats diff, style element count comparison, event average diff, CPU profile diff by percentage-point impact |
-
 ### Auto-detected Trace Metadata
 
 Extracts from Chrome trace JSON:
@@ -273,19 +260,6 @@ Ready to paste directly into a PR description:
 > | Style (ULT) | 330.70ms | 174.68ms | -47% :white_check_mark: |
 > | Paint | 26.61ms | 88.78ms | +234% :red_circle: |
 > | HitTest | 72.28ms | 28.49ms | -61% :white_check_mark: |
-
-## TUI Keybindings
-
-| Key | Action |
-|-----|--------|
-| `Tab` / `Shift+Tab` | Next / previous tab |
-| `1`-`5` | Jump to tab directly |
-| `j` / `k` / `Up` / `Down` | Scroll |
-| `Ctrl+d` / `Ctrl+u` | Page down / up |
-| `g` / `G` | Top / bottom |
-| `t` | Toggle CPU throttle display (trace time vs real time) |
-| `e` | Export current analysis to `chperf-export-<name>.md` |
-| `q` / `Esc` / `Ctrl+c` | Quit |
 
 ## Analyzed Events
 

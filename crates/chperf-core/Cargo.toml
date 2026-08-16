@@ -1,0 +1,14 @@
+[package]
+name = "chperf-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+memchr = "2"
+regex = "1"
+# Faster hashing for the u64/string-keyed aggregation maps (SipHash in std
+# is DoS-resistant but ~2-4x slower on the hot scan/aggregation paths).
+rustc-hash = "2"

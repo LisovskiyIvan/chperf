@@ -1,21 +1,10 @@
-[package]
-name = "chperf"
+[workspace]
+resolver = "2"
+members = ["crates/chperf-core", "crates/chperf-cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
-clap = { version = "4", features = ["derive"] }
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-memchr = "2"
-regex = "1"
-# Faster hashing for the u64/string-keyed aggregation maps (SipHash in std
-# is DoS-resistant but ~2-4x slower on the hot scan/aggregation paths).
-rustc-hash = "2"
-
 
 [profile.release]
 lto = "thin"

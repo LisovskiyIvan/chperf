@@ -1,4 +1,4 @@
-use crate::analysis::*;
+use chperf_core::analysis::*;
 use crate::app::App;
 
 fn fmt_us(us: f64) -> String {

@@ -1,25 +1,16 @@
-mod analysis;
 mod app;
 mod export;
-mod inspect;
 mod repl;
-mod trace;
-mod ui;
-mod windowed;
 
-use std::io;
+use chperf_core::{analysis, inspect, trace, windowed};
+
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::prelude::*;
 use serde_json::Value;
 
 #[derive(Parser)]
-#[command(name = "chperf", about = "Chrome DevTools Trace JSON analyzer (TUI)")]
+#[command(name = "chperf", about = "Chrome DevTools Trace JSON analyzer (CLI)")]
 pub(crate) struct Cli {
     /// Path to trace JSON file (.json or .json.gz) or a directory of traces
     pub(crate) trace: Option<String>,
@@ -1005,7 +996,6 @@ fn run_single(
     });
     if throttle > 1.0 {
         app.throttle_factor = throttle;
-        app.throttle_factor_saved = throttle;
         eprintln!(
             "  CPU throttle: {:.0}x ({})",
             throttle,
@@ -1017,23 +1007,20 @@ fn run_single(
         );
     }
 
-    // Export mode: skip TUI, output Markdown
-    if let Some(ref export_target) = cli.export {
-        let md = if cli.summary {
-            export::export_summary_only(&app)
-        } else {
-            export::export_markdown(&app)
-        };
-        if export_target == "-" {
-            print!("{}", md);
-        } else {
-            std::fs::write(export_target, &md)?;
-            eprintln!("Exported to {}", export_target);
+    // CLI-only: render the report to stdout (or a file via --export=FILE).
+    let md = if cli.summary {
+        export::export_summary_only(&app)
+    } else {
+        export::export_markdown(&app)
+    };
+    match cli.export.as_deref() {
+        Some("-") | None => print!("{}", md),
+        Some(target) => {
+            std::fs::write(target, &md)?;
+            eprintln!("Exported to {}", target);
         }
-        return Ok(());
     }
-
-    run_tui(app)
+    Ok(())
 }
 
 /// Batch-export every trace in a directory as Markdown files.
@@ -1078,7 +1065,6 @@ fn export_one(
     });
     if throttle > 1.0 {
         app.throttle_factor = throttle;
-        app.throttle_factor_saved = throttle;
     }
 
     let md = if summary_only {
@@ -1093,102 +1079,6 @@ fn export_one(
         .join(format!("chperf-export-{}.md", stem));
     std::fs::write(&out_path, &md)?;
     eprintln!("  -> {}", out_path.display());
-    Ok(())
-}
-
-// ── TUI ──
-
-fn run_tui(mut app: app::App) -> Result<(), Box<dyn std::error::Error>> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Event loop
-    loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
-
-        if let Event::Key(key) = event::read()? {
-            // Dismiss status message on any keypress
-            if app.status_message.is_some() {
-                app.status_message = None;
-                continue;
-            }
-
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    app.should_quit = true;
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.should_quit = true;
-                }
-                KeyCode::Char('e') => {
-                    // Export to file from TUI
-                    let filename = format!("chperf-export-{}.md", app.trace_name_a);
-                    let md = export::export_markdown(&app);
-                    if let Err(e) = std::fs::write(&filename, &md) {
-                        app.set_message(format!("Export failed: {}", e));
-                    } else {
-                        app.set_message(format!("Exported to {}", filename));
-                    }
-                }
-                KeyCode::Tab => app.next_tab(),
-                KeyCode::BackTab => app.prev_tab(),
-                KeyCode::Char('t') => app.toggle_throttle(),
-                KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
-                KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.scroll_down(20)
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.scroll_up(20)
-                }
-                KeyCode::Char('g') => app.scroll_offset = 0,
-                KeyCode::Char('G') => {
-                    let max = app.row_count().saturating_sub(1);
-                    app.scroll_offset = max;
-                }
-                KeyCode::Char('1')
-                    if !app.tabs.is_empty() => {
-                        app.tab = app.tabs[0];
-                        app.scroll_offset = 0;
-                    }
-                KeyCode::Char('2')
-                    if app.tabs.len() > 1 => {
-                        app.tab = app.tabs[1];
-                        app.scroll_offset = 0;
-                    }
-                KeyCode::Char('3')
-                    if app.tabs.len() > 2 => {
-                        app.tab = app.tabs[2];
-                        app.scroll_offset = 0;
-                    }
-                KeyCode::Char('4')
-                    if app.tabs.len() > 3 => {
-                        app.tab = app.tabs[3];
-                        app.scroll_offset = 0;
-                    }
-                KeyCode::Char('5')
-                    if app.tabs.len() > 4 => {
-                        app.tab = app.tabs[4];
-                        app.scroll_offset = 0;
-                    }
-                _ => {}
-            }
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
     Ok(())
 }
 
@@ -1220,7 +1110,7 @@ mod tests {
         assert_eq!(inspect::trace_start_us(&events), 1_000_000.0);
 
         // CPU: per-sample delta weights (5ms × 7 + 4+3+0+4 ms), nodes first-wins.
-        let cpu = analysis::analyze_cpu_profile(&events);
+        let cpu = analysis::analyze_cpu_profile_full(&events).0;
         assert_eq!(cpu.total_sample_time_us, 46_000.0);
         // Two distinct node ids share the name "shoot" (chunk1 node 2 and
         // chunk2 node 4): 4×5ms + 11ms.
@@ -1334,7 +1224,7 @@ mod tests {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (state >> 33) as u64
+            state >> 33
         };
         let names = ["RunTask", "FunctionCall", "ProfileChunk", "thread_name", "MajorGC", "MinorGC", "DroppedFrame", "SubmitCompositorFrameToPresentationCompositorFrame", "Paint", "Profile", "Layout", "UpdateLayoutTree"];
         let phases = ["X", "b", "e", "P", "M", "I", "B", "E", "N", ""];
@@ -1449,7 +1339,7 @@ mod tests {
             }
 
             // Analysis passes must not panic on garbage.
-            let _ = analysis::analyze_cpu_profile(&events);
+            let _ = analysis::analyze_cpu_profile_full(&events).0;
             let _ = analysis::analyze_summary(&events, 1);
             let _ = analysis::analyze_jank(&events, 1, None);
             let _ = analysis::analyze_jank(&events, 1, Some(&scope_half));

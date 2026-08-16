@@ -3,7 +3,8 @@
 //! keeps the parsed events and the fully analyzed `App`, so every query is a
 //! single pass over memory instead of a re-parse of the file.
 
-use crate::{Cli, Analyzed, app::App, build_app, inspect_output, load_and_analyze, trace};
+use crate::{Cli, Analyzed, app::App, build_app, inspect_output, load_and_analyze};
+use chperf_core::trace;
 use clap::Parser;
 use std::io::{self, Write};
 use std::path::Path;
@@ -70,7 +71,6 @@ pub fn run_repl(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     });
     if throttle > 1.0 {
         app.throttle_factor = throttle;
-        app.throttle_factor_saved = throttle;
     }
 
     let n = analyzed.trace.trace_events.len();
@@ -259,7 +259,6 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
     // Tune the session.
     if let Some(t) = cmd.throttle {
         session.app.throttle_factor = t;
-        session.app.throttle_factor_saved = t;
         println!("throttle = {}x", t);
         return Ok(Cmd::Done);
     }
