@@ -27,12 +27,16 @@ pub(crate) struct Analyzed {
     pub(crate) style_recalc: analysis::StyleRecalcResult,
     pub(crate) forced_reflows: analysis::ForcedReflowResult,
     pub(crate) jank: analysis::JankResult,
+    /// Metadata-free trace start (µs), cached so REPL queries don't re-scan
+    /// every event to find the time base.
+    pub(crate) min_ts: f64,
 }
 
 pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
     let trace = trace::parse_trace(path)?;
     let main_tid = trace::detect_main_thread(&trace.trace_events);
+    let min_ts = chperf_core::inspect::trace_start_us(&trace.trace_events);
     let events = &trace.trace_events;
     eprintln!(
         "  {} events, main thread tid={}",
@@ -84,6 +88,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
         jank,
         trace,
         main_tid,
+        min_ts,
     })
 }
 
@@ -183,8 +188,9 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     let trace = trace::parse_trace(path)?;
     eprintln!("  {} events", trace.trace_events.len());
     let name_a = trace::trace_stem(path);
+    let min_ts = chperf_core::inspect::trace_start_us(&trace.trace_events);
     let Some(path_b) = cli.compare.as_deref().map(Path::new) else {
-        return inspect::inspect_output(&trace.trace_events, &name_a, cli, None);
+        return inspect::inspect_output(&trace.trace_events, min_ts, &name_a, cli, None);
     };
     eprintln!("Loading {}...", path_b.display());
     let trace_b = trace::parse_trace(path_b)?;

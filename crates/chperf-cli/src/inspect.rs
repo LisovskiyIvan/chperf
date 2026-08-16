@@ -211,11 +211,11 @@ pub(crate) fn compare_json(compare: &Option<(windowed::DeltaData, windowed::Delt
 /// `--compare`) the windowed two-trace comparison.
 pub(crate) fn inspect_output(
     events: &[trace::TraceEvent],
+    min_ts: f64,
     trace_name: &str,
     cli: &Cli,
     cpu_cache: Option<&analysis::CpuProfileCache>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let min_ts = inspect::trace_start_us(events);
     let ws = resolve_windows(events, min_ts, cli)?;
 
     // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown/json).

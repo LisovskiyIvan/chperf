@@ -209,6 +209,7 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
     if cmd.is_inspect() {
         inspect_output(
             &session.analyzed.trace.trace_events,
+            session.analyzed.min_ts,
             &session.name_a,
             &cmd,
             Some(&session.analyzed.cpu_cache),
