@@ -1026,6 +1026,8 @@ mod tests {
     fn ev(name: &str, ph: &str, ts: f64, dur: Option<f64>, args: Option<serde_json::Value>) -> TraceEvent {
         TraceEvent {
             name: crate::trace::intern_name(name),
+            id: 0,
+            has_id: false,
             ph: ph.as_bytes().first().copied().unwrap_or(0),
             ts,
             dur,

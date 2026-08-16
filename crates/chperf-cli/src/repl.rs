@@ -25,6 +25,7 @@ const BARE: &[(&str, &str)] = &[
     ("flame", "--flame"),
     ("compare", "--compare"),
     ("export", "--export"),
+    ("html", "--html"),
     ("summary", "--summary"),
     ("json", "--json"),
     ("throttle", "--throttle"),
@@ -40,6 +41,9 @@ const BARE: &[(&str, &str)] = &[
     ("regex", "--regex"),
     ("full-args", "--full-args"),
     ("jank", "--jank"),
+    ("memory", "--memory"),
+    ("input", "--input"),
+    ("async", "--async"),
 ];
 
 struct Session {
@@ -252,6 +256,23 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         }
         return Ok(Cmd::Done);
     }
+    // Self-contained HTML report (trace A only; the compared trace's raw
+    // events are dropped after `compare` rebuilds the app).
+    if let Some(target) = &cmd.html {
+        let doc = crate::html::export_html(
+            &session.app,
+            &session.analyzed.trace.trace_events,
+            session.analyzed.min_ts,
+            None,
+        );
+        if target == "-" {
+            print!("{}", doc);
+        } else {
+            std::fs::write(target, &doc)?;
+            println!("exported HTML to {}", target);
+        }
+        return Ok(Cmd::Done);
+    }
     if cmd.summary {
         print!("{}", crate::export::export_summary_only(&session.app));
         return Ok(Cmd::Done);
@@ -300,7 +321,8 @@ fn print_help() {
     println!("  worst [--task] [--stacks] [--top N] | task [--top N] | stacks [--function P] [--top N] | flame [--function P]");
     println!("  anchor <pat> [--delta] [--pre MS] [--post MS] [--window MS] | delta | calltree [--url P] [--function P]");
     println!("  gc [--lt MS] | frames [--frame-event NAME] | csv (add --csv to any query)");
-    println!("  compare <file2> | export [file] | summary | throttle N | status | clear | help | quit");
+    println!("  memory [--around MS] [--window MS] | input [--top N] | async [--top N]");
+    println!("  compare <file2> | export [file] | html [file] | summary | throttle N | status | clear | help | quit");
     println!("  every query also accepts [--json] for jq/pipelines");
     println!();
 }

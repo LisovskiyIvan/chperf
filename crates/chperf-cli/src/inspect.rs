@@ -365,6 +365,19 @@ fn build_sections(
         sections.push(("jank", m, j));
     }
 
+    if cli.memory {
+        let (m, j) = inspect::memory_section(events, scope, cli.top, min_ts);
+        sections.push(("memory", m, j));
+    }
+    if cli.input {
+        let (m, j) = inspect::input_section(events, scope, cli.top, min_ts);
+        sections.push(("input", m, j));
+    }
+    if cli.async_ {
+        let (m, j) = inspect::async_section(events, scope, cli.top, min_ts);
+        sections.push(("async", m, j));
+    }
+
     if cli.timeline {
         let (m, j) = inspect::timeline_section(events, scope, cli.bucket, min_ts);
         sections.push(("timeline", m, j));

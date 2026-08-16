@@ -117,6 +117,18 @@ fn smoke_compare_windowed() {
 }
 
 #[test]
+fn smoke_memory_input_async_html() {
+    contains(&[FIXTURE, "--memory"], "## Memory timeline");
+    contains(&[FIXTURE, "--input"], "## Input latency");
+    contains(&[FIXTURE, "--async"], "## Async tasks");
+    // Self-contained HTML: no markdown, valid DOCTYPE, includes the sections.
+    let o = ok(&[FIXTURE, "--html"]);
+    assert!(o.stdout.starts_with("<!DOCTYPE html>"), "bad html head");
+    assert!(o.stdout.contains("CPU profile"), "html missing CPU section");
+    assert!(!o.stdout.contains("## "), "html leaked markdown headers");
+}
+
+#[test]
 fn smoke_regex_and_errors() {
     contains(&[FIXTURE, "--regex", "--events", "Run.*Task"], "## Events");
     exits_nonzero(&[FIXTURE, "--regex", "--function", "("]); // invalid regex

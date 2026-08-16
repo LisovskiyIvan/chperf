@@ -21,6 +21,11 @@ pub(crate) struct Cli {
     #[arg(short, long, num_args = 0..=1, default_missing_value = "-")]
     pub(crate) export: Option<String>,
 
+    /// Export a self-contained HTML report (single file, SVG charts)
+    /// Use --html to print to stdout, --html=FILE to write to file
+    #[arg(long, num_args = 0..=1, default_missing_value = "-")]
+    pub(crate) html: Option<String>,
+
     /// CPU throttle factor (e.g. --throttle 20 divides all times by 20)
     #[arg(short, long)]
     pub(crate) throttle: Option<f64>,
@@ -129,6 +134,20 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) jank: bool,
 
+    /// Inspect: memory timeline (UpdateCounters: JS heap, DOM nodes, documents,
+    /// event listeners) with peak / growth summary
+    #[arg(long)]
+    pub(crate) memory: bool,
+
+    /// Inspect: input latency by type (EventDispatch): percentiles + worst events
+    #[arg(long)]
+    pub(crate) input: bool,
+
+    /// Inspect: async task timings (s/f events paired by id): per-name
+    /// percentiles + longest tasks
+    #[arg(long = "async")]
+    pub(crate) async_: bool,
+
     /// Inspect: anchor windows on the first FunctionCall functionName /
     /// CPU profile function or URL / event-args match of this substring
     #[arg(long)]
@@ -188,6 +207,9 @@ impl Cli {
             || self.timeline
             || self.worst
             || self.jank
+            || self.memory
+            || self.input
+            || self.async_
             || self.anchor.is_some()
             || self.delta
             || self.calltree

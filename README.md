@@ -39,6 +39,10 @@ chperf trace.json --export
 # Export to file
 chperf trace.json --export=report.md
 
+# Self-contained HTML report (single file, SVG memory charts, A/B compare)
+chperf trace.json --html=report.html
+chperf before.json --compare after.json --html=report.html
+
 # Compare + export
 chperf before.json --compare after.json --export
 
@@ -134,6 +138,19 @@ chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].ar
 # Jank clusters: dropped frames / sub-threshold spikes hidden by the summary
 chperf trace.json --jank
 
+# Memory timeline: JS heap / DOM nodes / documents / listeners over time,
+# with peak and growth (leak check). JSON gives the full sample list.
+chperf trace.json --memory
+chperf trace.json --memory --around 5000 --window 2000 --top 100 --json | jq '.sections.memory.summary'
+
+# Input latency by event type (pointer/mouse/key): percentiles + worst events.
+chperf trace.json --input
+chperf trace.json --input --top 10
+
+# Async task timings (s/f events paired by id): RAF, GC jobs, timers, …
+chperf trace.json --async
+chperf trace.json --async --top 20 --json | jq '.sections.async.longest'
+
 # ── Windowed analysis around a semantic anchor (shoot/pre/post) ──
 # --anchor finds the first match in FunctionCall functionName → CPU profile
 # function/URL → event args; the SHOOT window = anchor ± --window (default
@@ -190,6 +207,9 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--json` | Emit JSON (for jq/pipelines) instead of Markdown |
 | `--csv` | Emit CSV (one block per section) instead of Markdown |
 | `--jank` | Jank clusters: dropped frames / spikes below the Long Task threshold |
+| `--memory` | Memory timeline (JS heap, DOM nodes, documents, listeners) with peak/growth |
+| `--input` | Input latency by type (`EventDispatch`): percentiles + worst events |
+| `--async` | Async task timings (`s`/`f` paired by id): per-name percentiles + longest tasks |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |
 | `--pid <n>` | Restrict to this process |

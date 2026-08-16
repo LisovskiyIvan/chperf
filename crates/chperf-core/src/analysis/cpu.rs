@@ -457,6 +457,8 @@ mod tests {
     fn profile_event(ts: f64) -> TraceEvent {
         TraceEvent {
             name: "Profile",
+            id: 0,
+            has_id: false,
             ph: b'P',
             ts,
             dur: None,
@@ -477,6 +479,8 @@ mod tests {
             .collect();
         TraceEvent {
             name: "ProfileChunk",
+            id: 0,
+            has_id: false,
             ph: b'P',
             ts,
             dur: None,
@@ -496,6 +500,8 @@ mod tests {
     fn plain_event(ts: f64, name: &str) -> TraceEvent {
         TraceEvent {
             name: crate::trace::intern_name(name),
+            id: 0,
+            has_id: false,
             ph: b'X',
             ts,
             dur: Some(100.0),

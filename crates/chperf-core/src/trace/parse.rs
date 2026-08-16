@@ -39,6 +39,8 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
     }
     let mut ev = TraceEvent {
         name: "",
+        id: 0,
+        has_id: false,
         ph: 0,
         ts: 0.0,
         dur: None,
@@ -81,6 +83,21 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                 let (v, a) = parse_phase(bytes, i)?;
                 ev.ph = v;
                 i = a;
+            }
+            b"id" => {
+                // Lenient: async ids are ints in practice, but a string /
+                // negative / float id must not fail the whole chunk — it just
+                // leaves `has_id` false and pairing skips the event.
+                match parse_num_u64(bytes, i) {
+                    Ok((v, a)) => {
+                        ev.id = v;
+                        ev.has_id = true;
+                        i = a;
+                    }
+                    Err(_) => {
+                        i = skip_value(bytes, i)?;
+                    }
+                }
             }
             b"ts" => {
                 let (v, a) = parse_num_f64(bytes, i)?;
@@ -1088,4 +1105,40 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     }
 
     Ok(trace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fast tokenizer must capture async `id`s (integer) for s/f pairing,
+    /// leave `has_id` false when the field is absent, and not bail the chunk
+    /// on a string / negative id (those are simply left unpaired).
+    #[test]
+    fn fast_path_parses_async_ids_leniently() {
+        let json = serde_json::json!({
+            "traceEvents": [
+                {"name": "AnimationFrame", "ph": "s", "ts": 1_000.0, "pid": 1, "tid": 1, "id": 42},
+                {"name": "AnimationFrame", "ph": "f", "ts": 5_000.0, "pid": 1, "tid": 1, "id": 42},
+                {"name": "AnimationFrame", "ph": "s", "ts": 2_000.0, "pid": 1, "tid": 1},
+                {"name": "AnimationFrame", "ph": "s", "ts": 3_000.0, "pid": 1, "tid": 1, "id": "x7"},
+                {"name": "AnimationFrame", "ph": "s", "ts": 4_000.0, "pid": 1, "tid": 1, "id": -3}
+            ]
+        });
+        let path = std::env::temp_dir().join(format!("chperf-async-id-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let evs = &trace.trace_events;
+        assert_eq!(evs.len(), 5);
+        assert_eq!(evs[0].id, 42);
+        assert!(evs[0].has_id);
+        assert_eq!(evs[1].id, 42);
+        assert!(evs[1].has_id);
+        // Absent / string / negative ids: present event, no id.
+        for (k, e) in evs.iter().enumerate().skip(2) {
+            assert!(!e.has_id, "event {} should have no id", k);
+        }
+    }
 }

@@ -1156,6 +1156,374 @@ pub fn jank_section(
     (out, Value::Array(json_rows))
 }
 
+/// Evenly-spaced index selection for downsampling a long timeline to `top`
+/// rows. Always includes the first and last sample.
+fn downsample_indices(n: usize, top: usize) -> Vec<usize> {
+    if n == 0 || top == 0 {
+        return Vec::new();
+    }
+    if n <= top {
+        return (0..n).collect();
+    }
+    let denom = (top - 1).max(1);
+    (0..top).map(|k| k * (n - 1) / denom).collect()
+}
+
+/// Memory timeline: `UpdateCounters` (phase `I`) samples carry the JS heap
+/// size and DOM node / document / event-listener counts. Renders a peak &
+/// growth summary plus a (downsampled) timeline; JSON returns every sample.
+pub fn memory_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    #[derive(Clone, Copy)]
+    struct Sample {
+        ts: f64,
+        heap: f64,
+        nodes: f64,
+        documents: f64,
+        listeners: f64,
+    }
+    let mut samples: Vec<Sample> = Vec::new();
+    for e in events {
+        if e.name != "UpdateCounters" || e.ph != b'I' || !scope.allows_event(e) {
+            continue;
+        }
+        let Some(args) = e.args_value() else { continue };
+        let data = args.get("data");
+        samples.push(Sample {
+            ts: e.ts,
+            heap: data.and_then(|d| d.get("jsHeapSizeUsed")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+            nodes: data.and_then(|d| d.get("nodes")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+            documents: data.and_then(|d| d.get("documents")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+            listeners: data.and_then(|d| d.get("jsEventListeners")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+        });
+    }
+    samples.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+    let n = samples.len();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Memory timeline (UpdateCounters) — {} samples, {}\n\n",
+        n,
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if n == 0 {
+        out.push_str("No UpdateCounters samples.\n\n");
+        let summary = json!({"samples": 0});
+        return (out, json!({"summary": summary, "samples": []}));
+    }
+
+    let mb = |b: f64| b / 1_048_576.0;
+    let first = samples[0];
+    let last = samples[n - 1];
+    let peak = samples
+        .iter()
+        .copied()
+        .max_by(|a, b| a.heap.partial_cmp(&b.heap).unwrap())
+        .unwrap();
+    let peak_nodes = samples.iter().map(|s| s.nodes).fold(f64::NEG_INFINITY, f64::max);
+    let peak_documents = samples.iter().map(|s| s.documents).fold(f64::NEG_INFINITY, f64::max);
+    let peak_listeners = samples.iter().map(|s| s.listeners).fold(f64::NEG_INFINITY, f64::max);
+
+    out.push_str(&format!(
+        "- **JS heap**: {:.1} MB → {:.1} MB ({:+.1} MB), peak {:.1} MB at t={:.2}ms\n",
+        mb(first.heap),
+        mb(last.heap),
+        mb(last.heap - first.heap),
+        mb(peak.heap),
+        (peak.ts - min_ts) / 1000.0,
+    ));
+    out.push_str(&format!(
+        "- **DOM nodes** peak {:.0} · **documents** peak {:.0} · **event listeners** peak {:.0}\n\n",
+        peak_nodes, peak_documents, peak_listeners,
+    ));
+
+    out.push_str("| t(ms) | heap(MB) | nodes | docs | listeners |\n");
+    out.push_str("|-------|----------|-------|------|-----------|\n");
+    let shown = top.max(1);
+    for idx in downsample_indices(n, shown) {
+        let s = samples[idx];
+        out.push_str(&format!(
+            "| {:.2} | {:.1} | {:.0} | {:.0} | {:.0} |\n",
+            (s.ts - min_ts) / 1000.0,
+            mb(s.heap),
+            s.nodes,
+            s.documents,
+            s.listeners,
+        ));
+    }
+    if n > shown {
+        out.push_str(&format!(
+            "\n_Showing {} of {} samples (use --top to see more)._{}",
+            shown, n, '\n'
+        ));
+    }
+    out.push('\n');
+
+    let json_rows: Vec<Value> = samples
+        .iter()
+        .map(|s| {
+            json!({
+                "t_us": (s.ts - min_ts).round(),
+                "heap_mb": s.heap / 1_048_576.0,
+                "nodes": s.nodes,
+                "documents": s.documents,
+                "listeners": s.listeners,
+            })
+        })
+        .collect();
+    let summary = json!({
+        "samples": n,
+        "first_heap_mb": mb(first.heap),
+        "last_heap_mb": mb(last.heap),
+        "growth_mb": mb(last.heap - first.heap),
+        "peak_heap_mb": mb(peak.heap),
+        "peak_heap_t_us": (peak.ts - min_ts).round(),
+        "peak_nodes": peak_nodes,
+        "peak_documents": peak_documents,
+        "peak_listeners": peak_listeners,
+    });
+    (out, json!({"summary": summary, "samples": json_rows}))
+}
+
+/// Input latency: `EventDispatch` (phase `X`) events by input type
+/// (pointer/mouse/key/…), with per-type duration percentiles and the worst
+/// individual events.
+pub fn input_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    let mut by_type: rustc_hash::FxHashMap<String, Vec<f64>> = rustc_hash::FxHashMap::default();
+    let mut worst: Vec<(String, f64, f64)> = Vec::new(); // (type, ts, dur)
+    for e in events {
+        if e.name != "EventDispatch" || e.ph != b'X' || !scope.allows_event(e) {
+            continue;
+        }
+        let d = e.dur.unwrap_or(0.0);
+        let ty = e
+            .args_value()
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+        by_type.entry(ty.clone()).or_default().push(d);
+        worst.push((ty, e.ts, d));
+    }
+    worst.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    let total_events = worst.len();
+
+    let mut rows: Vec<(String, usize, f64, f64, f64, f64, f64)> = by_type
+        .into_iter()
+        .map(|(ty, mut durs)| {
+            durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let count = durs.len();
+            let total: f64 = durs.iter().sum();
+            let avg = total / count as f64;
+            let p50 = percentile(&durs, 50.0);
+            let p99 = percentile(&durs, 99.0);
+            let max = *durs.last().unwrap();
+            (ty, count, total, avg, p50, p99, max)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Input latency (EventDispatch) — {} events, {} types, {}\n\n",
+        total_events,
+        rows.len(),
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if rows.is_empty() {
+        out.push_str("No EventDispatch events.\n\n");
+        return (out, json!({"types": [], "worst": []}));
+    }
+
+    out.push_str("| type | count | total(ms) | avg(ms) | p50(ms) | p99(ms) | max(ms) |\n");
+    out.push_str("|------|-------|-----------|---------|---------|---------|---------|\n");
+    let type_rows: Vec<Value> = rows
+        .iter()
+        .map(|(ty, count, total, avg, p50, p99, max)| {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                ty,
+                count,
+                fmt_ms(*total),
+                fmt_ms(*avg),
+                fmt_ms(*p50),
+                fmt_ms(*p99),
+                fmt_ms(*max),
+            ));
+            json!({
+                "type": ty,
+                "count": count,
+                "total_us": total.round(),
+                "avg_us": avg.round(),
+                "p50_us": p50.round(),
+                "p99_us": p99.round(),
+                "max_us": max.round(),
+            })
+        })
+        .collect();
+    out.push('\n');
+
+    out.push_str("### Worst inputs\n\n");
+    out.push_str("| # | t(ms) | dur(ms) | type |\n");
+    out.push_str("|---|-------|---------|------|\n");
+    let worst_rows: Vec<Value> = worst
+        .iter()
+        .take(top)
+        .enumerate()
+        .map(|(i, (ty, ts, d))| {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_ms(*ts - min_ts),
+                fmt_ms(*d),
+                ty,
+            ));
+            json!({
+                "t_us": (ts - min_ts).round(),
+                "dur_us": d.round(),
+                "type": ty,
+            })
+        })
+        .collect();
+    out.push('\n');
+    (out, json!({"types": type_rows, "worst": worst_rows}))
+}
+
+/// Async task timings: pair `s` (start) and `f` (finish) events by `(pid, id)`
+/// and report per-name duration percentiles (RAF, GC jobs, …) plus the longest
+/// individual tasks. A task is counted when its start is inside the scope.
+pub fn async_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    // Pass 1: in-scope `s` events → (pid, id) → (name, start ts).
+    let mut starts: rustc_hash::FxHashMap<(u64, u64), (&'static str, f64)> = rustc_hash::FxHashMap::default();
+    for e in events {
+        if e.ph == b's' && e.has_id && scope.allows_event(e) {
+            starts.entry((e.pid, e.id)).or_insert((e.name, e.ts));
+        }
+    }
+    // Pass 2: `f` events complete the pair; duration = finish − start.
+    let mut by_name: rustc_hash::FxHashMap<&'static str, Vec<f64>> = rustc_hash::FxHashMap::default();
+    let mut longest: Vec<(&'static str, f64, f64)> = Vec::new(); // (name, start ts, dur)
+    for e in events {
+        if e.ph != b'f' || !e.has_id {
+            continue;
+        }
+        if let Some(&(name, start_ts)) = starts.get(&(e.pid, e.id)) {
+            let dur = (e.ts - start_ts).max(0.0);
+            by_name.entry(name).or_default().push(dur);
+            longest.push((name, start_ts, dur));
+        }
+    }
+    longest.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    let total_tasks = longest.len();
+
+    let mut rows: Vec<(&'static str, usize, f64, f64, f64, f64, f64)> = by_name
+        .into_iter()
+        .map(|(name, mut durs)| {
+            durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let count = durs.len();
+            let total: f64 = durs.iter().sum();
+            let avg = total / count as f64;
+            let p50 = percentile(&durs, 50.0);
+            let p99 = percentile(&durs, 99.0);
+            let max = *durs.last().unwrap();
+            (name, count, total, avg, p50, p99, max)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Async tasks (s/f paired) — {} tasks, {} names, {}\n\n",
+        total_tasks,
+        rows.len(),
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if rows.is_empty() {
+        out.push_str("No async s/f pairs found.\n\n");
+        return (out, json!({"tasks": [], "longest": []}));
+    }
+
+    out.push_str("| name | count | total(ms) | avg(ms) | p50(ms) | p99(ms) | max(ms) |\n");
+    out.push_str("|------|-------|-----------|---------|---------|---------|---------|\n");
+    let task_rows: Vec<Value> = rows
+        .iter()
+        .map(|(name, count, total, avg, p50, p99, max)| {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                name,
+                count,
+                fmt_ms(*total),
+                fmt_ms(*avg),
+                fmt_ms(*p50),
+                fmt_ms(*p99),
+                fmt_ms(*max),
+            ));
+            json!({
+                "name": name,
+                "count": count,
+                "total_us": total.round(),
+                "avg_us": avg.round(),
+                "p50_us": p50.round(),
+                "p99_us": p99.round(),
+                "max_us": max.round(),
+            })
+        })
+        .collect();
+    out.push('\n');
+
+    out.push_str("### Longest tasks\n\n");
+    out.push_str("| # | t(ms) | dur(ms) | name |\n");
+    out.push_str("|---|-------|---------|------|\n");
+    let longest_rows: Vec<Value> = longest
+        .iter()
+        .take(top)
+        .enumerate()
+        .map(|(i, (name, start_ts, d))| {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_ms(*start_ts - min_ts),
+                fmt_ms(*d),
+                name,
+            ));
+            json!({
+                "t_us": (start_ts - min_ts).round(),
+                "dur_us": d.round(),
+                "name": name,
+            })
+        })
+        .collect();
+    out.push('\n');
+    (out, json!({"tasks": task_rows, "longest": longest_rows}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1532,8 @@ mod tests {
     fn ev(ts: f64, name: &str, cat: Option<&str>) -> TraceEvent {
         TraceEvent {
             name: crate::trace::intern_name(name),
+            id: 0,
+            has_id: false,
             ph: b'X',
             ts,
             dur: None,
@@ -1186,5 +1556,117 @@ mod tests {
             ev(3_100_100_000.0, "Paint", None),
         ];
         assert_eq!(trace_start_us(&events), 3_100_000_000.0);
+    }
+
+    /// Full-field event builder for the memory / input / async sections.
+    #[allow(clippy::too_many_arguments)]
+    fn evx(
+        ts: f64,
+        name: &str,
+        ph: u8,
+        dur: Option<f64>,
+        id: u64,
+        has_id: bool,
+        args: Option<serde_json::Value>,
+    ) -> TraceEvent {
+        TraceEvent {
+            name: crate::trace::intern_name(name),
+            id,
+            has_id,
+            ph,
+            ts,
+            dur,
+            tid: 1,
+            pid: 1,
+            cat: None,
+            args: args.and_then(crate::trace::test_args),
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn memory_section_reads_update_counters() {
+        let events = vec![
+            evx(
+                1_000.0,
+                "UpdateCounters",
+                b'I',
+                None,
+                0,
+                false,
+                Some(json!({"data": {"jsHeapSizeUsed": 1_048_576.0, "nodes": 10.0, "documents": 2.0, "jsEventListeners": 5.0}})),
+            ),
+            evx(
+                2_000.0,
+                "UpdateCounters",
+                b'I',
+                None,
+                0,
+                false,
+                Some(json!({"data": {"jsHeapSizeUsed": 2_097_152.0, "nodes": 20.0, "documents": 2.0, "jsEventListeners": 8.0}})),
+            ),
+            evx(1_500.0, "RunTask", b'X', Some(10.0), 0, false, None),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let (md, j) = memory_section(&events, &scope, 10, 0.0);
+        assert!(md.contains("2 samples"), "{}", md);
+        assert!(md.contains("1.0 MB → 2.0 MB (+1.0 MB)"), "{}", md);
+        assert!(md.contains("peak 2.0 MB"), "{}", md);
+        assert!(md.contains("**DOM nodes** peak 20"), "{}", md);
+        assert_eq!(j["summary"]["samples"], 2);
+        assert_eq!(j["summary"]["growth_mb"], 1.0);
+        assert_eq!(j["samples"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn input_section_groups_by_type_with_percentiles() {
+        let dispatch = |ty: &str, dur: f64| {
+            evx(1_000.0, "EventDispatch", b'X', Some(dur), 0, false, Some(json!({"data": {"type": ty}})))
+        };
+        let events = vec![
+            dispatch("pointerdown", 1_000.0),
+            dispatch("pointerdown", 2_000.0),
+            dispatch("pointerdown", 4_000.0),
+            dispatch("mousemove", 100.0),
+            evx(500.0, "RunTask", b'X', Some(9_999.0), 0, false, None),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let (md, j) = input_section(&events, &scope, 5, 0.0);
+        assert!(md.contains("4 events, 2 types"), "{}", md);
+        let types = j["types"].as_array().unwrap();
+        assert_eq!(types.len(), 2);
+        // pointerdown total 7ms beats mousemove 0.1ms → sorted first.
+        assert_eq!(types[0]["type"], "pointerdown");
+        assert_eq!(types[0]["count"], 3);
+        assert_eq!(types[0]["max_us"], 4_000.0);
+        assert_eq!(types[0]["p50_us"], 2_000.0);
+        // worst event is the 4ms pointerdown.
+        assert_eq!(j["worst"].as_array().unwrap()[0]["dur_us"], 4_000.0);
+    }
+
+    #[test]
+    fn async_section_pairs_s_f_by_id() {
+        let events = vec![
+            evx(1_000.0, "AnimationFrame", b's', None, 1, true, None),
+            evx(5_000.0, "AnimationFrame", b'f', None, 1, true, None),
+            evx(2_000.0, "AnimationFrame", b's', None, 2, true, None),
+            evx(3_000.0, "AnimationFrame", b'f', None, 2, true, None),
+            // start without a finish (id 3): must not be counted.
+            evx(6_000.0, "AnimationFrame", b's', None, 3, true, None),
+            // start without an id: skipped by pairing.
+            evx(7_000.0, "AnimationFrame", b's', None, 0, false, None),
+            evx(8_000.0, "AnimationFrame", b'f', None, 0, false, None),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let (md, j) = async_section(&events, &scope, 5, 0.0);
+        assert!(md.contains("2 tasks, 1 names"), "{}", md);
+        let tasks = j["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["name"], "AnimationFrame");
+        assert_eq!(tasks[0]["count"], 2);
+        assert_eq!(tasks[0]["total_us"], 5_000.0); // 4ms + 1ms
+        assert_eq!(tasks[0]["max_us"], 4_000.0);
+        // longest first: the 4ms task.
+        assert_eq!(j["longest"].as_array().unwrap()[0]["dur_us"], 4_000.0);
     }
 }

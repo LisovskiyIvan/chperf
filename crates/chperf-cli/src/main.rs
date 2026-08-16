@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod export;
+mod html;
 mod inspect;
 mod repl;
 
@@ -244,6 +245,26 @@ fn run_single(
     }
 
     // CLI-only: render the report to stdout (or a file via --export=FILE).
+    // --html wins over --export: it needs the raw events for the memory /
+    // input / async sections, which only live on `Analyzed` here.
+    if let Some(target) = cli.html.as_deref() {
+        let events_b = b_opt.as_ref().map(|(b, _)| (b.trace.trace_events.as_slice(), b.min_ts));
+        let doc = html::export_html(
+            &app,
+            &analyzed_a.trace.trace_events,
+            analyzed_a.min_ts,
+            events_b,
+        );
+        match target {
+            "-" => print!("{}", doc),
+            t => {
+                std::fs::write(t, &doc)?;
+                eprintln!("Exported HTML to {}", t);
+            }
+        }
+        return Ok(());
+    }
+
     let md = if cli.summary {
         export::export_summary_only(&app)
     } else {

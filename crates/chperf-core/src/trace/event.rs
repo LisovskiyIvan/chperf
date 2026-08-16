@@ -8,10 +8,20 @@ use serde::Deserialize;
 /// better cache locality. Distinct names are leaked (bounded by the trace's
 /// vocabulary, a few hundred entries at most).
 pub(crate) fn intern_name(s: &str) -> &'static str {
-    use std::sync::{Mutex, OnceLock};
-    static TABLE: OnceLock<Mutex<rustc_hash::FxHashSet<&'static str>>> = OnceLock::new();
-    let table = TABLE.get_or_init(|| Mutex::new(rustc_hash::FxHashSet::default()));
-    let mut guard = table.lock().unwrap_or_else(|p| p.into_inner());
+    use std::sync::{OnceLock, RwLock};
+    static TABLE: OnceLock<RwLock<rustc_hash::FxHashSet<&'static str>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| RwLock::new(rustc_hash::FxHashSet::default()));
+    // Fast path: concurrent readers. The name vocabulary is tiny (a few
+    // hundred entries), so once warm virtually every lookup hits and runs
+    // under a shared read lock with no cross-thread serialization — the
+    // parallel tokenizer was contending on a single Mutex here before.
+    if let Ok(guard) = table.read()
+        && let Some(&existing) = guard.get(s) {
+            return existing;
+        }
+    // Slow path: a genuinely new name. Re-check under the write lock (two
+    // threads can both miss and race here), then leak the interned copy.
+    let mut guard = table.write().unwrap_or_else(|p| p.into_inner());
     if let Some(&existing) = guard.get(s) {
         return existing;
     }
@@ -27,6 +37,15 @@ pub struct TraceEvent {
     /// Interned event name (see `intern_name`): a shared `&'static str`
     /// instead of a per-event `String` allocation.
     pub name: &'static str,
+    /// Async id: pairs `s` (start) / `f` (finish) events with the same
+    /// `(pid, id)`. `0` unless `has_id` is set — `0` is a valid Chrome id
+    /// (GC jobs use it), so it cannot serve as an absence sentinel. Placed
+    /// right after `name` so the two one-byte flags pack into a single
+    /// 8-byte slot and the struct only grows by 8 bytes vs. 16 for
+    /// `Option<u64>`.
+    pub id: u64,
+    /// Whether the trace actually carried an `id` field on this event.
+    pub has_id: bool,
     /// Event phase: a single ASCII byte (`X`, `b`, `e`, `P`, `M`, `I`, …),
     /// or `0` when absent/empty.
     pub ph: u8,
@@ -59,6 +78,8 @@ impl<'de> Deserialize<'de> for TraceEvent {
         struct Owned {
             #[serde(default)]
             name: String,
+            #[serde(default, deserialize_with = "deserialize_id")]
+            id: Option<u64>,
             #[serde(default)]
             ph: String,
             #[serde(default)]
@@ -77,6 +98,8 @@ impl<'de> Deserialize<'de> for TraceEvent {
         let h = Owned::deserialize(deserializer)?;
         Ok(TraceEvent {
             name: intern_name(&h.name),
+            id: h.id.unwrap_or(0),
+            has_id: h.id.is_some(),
             ph: h.ph.as_bytes().first().copied().unwrap_or(0),
             ts: h.ts,
             dur: h.dur,
@@ -87,6 +110,18 @@ impl<'de> Deserialize<'de> for TraceEvent {
             args_cache: std::sync::OnceLock::new(),
         })
     }
+}
+
+/// Serde fallback for `id`: Chrome traces use an integer id (the common
+/// case) but occasionally a string or object id (`id2`). Anything that isn't
+/// a non-negative integer is treated as "no id" rather than failing the whole
+/// trace — async pairing simply skips those events.
+fn deserialize_id<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| v.as_u64()))
 }
 
 /// Serde fallback: capture the `args` field as raw JSON bytes (zero-copy via
@@ -110,6 +145,8 @@ impl Clone for TraceEvent {
     fn clone(&self) -> Self {
         TraceEvent {
             name: self.name,
+            id: self.id,
+            has_id: self.has_id,
             ph: self.ph,
             ts: self.ts,
             dur: self.dur,
