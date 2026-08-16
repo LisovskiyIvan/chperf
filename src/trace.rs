@@ -2,6 +2,24 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Intern an event name into a `&'static str`. Chrome traces reuse a small
+/// set of names across millions of events, so interning turns one heap
+/// allocation per event into a shared reference — a large memory win and
+/// better cache locality. Distinct names are leaked (bounded by the trace's
+/// vocabulary, a few hundred entries at most).
+pub(crate) fn intern_name(s: &str) -> &'static str {
+    use std::sync::{Mutex, OnceLock};
+    static TABLE: OnceLock<Mutex<rustc_hash::FxHashSet<&'static str>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| Mutex::new(rustc_hash::FxHashSet::default()));
+    let mut guard = table.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&existing) = guard.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+    guard.insert(leaked);
+    leaked
+}
+
 #[derive(Deserialize, Clone)]
 pub struct TraceMetadata {
     #[serde(rename = "cpuThrottling", default)]
@@ -30,55 +48,97 @@ pub struct TraceFile {
     pub metadata: Option<TraceMetadata>,
 }
 
-#[derive(Deserialize)]
+/// A single parsed event. `name` is interned (see `intern_name`) and `ph` is
+/// a single byte, so the struct is compact: no per-event allocation for the
+/// name or the phase.
 pub struct TraceEvent {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub ph: String,
-    #[serde(default)]
+    /// Interned event name (see `intern_name`): a shared `&'static str`
+    /// instead of a per-event `String` allocation.
+    pub name: &'static str,
+    /// Event phase: a single ASCII byte (`X`, `b`, `e`, `P`, `M`, `I`, …),
+    /// or `0` when absent/empty.
+    pub ph: u8,
     pub ts: f64,
-    #[serde(default)]
     pub dur: Option<f64>,
-    #[serde(default)]
     pub tid: u64,
-    #[serde(default)]
     #[allow(dead_code)]
     pub pid: u64,
-    #[serde(default)]
     #[allow(dead_code)]
-    pub cat: Option<String>,
+    pub cat: Option<Box<str>>,
     /// Raw `args` JSON text. The fast tokenizer captures the byte range
     /// without parsing; serde_json's RawValue would validate (full parse) on
-    /// construction, which is exactly what we're avoiding.
-    #[serde(default, deserialize_with = "deserialize_args_raw")]
-    pub args: Option<String>,
-    #[serde(skip)]
+    /// construction, which is exactly what we're avoiding. Owned as `Box<str>`
+    /// (16 bytes vs 24 for `String`, immutable after parse).
+    pub args: Option<Box<str>>,
     pub(crate) args_cache: std::sync::OnceLock<Option<serde_json::Value>>,
 }
 
+impl<'de> Deserialize<'de> for TraceEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Serde fallback (the fast tokenizer is the primary path): deserialize
+        // into an owned shadow struct, then intern the name and fold the phase
+        // to its first byte. A derived impl would treat `name: &'static str`
+        // as a borrowed `&str` field and force `'de: 'static`, which breaks
+        // the streaming `Deserializer::from_slice` borrow.
+        #[derive(Deserialize)]
+        struct Owned {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            ph: String,
+            #[serde(default)]
+            ts: f64,
+            #[serde(default)]
+            dur: Option<f64>,
+            #[serde(default)]
+            tid: u64,
+            #[serde(default)]
+            pid: u64,
+            #[serde(default)]
+            cat: Option<Box<str>>,
+            #[serde(default, deserialize_with = "deserialize_args_raw")]
+            args: Option<Box<str>>,
+        }
+        let h = Owned::deserialize(deserializer)?;
+        Ok(TraceEvent {
+            name: intern_name(&h.name),
+            ph: h.ph.as_bytes().first().copied().unwrap_or(0),
+            ts: h.ts,
+            dur: h.dur,
+            tid: h.tid,
+            pid: h.pid,
+            cat: h.cat,
+            args: h.args,
+            args_cache: std::sync::OnceLock::new(),
+        })
+    }
+}
+
 /// Serde fallback: capture the `args` field as raw JSON bytes (zero-copy via
-/// RawValue) and own them as a String. Only used when the fast tokenizer
+/// RawValue) and own them as a `Box<str>`. Only used when the fast tokenizer
 /// falls back to serde.
-fn deserialize_args_raw<'de, D>(d: D) -> Result<Option<String>, D::Error>
+fn deserialize_args_raw<'de, D>(d: D) -> Result<Option<Box<str>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<&'de serde_json::value::RawValue>::deserialize(d)?;
-    Ok(raw.map(|r| r.get().to_string()))
+    Ok(raw.map(|r| r.get().into()))
 }
 
 /// Test helper: build an event `args` field from a JSON value (stored raw).
 #[cfg(test)]
-pub(crate) fn test_args(v: serde_json::Value) -> Option<String> {
-    serde_json::to_string(&v).ok()
+pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<str>> {
+    serde_json::to_string(&v).ok().map(String::into_boxed_str)
 }
 
 impl Clone for TraceEvent {
     fn clone(&self) -> Self {
         TraceEvent {
-            name: self.name.clone(),
-            ph: self.ph.clone(),
+            name: self.name,
+            ph: self.ph,
             ts: self.ts,
             dur: self.dur,
             tid: self.tid,
@@ -144,8 +204,8 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
         return Err(());
     }
     let mut ev = TraceEvent {
-        name: String::new(),
-        ph: String::new(),
+        name: "",
+        ph: 0,
         ts: 0.0,
         dur: None,
         tid: 0,
@@ -179,12 +239,12 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
         }
         match key {
             b"name" => {
-                let (v, a) = parse_string(bytes, i)?;
+                let (v, a) = parse_string_intern(bytes, i)?;
                 ev.name = v;
                 i = a;
             }
             b"ph" => {
-                let (v, a) = parse_string(bytes, i)?;
+                let (v, a) = parse_phase(bytes, i)?;
                 ev.ph = v;
                 i = a;
             }
@@ -225,7 +285,7 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                     ev.cat = None;
                 } else {
                     let (v, a) = parse_string(bytes, i)?;
-                    ev.cat = Some(v);
+                    ev.cat = Some(v.into());
                     i = a;
                 }
             }
@@ -238,7 +298,7 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                     ev.args = None;
                 } else {
                     let end = skip_value(bytes, i)?;
-                    ev.args = Some(std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?.to_string());
+                    ev.args = Some(std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?.into());
                     i = end;
                 }
             }
@@ -300,6 +360,47 @@ fn parse_string(bytes: &[u8], p: usize) -> Result<(String, usize), ()> {
             }
             let s = std::str::from_utf8(&bytes[p + 1..q]).map_err(|_| ())?.to_string();
             Ok((s, q + 1))
+        }
+        None => Err(()),
+    }
+}
+
+/// Like `parse_string`, but interns the result instead of allocating a new
+/// `String` per event (event names repeat heavily across a trace).
+fn parse_string_intern(bytes: &[u8], p: usize) -> Result<(&'static str, usize), ()> {
+    let len = bytes.len();
+    if p >= len || bytes[p] != b'"' {
+        return Err(());
+    }
+    match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
+        Some(rel) => {
+            let q = p + 1 + rel;
+            if bytes[q] == b'\\' {
+                return Err(());
+            }
+            let s = std::str::from_utf8(&bytes[p + 1..q]).map_err(|_| ())?;
+            Ok((intern_name(s), q + 1))
+        }
+        None => Err(()),
+    }
+}
+
+/// Event phase: the first byte of a quoted, unescaped string (`0` when the
+/// string is empty). Escaped phases bail to the serde fallback, same as
+/// `parse_string`. Returns (byte, pos after closing quote).
+fn parse_phase(bytes: &[u8], p: usize) -> Result<(u8, usize), ()> {
+    let len = bytes.len();
+    if p >= len || bytes[p] != b'"' {
+        return Err(());
+    }
+    match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
+        Some(rel) => {
+            let q = p + 1 + rel;
+            if bytes[q] == b'\\' {
+                return Err(());
+            }
+            let v = if q > p + 1 { bytes[p + 1] } else { 0 };
+            Ok((v, q + 1))
         }
         None => Err(()),
     }
@@ -1161,7 +1262,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
 /// lands in dead time.
 pub fn is_metadata_event(e: &TraceEvent) -> bool {
     matches!(
-        e.name.as_str(),
+        e.name,
         "thread_name" | "process_name" | "thread_sort_index" | "process_sort_index"
     ) || e.cat.as_deref() == Some("__metadata")
 }
@@ -1169,7 +1270,7 @@ pub fn is_metadata_event(e: &TraceEvent) -> bool {
 /// Detect main thread: first RunTask with dur > 500ms
 pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     for e in events {
-        if e.name == "RunTask" && e.ph == "X"
+        if e.name == "RunTask" && e.ph == b'X'
             && let Some(dur) = e.dur
                 && dur > 500_000.0 {
                     return e.tid;
@@ -1178,7 +1279,7 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     // Fallback: tid with most RunTask events
     let mut counts: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
     for e in events {
-        if e.name == "RunTask" && e.ph == "X" {
+        if e.name == "RunTask" && e.ph == b'X' {
             *counts.entry(e.tid).or_default() += 1;
         }
     }

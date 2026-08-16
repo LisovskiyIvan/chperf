@@ -423,10 +423,9 @@ fn inspect_compare_output(
         return Ok(());
     }
 
-    let sections_a = build_sections(events_a, min_ts_a, &ws_a, cli)?;
-    let sections_b = build_sections(events_b, min_ts_b, &ws_b, cli)?;
-
-    // Merged delta rows (raw units): None when either trace lacks windows.
+    // Compute delta data once per trace: the per-trace delta section and the
+    // merged A-vs-B table share the same raw data (a full event sweep + a
+    // multi-window CPU scan), so computing it twice would double that work.
     let compare = if cli.delta {
         match (
             ws_a.pre, ws_a.shoot, ws_a.post, ws_a.anchor_ts,
@@ -442,6 +441,9 @@ fn inspect_compare_output(
     } else {
         None
     };
+
+    let sections_a = build_sections(events_a, min_ts_a, &ws_a, cli, compare.as_ref().map(|(da, _)| da))?;
+    let sections_b = build_sections(events_b, min_ts_b, &ws_b, cli, compare.as_ref().map(|(_, db)| db))?;
 
     if cli.json {
         let mut obj = serde_json::Map::new();
@@ -616,7 +618,7 @@ pub(crate) fn inspect_output(
         return Ok(());
     }
 
-    let sections = build_sections(events, min_ts, &ws, cli)?;
+    let sections = build_sections(events, min_ts, &ws, cli, None)?;
     dispatch_output(&sections, trace_name, min_ts, &ws, cli)
 }
 
@@ -731,6 +733,7 @@ fn build_sections(
     min_ts: f64,
     ws: &WindowState,
     cli: &Cli,
+    delta: Option<&windowed::DeltaData>,
 ) -> Result<Vec<Section>, Box<dyn std::error::Error>> {
     let scope = &ws.scope;
     let sort = match cli.sort.as_deref() {
@@ -840,16 +843,19 @@ fn build_sections(
     if cli.delta {
         match (ws.pre, ws.shoot, ws.post, ws.anchor_ts) {
             (Some(p), Some(s), Some(q), Some(a)) => {
-                let (md, j) = windowed::delta_section(
-                    events,
-                    p,
-                    s,
-                    q,
-                    a,
-                    &cli.frame_event,
-                    cli.lt,
-                    min_ts,
-                );
+                let (md, j) = match delta {
+                    Some(d) => windowed::delta_section_from_data(d, min_ts),
+                    None => windowed::delta_section(
+                        events,
+                        p,
+                        s,
+                        q,
+                        a,
+                        &cli.frame_event,
+                        cli.lt,
+                        min_ts,
+                    ),
+                };
                 sections.push(("delta", md, j));
             }
             _ => sections.push((

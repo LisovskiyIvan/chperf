@@ -89,7 +89,7 @@ impl Scope {
             && self
                 .cat
                 .as_deref()
-                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
+                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| contains_ignore_case(ec, c)))
     }
 
     /// Thread/process/category filter without the window check — for CPU
@@ -100,7 +100,7 @@ impl Scope {
             && self
                 .cat
                 .as_deref()
-                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| ec.to_lowercase().contains(c)))
+                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| contains_ignore_case(ec, c)))
     }
 
     pub(crate) fn window_line(&self, min_ts: f64) -> Option<String> {
@@ -211,14 +211,14 @@ pub fn events_section(
 ) -> (String, Value) {
     let mut rows: Vec<&TraceEvent> = events
         .iter()
-        .filter(|e| filter.matches(&e.name))
+        .filter(|e| filter.matches(e.name))
         .filter(|e| e.dur.unwrap_or(0.0) >= min_dur_us)
         .filter(|e| scope.allows_event(e))
         .collect();
     match sort {
         Sort::Ts => rows.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap()),
         Sort::Dur => rows.sort_by(|a, b| b.dur.unwrap_or(0.0).partial_cmp(&a.dur.unwrap_or(0.0)).unwrap()),
-        Sort::Name => rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.ts.partial_cmp(&b.ts).unwrap())),
+        Sort::Name => rows.sort_by(|a, b| a.name.cmp(b.name).then(a.ts.partial_cmp(&b.ts).unwrap())),
         Sort::Count => {}
     }
 
@@ -285,18 +285,24 @@ pub fn stats_section(
 ) -> (String, Value) {
     let mut groups: rustc_hash::FxHashMap<&str, Vec<f64>> = rustc_hash::FxHashMap::default();
     for e in events {
-        if !filter.matches(&e.name) || !scope.allows_event(e) {
+        if !filter.matches(e.name) || !scope.allows_event(e) {
             continue;
         }
         let d = e.dur.unwrap_or(0.0);
         if d < min_dur_us {
             continue;
         }
-        groups.entry(e.name.as_str()).or_default().push(d);
+        groups.entry(e.name).or_default().push(d);
     }
 
-    let mut rows: Vec<(&str, Vec<f64>)> = groups.into_iter().collect();
-    rows.sort_by(|a, b| b.1.iter().sum::<f64>().partial_cmp(&a.1.iter().sum::<f64>()).unwrap());
+    let mut rows: Vec<(&str, Vec<f64>, f64)> = groups
+        .into_iter()
+        .map(|(name, durs)| {
+            let total = durs.iter().sum::<f64>();
+            (name, durs, total)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -318,9 +324,8 @@ pub fn stats_section(
 
     out.push_str("| name | count | total(ms) | min | avg | p50 | p90 | p99 | max |\n");
     out.push_str("|------|-------|-----------|-----|-----|-----|-----|-----|-----|\n");
-    for (name, mut durs) in rows {
+    for (name, mut durs, total) in rows {
         durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let total: f64 = durs.iter().sum();
         let count = durs.len();
         let avg = total / count as f64;
         let ms = |v: f64| format!("{:.2}", v / 1000.0);
@@ -733,7 +738,7 @@ pub fn names_section(
         if !scope.allows_event(e) {
             continue;
         }
-        let entry = stats.entry(e.name.as_str()).or_default();
+        let entry = stats.entry(e.name).or_default();
         entry.0 += 1;
         entry.1 += e.dur.unwrap_or(0.0);
     }
@@ -812,7 +817,7 @@ pub fn threads_section(
         if e.name == "RunTask" {
             entry.1 += e.dur.unwrap_or(0.0);
         }
-        *entry.2.entry(e.name.as_str()).or_default() += 1;
+        *entry.2.entry(e.name).or_default() += 1;
     }
 
     let mut rows: Vec<(u64, usize, f64, String)> = tids
@@ -958,7 +963,7 @@ pub fn timeline_section(
 pub fn worst_runtask(events: &[TraceEvent], scope: &Scope) -> Option<(f64, f64)> {
     events
         .iter()
-        .filter(|e| e.name == "RunTask" && e.ph == "X" && scope.allows_event(e))
+        .filter(|e| e.name == "RunTask" && e.ph == b'X' && scope.allows_event(e))
         .filter_map(|e| e.dur.map(|d| (e.ts, d)))
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
 }
@@ -973,7 +978,7 @@ pub fn task_section(
 ) -> (String, Value) {
     let mut tasks: Vec<&TraceEvent> = events
         .iter()
-        .filter(|e| e.name == "RunTask" && e.ph == "X" && e.dur.is_some() && scope.allows_event(e))
+        .filter(|e| e.name == "RunTask" && e.ph == b'X' && e.dur.is_some() && scope.allows_event(e))
         .collect();
     tasks.sort_by(|a, b| b.dur.unwrap().partial_cmp(&a.dur.unwrap()).unwrap());
     let total = tasks.len();
@@ -1003,7 +1008,7 @@ pub fn task_section(
                 continue;
             }
             let d = e.dur.unwrap_or(0.0);
-            let g = groups.entry(e.name.clone()).or_default();
+            let g = groups.entry(e.name.to_string()).or_default();
             g.0 += 1;
             g.1 += d;
             if e.name == "FunctionCall" && top_fc.as_ref().is_none_or(|(_, dd)| d > *dd) {
@@ -1148,13 +1153,13 @@ mod tests {
 
     fn ev(ts: f64, name: &str, cat: Option<&str>) -> TraceEvent {
         TraceEvent {
-            name: name.into(),
-            ph: "X".into(),
+            name: crate::trace::intern_name(name),
+            ph: b'X',
             ts,
             dur: None,
             tid: 1,
             pid: 1,
-            cat: cat.map(|s| s.to_string()),
+            cat: cat.map(|s| s.into()),
             args: None,
             args_cache: std::sync::OnceLock::new(),
         }

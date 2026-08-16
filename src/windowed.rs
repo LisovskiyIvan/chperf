@@ -53,8 +53,17 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // Pass 1: FunctionCall data.functionName.
     let mut best: Option<Anchor> = None;
     for e in events {
-        if e.name != "FunctionCall" || e.ph != "X" {
+        if e.name != "FunctionCall" || e.ph != b'X' {
             continue;
+        }
+        // Fast pre-filter on raw bytes: substring needles can't match an
+        // event whose raw args don't contain them, so skip the args parse
+        // (and the OnceLock fill) entirely.
+        if let Matcher::Substr(p) = matcher {
+            let Some(raw) = e.args_raw() else { continue };
+            if !crate::inspect::contains_ignore_case(raw, p) {
+                continue;
+            }
         }
         let Some(fn_name) = e
             .args_value()
@@ -81,7 +90,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // `Profile` (ph=P) event; timeDeltas are inter-sample gaps.
     let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
     for e in events {
-        if e.name == "Profile" && e.ph == "P" {
+        if e.name == "Profile" && e.ph == b'P' {
             starts.entry(e.pid).or_insert(e.ts);
         }
     }
@@ -220,9 +229,9 @@ fn paired_durations(events: &[TraceEvent], name: &str, window: Option<(f64, f64)
             && (e.ts < lo || e.ts > hi) {
                 continue;
             }
-        match e.ph.as_str() {
-            "b" => stacks.entry(e.tid).or_default().push(e.ts),
-            "e" => {
+        match e.ph {
+            b'b' => stacks.entry(e.tid).or_default().push(e.ts),
+            b'e' => {
                 if let Some(st) = stacks.get_mut(&e.tid)
                     && let Some(t) = st.pop()
                         && e.ts > t {
@@ -330,11 +339,11 @@ pub fn gc_section(
         if !scope.allows_event(e) {
             continue;
         }
-        if e.ph != "X" {
+        if e.ph != b'X' {
             continue;
         }
         let d = e.dur.unwrap_or(0.0);
-        let gi = match e.name.as_str() {
+        let gi = match e.name {
             "MajorGC" => Some(0),
             "MinorGC" | "V8.GCScavenger" => Some(1),
             n if n.starts_with("V8.GC") || n.starts_with("CppGC") => Some(2),
@@ -679,8 +688,8 @@ fn delta_windows_stats(
             if ts < *lo || ts > *hi {
                 continue;
             }
-            if e.ph == "X" && e.tid == main_tid {
-                match e.name.as_str() {
+            if e.ph == b'X' && e.tid == main_tid {
+                match e.name {
                     "RunTask" => {
                         if let Some(d) = e.dur {
                             accs[wi].runtask += d;
@@ -694,8 +703,8 @@ fn delta_windows_stats(
                     _ => {}
                 }
             }
-            match e.name.as_str() {
-                "MajorGC" | "MinorGC" if e.ph == "X" => {
+            match e.name {
+                "MajorGC" | "MinorGC" if e.ph == b'X' => {
                     accs[wi].gc += e.dur.unwrap_or(0.0);
                     accs[wi].gc_count += 1;
                 }
@@ -847,6 +856,13 @@ pub fn delta_section(
     min_ts: f64,
 ) -> (String, Value) {
     let data = delta_data(events, pre, shoot, post, anchor_ts, frame_event, lt_ms);
+    delta_section_from_data(&data, min_ts)
+}
+
+/// Render the PRE/SHOOT/POST section from already-computed `DeltaData`, so
+/// callers that also need the raw rows (e.g. the two-trace compare) compute
+/// `delta_data` exactly once per trace.
+pub fn delta_section_from_data(data: &DeltaData, min_ts: f64) -> (String, Value) {
 
     let ms = |v: f64| format!("{:.1}", v / 1000.0);
     let dms = |a: f64, b: f64| format!("{:+.1}", (b - a) / 1000.0);
@@ -857,18 +873,18 @@ pub fn delta_section(
     out.push_str("## Delta: PRE → SHOOT → POST\n\n");
     out.push_str(&format!(
         "- **SHOOT**: {:.2}ms … {:.2}ms from trace start\n",
-        (shoot.0 - min_ts) / 1000.0,
-        (shoot.1 - min_ts) / 1000.0,
+        (data.shoot.0 - min_ts) / 1000.0,
+        (data.shoot.1 - min_ts) / 1000.0,
     ));
     out.push_str(&format!(
         "- **PRE**:  {:.2}ms … {:.2}ms\n",
-        (pre.0 - min_ts) / 1000.0,
-        (pre.1 - min_ts) / 1000.0,
+        (data.pre.0 - min_ts) / 1000.0,
+        (data.pre.1 - min_ts) / 1000.0,
     ));
     out.push_str(&format!(
         "- **POST**: {:.2}ms … {:.2}ms\n\n",
-        (post.0 - min_ts) / 1000.0,
-        (post.1 - min_ts) / 1000.0,
+        (data.post.0 - min_ts) / 1000.0,
+        (data.post.1 - min_ts) / 1000.0,
     ));
 
     out.push_str("| metric | PRE | SHOOT | POST | SHOOT−PRE | POST−SHOOT |\n");
@@ -936,11 +952,11 @@ pub fn delta_section(
         )
     };
     let mut obj = serde_json::Map::new();
-    obj.insert("anchor_us".into(), json!(anchor_ts.round()));
+    obj.insert("anchor_us".into(), json!(data.anchor_us.round()));
     obj.insert("windows".into(), json!({
-        "pre": [pre.0.round(), pre.1.round()],
-        "shoot": [shoot.0.round(), shoot.1.round()],
-        "post": [post.0.round(), post.1.round()],
+        "pre": [data.pre.0.round(), data.pre.1.round()],
+        "shoot": [data.shoot.0.round(), data.shoot.1.round()],
+        "post": [data.post.0.round(), data.post.1.round()],
     }));
     obj.insert("metrics".into(), Value::Array(json_rows));
     obj.insert("top_cpu".into(), json!({
@@ -1008,8 +1024,8 @@ mod tests {
 
     fn ev(name: &str, ph: &str, ts: f64, dur: Option<f64>, args: Option<serde_json::Value>) -> TraceEvent {
         TraceEvent {
-            name: name.into(),
-            ph: ph.into(),
+            name: crate::trace::intern_name(name),
+            ph: ph.as_bytes().first().copied().unwrap_or(0),
             ts,
             dur,
             tid: 1,

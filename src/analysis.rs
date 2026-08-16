@@ -63,7 +63,7 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         if end > max_ts {
             max_ts = end;
         }
-        if e.tid != main_tid || e.ph != "X" {
+        if e.tid != main_tid || e.ph != b'X' {
             continue;
         }
         if e.name == "RunTask"
@@ -73,7 +73,7 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
                     long_task_durs.push(d);
                 }
             }
-        if let Some(key) = target_key(&e.name)
+        if let Some(key) = target_key(e.name)
             && let Some(d) = e.dur {
                 let entry = stats_map.entry(key).or_default();
                 entry.0 += d;
@@ -181,7 +181,7 @@ pub struct ScrollFrameResult {
 pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFrameResult {
     let mut main_x: Vec<&TraceEvent> = events
         .iter()
-        .filter(|e| e.tid == main_tid && e.ph == "X")
+        .filter(|e| e.tid == main_tid && e.ph == b'X')
         .collect();
     main_x.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
 
@@ -243,7 +243,7 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
             if e.name != "RunTask" {
                 let d = e.dur.unwrap_or(0.0);
                 if d > 0.0 && e.ts + d <= rt_end {
-                    match e.name.as_str() {
+                    match e.name {
                         "FunctionCall" => ft.js_us += d,
                         "UpdateLayoutTree" => ft.ult_us += d,
                         "Paint" => ft.paint_us += d,
@@ -455,7 +455,7 @@ fn scan_profile_chunks_core(
 fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
     let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
     for e in events {
-        if e.name == "Profile" && e.ph == "P" {
+        if e.name == "Profile" && e.ph == b'P' {
             starts.entry(e.pid).or_insert(e.ts);
         }
     }
@@ -709,7 +709,7 @@ pub fn analyze_style_recalc(events: &[TraceEvent], main_tid: u64) -> StyleRecalc
     let mut entries = Vec::new();
 
     for e in events {
-        if e.tid != main_tid || e.name != "UpdateLayoutTree" || e.ph != "X" {
+        if e.tid != main_tid || e.name != "UpdateLayoutTree" || e.ph != b'X' {
             continue;
         }
         let element_count = e
@@ -764,7 +764,7 @@ pub fn analyze_layout_dirty(events: &[TraceEvent], main_tid: u64) -> LayoutDirty
     let mut entries = Vec::new();
 
     for e in events {
-        if e.tid != main_tid || e.name != "Layout" || e.ph != "X" {
+        if e.tid != main_tid || e.name != "Layout" || e.ph != b'X' {
             continue;
         }
         let args = match e.args_value() {
@@ -833,7 +833,7 @@ pub struct ForcedReflowResult {
 pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedReflowResult {
     let mut main_x: Vec<&TraceEvent> = events
         .iter()
-        .filter(|e| e.tid == main_tid && e.ph == "X")
+        .filter(|e| e.tid == main_tid && e.ph == b'X')
         .collect();
     main_x.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
 
@@ -863,7 +863,7 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
         while j < main_x.len() && main_x[j].ts <= rt_end {
             let c = main_x[j];
             if c.name != "RunTask" && c.ts + c.dur.unwrap_or(0.0) <= rt_end {
-                match c.name.as_str() {
+                match c.name {
                     "FunctionCall" => {
                         last_was_js = true;
                     }
@@ -1395,8 +1395,8 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
                 continue;
             }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
-        match e.name.as_str() {
-            "RunTask" if e.ph == "X" && e.tid == main_tid => {
+        match e.name {
+            "RunTask" if e.ph == b'X' && e.tid == main_tid => {
                 if let Some(d) = e.dur {
                     busy[b] += d;
                     if d > max_run[b] {
@@ -1404,13 +1404,13 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
                     }
                 }
             }
-            "FireAnimationFrame" if e.ph == "X" && e.tid == main_tid => {
+            "FireAnimationFrame" if e.ph == b'X' && e.tid == main_tid => {
                 if let Some(d) = e.dur
                     && d > max_faf[b] {
                         max_faf[b] = d;
                     }
             }
-            "GPUTask" if e.ph == "X" => {
+            "GPUTask" if e.ph == b'X' => {
                 if let Some(d) = e.dur
                     && d > max_gpu[b] {
                         max_gpu[b] = d;
@@ -1489,7 +1489,7 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
     }
     let mut calls: Vec<rustc_hash::FxHashMap<String, f64>> = (0..top.len()).map(|_| rustc_hash::FxHashMap::default()).collect();
     for e in events {
-        if e.name != "FunctionCall" || e.ph != "X" {
+        if e.name != "FunctionCall" || e.ph != b'X' {
             continue;
         }
         if let (Some(lo), Some(hi)) = (win_lo, win_hi)
@@ -1544,8 +1544,8 @@ mod tests {
 
     fn profile_event(ts: f64) -> TraceEvent {
         TraceEvent {
-            name: "Profile".into(),
-            ph: "P".into(),
+            name: "Profile",
+            ph: b'P',
             ts,
             dur: None,
             tid: 65,
@@ -1564,8 +1564,8 @@ mod tests {
             })
             .collect();
         TraceEvent {
-            name: "ProfileChunk".into(),
-            ph: "P".into(),
+            name: "ProfileChunk",
+            ph: b'P',
             ts,
             dur: None,
             tid: 65,
@@ -1583,8 +1583,8 @@ mod tests {
 
     fn plain_event(ts: f64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: name.into(),
-            ph: "X".into(),
+            name: crate::trace::intern_name(name),
+            ph: b'X',
             ts,
             dur: Some(100.0),
             tid: 1,
