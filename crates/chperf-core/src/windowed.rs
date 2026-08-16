@@ -445,7 +445,7 @@ pub fn calltree_section(
     // Children map + roots.
     let mut children: rustc_hash::FxHashMap<u64, Vec<u64>> = rustc_hash::FxHashMap::default();
     let mut roots: Vec<u64> = Vec::new();
-    for (id, (_, _, parent)) in &nodes {
+    for (id, (_, _, parent)) in nodes.iter() {
         match parent {
             Some(p) if nodes.contains_key(p) => children.entry(*p).or_default().push(*id),
             _ => roots.push(*id),

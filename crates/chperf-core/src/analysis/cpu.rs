@@ -4,6 +4,7 @@
 use crate::inspect::Scope;
 use crate::trace::{TraceEvent, is_metadata_event};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// CPU-profile node id -> (function name, source URL, parent id), first-wins.
 /// FxHash: u64 keys on hot scan paths; SipHash costs ~2-4x on millions of
@@ -360,7 +361,7 @@ pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
 pub fn analyze_cpu_profile_full(events: &[TraceEvent]) -> (CpuProfileResult, CpuProfileCache) {
     let (node_map, self_times) = scan_profile_chunks(events, None, 5);
     let result = build_cpu_profile_result(&node_map, &self_times);
-    (result, CpuProfileCache { nodes: node_map, self_times })
+    (result, CpuProfileCache { nodes: Arc::new(node_map), self_times })
 }
 
 fn build_cpu_profile_result(node_map: &ProfileNodes, self_times: &ProfileSelfTimes) -> CpuProfileResult {
@@ -414,8 +415,12 @@ fn build_cpu_profile_result(node_map: &ProfileNodes, self_times: &ProfileSelfTim
 }
 
 /// Reusable full-trace CPU profile (node table + per-node self-time).
+///
+/// `nodes` is `Arc`-shared: it is only ever read (by id), so cached REPL
+/// queries bump a reference count instead of re-cloning the whole node table
+/// (thousands of nodes × two `String`s) on every request.
 pub struct CpuProfileCache {
-    pub nodes: ProfileNodes,
+    pub nodes: Arc<ProfileNodes>,
     pub self_times: ProfileSelfTimes,
 }
 
@@ -434,10 +439,13 @@ pub fn cpu_profile_for(
     events: &[TraceEvent],
     scope: &Scope,
     cache: Option<&CpuProfileCache>,
-) -> (ProfileNodes, ProfileSelfTimes) {
+) -> (Arc<ProfileNodes>, ProfileSelfTimes) {
     match cache.filter(|c| c.serves(scope)) {
-        Some(c) => (c.nodes.clone(), c.self_times.clone()),
-        None => scan_profile_chunks(events, Some(scope), 0),
+        Some(c) => (Arc::clone(&c.nodes), c.self_times.clone()),
+        None => {
+            let (nodes, times) = scan_profile_chunks(events, Some(scope), 0);
+            (Arc::new(nodes), times)
+        }
     }
 }
 
@@ -629,7 +637,7 @@ mod tests {
         let (cached_nodes, cached_times) = cpu_profile_for(&events, &empty, Some(&cache));
         let (fresh_nodes, fresh_times) = cpu_profile_for(&events, &empty, None);
         assert_eq!(cached_nodes.len(), fresh_nodes.len());
-        for (id, v) in &cached_nodes {
+        for (id, v) in cached_nodes.iter() {
             assert_eq!(fresh_nodes.get(id), Some(v));
         }
         assert_eq!(cached_times.len(), fresh_times.len());

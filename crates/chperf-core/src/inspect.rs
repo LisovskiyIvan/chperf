@@ -7,6 +7,7 @@
 
 use crate::trace::TraceEvent;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 // ── Time helpers ──
 
@@ -423,9 +424,10 @@ pub fn functions_section(
 
 // ── CPU profile collection (shared by stacks + flame) ──
 
-/// node id -> (name, url, parent)
+/// node id -> (name, url, parent). The node table is `Arc`-shared: cached
+/// queries re-use it without re-cloning thousands of `(name, url)` strings.
 pub struct CpuProfile {
-    pub nodes: crate::analysis::ProfileNodes,
+    pub nodes: Arc<crate::analysis::ProfileNodes>,
     pub leaf_time: crate::analysis::ProfileSelfTimes,
 }
 
