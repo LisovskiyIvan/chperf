@@ -222,6 +222,9 @@ pub(crate) struct Analyzed {
     pub(crate) summary: analysis::SummaryResult,
     pub(crate) scroll_frames: analysis::ScrollFrameResult,
     pub(crate) cpu_profile: analysis::CpuProfileResult,
+    /// Raw full-trace CPU profile (node table + self-times), kept so REPL
+    /// queries with an empty scope can skip re-scanning the trace.
+    pub(crate) cpu_cache: analysis::CpuProfileCache,
     pub(crate) layout_dirty: analysis::LayoutDirtyResult,
     pub(crate) style_recalc: analysis::StyleRecalcResult,
     pub(crate) forced_reflows: analysis::ForcedReflowResult,
@@ -241,12 +244,12 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
     // The six analysis passes are independent and read-only, so on large
     // traces they run concurrently (each pass itself parallelizes hot work).
     const PARALLEL_THRESHOLD: usize = 200_000;
-    let (summary, scroll_frames, cpu_profile, layout_dirty, style_recalc, forced_reflows, jank) =
+    let (summary, scroll_frames, layout_dirty, style_recalc, forced_reflows, jank, (cpu_profile, cpu_cache)) =
         if events.len() >= PARALLEL_THRESHOLD {
             std::thread::scope(|s| {
                 let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
                 let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
-                let c = s.spawn(|| analysis::analyze_cpu_profile(events));
+                let c = s.spawn(|| analysis::analyze_cpu_profile_full(events));
                 let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
                 let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
                 let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
@@ -254,28 +257,29 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
                 (
                     a.join().unwrap(),
                     b.join().unwrap(),
-                    c.join().unwrap(),
                     d.join().unwrap(),
                     e.join().unwrap(),
                     f.join().unwrap(),
                     g.join().unwrap(),
+                    c.join().unwrap(),
                 )
             })
         } else {
             (
                 analysis::analyze_summary(events, main_tid),
                 analysis::analyze_scroll_frames(events, main_tid),
-                analysis::analyze_cpu_profile(events),
                 analysis::analyze_layout_dirty(events, main_tid),
                 analysis::analyze_style_recalc(events, main_tid),
                 analysis::analyze_forced_reflows(events, main_tid),
                 analysis::analyze_jank(events, main_tid, None),
+                analysis::analyze_cpu_profile_full(events),
             )
         };
     Ok(Analyzed {
         summary,
         scroll_frames,
         cpu_profile,
+        cpu_cache,
         layout_dirty,
         style_recalc,
         forced_reflows,
@@ -382,7 +386,7 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("  {} events", trace.trace_events.len());
     let name_a = trace::trace_stem(path);
     let Some(path_b) = cli.compare.as_deref().map(Path::new) else {
-        return inspect_output(&trace.trace_events, &name_a, cli);
+        return inspect_output(&trace.trace_events, &name_a, cli, None);
     };
     eprintln!("Loading {}...", path_b.display());
     let trace_b = trace::parse_trace(path_b)?;
@@ -418,8 +422,8 @@ fn inspect_compare_output(
             .as_deref()
             .map(|p| inspect::Matcher::new(p, cli.regex))
             .transpose()?;
-        print!("{}", inspect::stacks_folded(events_a, matcher.as_ref(), &ws_a.scope));
-        print!("{}", inspect::stacks_folded(events_b, matcher.as_ref(), &ws_b.scope));
+        print!("{}", inspect::stacks_folded(events_a, matcher.as_ref(), &ws_a.scope, None));
+        print!("{}", inspect::stacks_folded(events_b, matcher.as_ref(), &ws_b.scope, None));
         return Ok(());
     }
 
@@ -442,8 +446,8 @@ fn inspect_compare_output(
         None
     };
 
-    let sections_a = build_sections(events_a, min_ts_a, &ws_a, cli, compare.as_ref().map(|(da, _)| da))?;
-    let sections_b = build_sections(events_b, min_ts_b, &ws_b, cli, compare.as_ref().map(|(_, db)| db))?;
+    let sections_a = build_sections(events_a, min_ts_a, &ws_a, cli, compare.as_ref().map(|(da, _)| da), None)?;
+    let sections_b = build_sections(events_b, min_ts_b, &ws_b, cli, compare.as_ref().map(|(_, db)| db), None)?;
 
     if cli.json {
         let mut obj = serde_json::Map::new();
@@ -603,6 +607,7 @@ pub(crate) fn inspect_output(
     events: &[trace::TraceEvent],
     trace_name: &str,
     cli: &Cli,
+    cpu_cache: Option<&analysis::CpuProfileCache>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let min_ts = inspect::trace_start_us(events);
     let ws = resolve_windows(events, min_ts, cli)?;
@@ -614,11 +619,11 @@ pub(crate) fn inspect_output(
             .as_deref()
             .map(|p| inspect::Matcher::new(p, cli.regex))
             .transpose()?;
-        print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &ws.scope));
+        print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &ws.scope, cpu_cache));
         return Ok(());
     }
 
-    let sections = build_sections(events, min_ts, &ws, cli, None)?;
+    let sections = build_sections(events, min_ts, &ws, cli, None, cpu_cache)?;
     dispatch_output(&sections, trace_name, min_ts, &ws, cli)
 }
 
@@ -734,6 +739,7 @@ fn build_sections(
     ws: &WindowState,
     cli: &Cli,
     delta: Option<&windowed::DeltaData>,
+    cpu_cache: Option<&analysis::CpuProfileCache>,
 ) -> Result<Vec<Section>, Box<dyn std::error::Error>> {
     let scope = &ws.scope;
     let sort = match cli.sort.as_deref() {
@@ -802,11 +808,11 @@ fn build_sections(
         None
     };
     if let Some(m) = &func_matcher {
-        let (md, j) = inspect::functions_section(events, m, scope, cli.top, min_ts);
+        let (md, j) = inspect::functions_section(events, m, scope, cli.top, min_ts, cpu_cache);
         sections.push(("functions", md, j));
     }
     if cli.stacks {
-        let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), scope, cli.top, min_ts);
+        let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), scope, cli.top, min_ts, cpu_cache);
         sections.push(("stacks", md, j));
     }
     if cli.calltree {
@@ -822,6 +828,7 @@ fn build_sections(
             url_matcher.as_ref(),
             cli.top,
             min_ts,
+            cpu_cache,
         );
         sections.push(("calltree", md, j));
     }
@@ -835,7 +842,7 @@ fn build_sections(
     }
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
-        let (md, j) = inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts);
+        let (md, j) = inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts, cpu_cache);
         sections.push(("find", md, j));
     }
 
@@ -1269,6 +1276,7 @@ mod tests {
             false,
             30,
             1_000_000.0,
+            None,
         );
         assert!(md.contains("CPU profile matches (0"));
         let (md, _) = inspect::find_section(
@@ -1278,6 +1286,7 @@ mod tests {
             false,
             30,
             1_000_000.0,
+            None,
         );
         assert!(md.contains("CPU profile matches (2"));
     }
@@ -1466,6 +1475,7 @@ mod tests {
                 None,
                 30,
                 min_ts,
+                None,
             );
         }
     }

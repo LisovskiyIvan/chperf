@@ -207,7 +207,12 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
 
     // Inspect queries run against the session data (no re-parse).
     if cmd.is_inspect() {
-        inspect_output(&session.analyzed.trace.trace_events, &session.name_a, &cmd)?;
+        inspect_output(
+            &session.analyzed.trace.trace_events,
+            &session.name_a,
+            &cmd,
+            Some(&session.analyzed.cpu_cache),
+        )?;
         return Ok(Cmd::Done);
     }
 

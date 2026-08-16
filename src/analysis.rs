@@ -639,24 +639,38 @@ fn scan_profile_chunk(
     (node_map, self_times)
 }
 
+/// Test-only convenience wrapper; production code uses `analyze_cpu_profile_full`
+/// so the raw node table + self-times can be kept for the REPL cache.
+#[cfg(test)]
 pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
-    let (node_map, self_times) = scan_profile_chunks(events, None, 5);
+    analyze_cpu_profile_full(events).0
+}
 
+/// Full-trace CPU profile plus its reusable cache. The cache keeps the raw
+/// node table and self-times (which `analyze_cpu_profile` would otherwise
+/// drop) so REPL queries with an empty scope can skip re-scanning the trace.
+pub fn analyze_cpu_profile_full(events: &[TraceEvent]) -> (CpuProfileResult, CpuProfileCache) {
+    let (node_map, self_times) = scan_profile_chunks(events, None, 5);
+    let result = build_cpu_profile_result(&node_map, &self_times);
+    (result, CpuProfileCache { nodes: node_map, self_times })
+}
+
+fn build_cpu_profile_result(node_map: &ProfileNodes, self_times: &ProfileSelfTimes) -> CpuProfileResult {
     let mut functions: Vec<FunctionTime> = self_times
-        .into_iter()
+        .iter()
         .map(|(id, time)| {
             // Clone only the (name, url) of nodes that were actually sampled —
             // rebuilding the whole node table first would clone every node's
             // strings, including the (often large) unsampled majority.
             let (name, url) = node_map
-                .get(&id)
+                .get(id)
                 .map(|(n, u, _)| (n.clone(), u.clone()))
                 .unwrap_or_default();
             let source_type = classify_url(&url);
             FunctionTime {
                 function_name: name,
                 url,
-                self_time_us: time,
+                self_time_us: *time,
                 source_type,
             }
         })
@@ -688,6 +702,34 @@ pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
         app_time_us,
         runtime_time_us,
         native_time_us,
+    }
+}
+
+/// Reusable full-trace CPU profile (node table + per-node self-time).
+pub struct CpuProfileCache {
+    pub nodes: ProfileNodes,
+    pub self_times: ProfileSelfTimes,
+}
+
+impl CpuProfileCache {
+    /// True when `scope` is the full trace (no time/thread/process/category
+    /// filter), so the cached full-trace profile applies verbatim.
+    pub fn serves(&self, scope: &Scope) -> bool {
+        scope.window.is_none() && scope.tid.is_none() && scope.pid.is_none() && scope.cat.is_none()
+    }
+}
+
+/// Node table + self-times for `scope`, reused from `cache` when the scope is
+/// the full trace (a clone of the already-built maps), otherwise a fresh
+/// parallel scan.
+pub fn cpu_profile_for(
+    events: &[TraceEvent],
+    scope: &Scope,
+    cache: Option<&CpuProfileCache>,
+) -> (ProfileNodes, ProfileSelfTimes) {
+    match cache.filter(|c| c.serves(scope)) {
+        Some(c) => (c.nodes.clone(), c.self_times.clone()),
+        None => scan_profile_chunks(events, Some(scope), 0),
     }
 }
 
@@ -1717,5 +1759,29 @@ mod tests {
         for (id, t) in &times_serial[0] {
             assert_eq!(times_par[0].get(id), Some(t), "node {} self-time diverged", id);
         }
+    }
+
+    #[test]
+    fn cpu_profile_cache_matches_fresh_scan_on_full_scope() {
+        // The REPL cache is only consulted for an empty scope; it must return
+        // exactly what a fresh full-trace scan would.
+        let events = fixture_events();
+        let empty = Scope { window: None, tid: None, pid: None, cat: None };
+        let (result, cache) = analyze_cpu_profile_full(&events);
+        assert!(cache.serves(&empty));
+        assert!(!cache.serves(&Scope { window: Some((0.0, 1.0)), tid: None, pid: None, cat: None }));
+
+        let (cached_nodes, cached_times) = cpu_profile_for(&events, &empty, Some(&cache));
+        let (fresh_nodes, fresh_times) = cpu_profile_for(&events, &empty, None);
+        assert_eq!(cached_nodes.len(), fresh_nodes.len());
+        for (id, v) in &cached_nodes {
+            assert_eq!(fresh_nodes.get(id), Some(v));
+        }
+        assert_eq!(cached_times.len(), fresh_times.len());
+        for (id, t) in &cached_times {
+            assert_eq!(fresh_times.get(id), Some(t));
+        }
+        // The built result agrees with the raw self-times.
+        assert!(result.total_sample_time_us > 0.0);
     }
 }

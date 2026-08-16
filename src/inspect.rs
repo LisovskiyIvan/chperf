@@ -364,8 +364,9 @@ pub fn functions_section(
     scope: &Scope,
     top: usize,
     min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
-    let (node_map, self_times) = crate::analysis::scan_profile_chunks(events, Some(scope), 0);
+    let (node_map, self_times) = crate::analysis::cpu_profile_for(events, scope, cache);
     let total_in_scope: f64 = self_times.values().sum();
 
     let mut funcs: Vec<(&str, &str, f64)> = self_times
@@ -430,8 +431,12 @@ pub struct CpuProfile {
 
 /// Register all CPU profile nodes, and accumulate per-leaf sample time from
 /// in-scope chunks. Shared by `stacks_section` and `stacks_folded`.
-pub fn collect_cpu_profile(events: &[TraceEvent], scope: &Scope) -> CpuProfile {
-    let (nodes, leaf_time) = crate::analysis::scan_profile_chunks(events, Some(scope), 0);
+pub fn collect_cpu_profile(
+    events: &[TraceEvent],
+    scope: &Scope,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+) -> CpuProfile {
+    let (nodes, leaf_time) = crate::analysis::cpu_profile_for(events, scope, cache);
     CpuProfile { nodes, leaf_time }
 }
 
@@ -463,8 +468,9 @@ pub fn stacks_section(
     scope: &Scope,
     top: usize,
     min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
-    let cpu = collect_cpu_profile(events, scope);
+    let cpu = collect_cpu_profile(events, scope, cache);
     let node_map = cpu.nodes;
     let leaf_time = cpu.leaf_time;
 
@@ -547,8 +553,9 @@ pub fn stacks_folded(
     events: &[TraceEvent],
     matcher: Option<&Matcher>,
     scope: &Scope,
+    cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> String {
-    let cpu = collect_cpu_profile(events, scope);
+    let cpu = collect_cpu_profile(events, scope, cache);
     let mut leaves: Vec<(u64, f64)> = cpu
         .leaf_time
         .iter()
@@ -592,6 +599,7 @@ pub fn find_section(
     full_args: bool,
     top: usize,
     min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
     let mut matches: Vec<(&TraceEvent, String)> = Vec::new();
     let needle_label = matcher.label();
@@ -679,7 +687,7 @@ pub fn find_section(
     out.push('\n');
 
     // Combined search: also match CPU profile function names and source URLs.
-    let (node_map, self_times) = crate::analysis::scan_profile_chunks(events, Some(scope), 0);
+    let (node_map, self_times) = crate::analysis::cpu_profile_for(events, scope, cache);
     let mut cpu_matches: Vec<(String, String, f64)> = self_times
         .iter()
         .filter_map(|(id, t)| node_map.get(id).map(|(n, u, _)| (n.clone(), u.clone(), *t)))

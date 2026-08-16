@@ -436,8 +436,9 @@ pub fn calltree_section(
     url_matcher: Option<&Matcher>,
     top: usize,
     min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
-    let cpu = crate::inspect::collect_cpu_profile(events, scope);
+    let cpu = crate::inspect::collect_cpu_profile(events, scope, cache);
     let nodes = cpu.nodes;
     let self_time = cpu.leaf_time;
 
