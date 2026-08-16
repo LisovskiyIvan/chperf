@@ -641,15 +641,17 @@ fn scan_profile_chunk(
 
 pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
     let (node_map, self_times) = scan_profile_chunks(events, None, 5);
-    let node_map: HashMap<u64, (String, String)> = node_map
-        .into_iter()
-        .map(|(id, (n, u, _))| (id, (n, u)))
-        .collect();
 
     let mut functions: Vec<FunctionTime> = self_times
         .into_iter()
         .map(|(id, time)| {
-            let (name, url) = node_map.get(&id).cloned().unwrap_or_default();
+            // Clone only the (name, url) of nodes that were actually sampled —
+            // rebuilding the whole node table first would clone every node's
+            // strings, including the (often large) unsampled majority.
+            let (name, url) = node_map
+                .get(&id)
+                .map(|(n, u, _)| (n.clone(), u.clone()))
+                .unwrap_or_default();
             let source_type = classify_url(&url);
             FunctionTime {
                 function_name: name,
@@ -1362,14 +1364,19 @@ fn bucket_hot(busy: f64, max_run: f64, max_faf: f64, max_gpu: f64, dropped: u32)
 /// cluster, the dominating FunctionCalls are collected (the "what happened"
 /// chain). This catches spikes that the 50ms Long Task summary misses.
 pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>) -> JankResult {
-    let min_ts = events
-        .iter()
-        .filter(|e| !crate::trace::is_metadata_event(e))
-        .map(|e| e.ts)
-        .fold(f64::INFINITY, f64::min);
-    let max_ts = events
-        .iter()
-        .fold(0.0f64, |acc, e| acc.max(e.ts + e.dur.unwrap_or(0.0)));
+    // One pass for both bounds: min_ts skips metadata events (their ts is the
+    // process start), max_ts includes everything.
+    let mut min_ts = f64::INFINITY;
+    let mut max_ts = 0.0f64;
+    for e in events {
+        if !crate::trace::is_metadata_event(e) && e.ts < min_ts {
+            min_ts = e.ts;
+        }
+        let end = e.ts + e.dur.unwrap_or(0.0);
+        if end > max_ts {
+            max_ts = end;
+        }
+    }
     let span_us = (max_ts - min_ts).max(1.0);
 
     let bucket_ms = (span_us / 1000.0 / 2000.0).clamp(50.0, 1000.0);
