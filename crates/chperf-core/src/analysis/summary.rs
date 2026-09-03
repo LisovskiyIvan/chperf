@@ -19,6 +19,8 @@ pub struct SummaryResult {
     pub total_trace_duration_us: f64,
     pub main_thread_busy_us: f64, // total RunTask time on main thread
     pub event_stats: Vec<EventTypeStat>,
+    pub total_blocking_time_us: f64, // sum of (dur - 50ms) for main thread RunTasks > 50ms (TBT)
+    pub long_tasks_total_us: f64,    // total duration of all long tasks on main thread
 }
 
 /// Map an event name to its canonical `'static` key, or `None` if not tracked.
@@ -46,6 +48,8 @@ fn target_key(name: &str) -> Option<&'static str> {
 pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
     // Single pass over the trace: duration bounds, long tasks, busy time, stats.
     let mut long_task_durs: Vec<f64> = Vec::new();
+    let mut total_blocking_time_us = 0.0f64;
+    let mut long_tasks_total_us = 0.0f64;
     let mut stats_map: rustc_hash::FxHashMap<&'static str, (f64, usize)> = rustc_hash::FxHashMap::default();
     let mut main_thread_busy_us = 0.0f64;
     let mut min_ts = f64::INFINITY;
@@ -70,6 +74,8 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
                 main_thread_busy_us += d;
                 if d > 50_000.0 {
                     long_task_durs.push(d);
+                    total_blocking_time_us += d - 50_000.0;
+                    long_tasks_total_us += d;
                 }
             }
         if let Some(key) = target_key(e.name)
@@ -111,5 +117,7 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         total_trace_duration_us,
         main_thread_busy_us,
         event_stats,
+        total_blocking_time_us,
+        long_tasks_total_us,
     }
 }

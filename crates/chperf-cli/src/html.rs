@@ -516,8 +516,11 @@ pub fn export_html(
         let sa = &cmp.summary_a;
         let sb = &cmp.summary_b;
         let mut rows: Vec<Vec<String>> = vec![
+            vec!["Total Blocking Time (TBT)".into(), dur(sa.total_blocking_time_us), dur(sb.total_blocking_time_us), change_cell(sa.total_blocking_time_us, sb.total_blocking_time_us)],
             vec!["Long tasks".into(), format!("{}", sa.long_task_count), format!("{}", sb.long_task_count), change_cell(sa.long_task_count as f64, sb.long_task_count as f64)],
             vec!["Worst task".into(), dur(sa.long_tasks_top.first().copied().unwrap_or(0.0)), dur(sb.long_tasks_top.first().copied().unwrap_or(0.0)), change_cell(sa.long_tasks_top.first().copied().unwrap_or(0.0), sb.long_tasks_top.first().copied().unwrap_or(0.0))],
+            vec!["Dropped frames".into(), format!("{}", cmp.jank_a.total_dropped), format!("{}", cmp.jank_b.total_dropped), change_cell(cmp.jank_a.total_dropped as f64, cmp.jank_b.total_dropped as f64)],
+            vec!["Forced reflows".into(), format!("{}", cmp.forced_reflow_a.total_reflows), format!("{}", cmp.forced_reflow_b.total_reflows), change_cell(cmp.forced_reflow_a.total_reflows as f64, cmp.forced_reflow_b.total_reflows as f64)],
             vec!["Main thread busy".into(), dur(sa.main_thread_busy_us), dur(sb.main_thread_busy_us), change_cell(sa.main_thread_busy_us, sb.main_thread_busy_us)],
             vec!["Layout dirty (avg)".into(), format!("{:.0}", cmp.layout_a.avg_dirty), format!("{:.0}", cmp.layout_b.avg_dirty), change_cell(cmp.layout_a.avg_dirty, cmp.layout_b.avg_dirty)],
         ];
@@ -560,7 +563,15 @@ pub fn export_html(
                 .map(|d| {
                     let name = if d.function_name.is_empty() { "(anonymous)" } else { &d.function_name };
                     let pp = d.pct_b - d.pct_a;
+                    let diff_time_str = if d.diff_time_us > 0.0 {
+                        format!("+{}", dur(d.diff_time_us))
+                    } else {
+                        dur(d.diff_time_us)
+                    };
                     vec![
+                        dur(d.time_a_us),
+                        dur(d.time_b_us),
+                        diff_time_str,
                         format!("{:.1}%", d.pct_a),
                         format!("{:.1}%", d.pct_b),
                         format!("{:+.1}pp", pp),
@@ -569,7 +580,7 @@ pub fn export_html(
                     ]
                 })
                 .collect();
-            table(&mut o, &["A %", "B %", "Δ pp", "source", "function"], rows);
+            table(&mut o, &["A time", "B time", "Δ time", "A %", "B %", "Δ pp", "source", "function"], rows);
         }
         o.push_str("</section>");
 

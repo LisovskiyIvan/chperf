@@ -1,7 +1,9 @@
 //! Two-trace comparison: per-event averages, scroll frames, CPU diff, findings.
 
 use super::cpu::{CpuProfileResult, FunctionTime, SourceType};
+use super::jank::JankResult;
 use super::layout::LayoutDirtyResult;
+use super::reflow::ForcedReflowResult;
 use super::scroll::{FrameTask, ScrollFramePercentiles, ScrollFrameResult};
 use super::style::StyleRecalcResult;
 use super::summary::{EventTypeStat, SummaryResult};
@@ -16,6 +18,9 @@ pub struct CompareRow {
     pub avg_a_us: f64,
     pub avg_b_us: f64,
     pub diff_pct: f64,
+    pub total_a_us: f64,
+    pub total_b_us: f64,
+    pub diff_total_pct: f64,
 }
 
 #[derive(Clone)]
@@ -26,6 +31,7 @@ pub struct CpuFunctionDiff {
     pub source_type: SourceType,
     pub time_a_us: f64,
     pub time_b_us: f64,
+    pub diff_time_us: f64,
     pub pct_a: f64,
     pub pct_b: f64,
     pub diff_pct: f64,
@@ -39,7 +45,7 @@ pub struct Finding {
     pub detail: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum FindingSeverity {
     Improved,
@@ -63,6 +69,10 @@ pub struct CompareResult {
     pub layout_b: LayoutDirtyResult,
     pub style_recalc_a: StyleRecalcResult,
     pub style_recalc_b: StyleRecalcResult,
+    pub forced_reflow_a: ForcedReflowResult,
+    pub forced_reflow_b: ForcedReflowResult,
+    pub jank_a: JankResult,
+    pub jank_b: JankResult,
     pub findings: Vec<Finding>,
 }
 
@@ -86,6 +96,10 @@ pub fn analyze_compare(
     layout_b: &LayoutDirtyResult,
     style_recalc_a: &StyleRecalcResult,
     style_recalc_b: &StyleRecalcResult,
+    forced_reflow_a: &ForcedReflowResult,
+    forced_reflow_b: &ForcedReflowResult,
+    jank_a: &JankResult,
+    jank_b: &JankResult,
 ) -> CompareResult {
     // ── Event rows ──
     let map_a: HashMap<&str, &EventTypeStat> = summary_a
@@ -110,6 +124,8 @@ pub fn analyze_compare(
             let b = map_b.get(name);
             let avg_a = a.map(|s| s.avg_time_us).unwrap_or(0.0);
             let avg_b = b.map(|s| s.avg_time_us).unwrap_or(0.0);
+            let total_a = a.map(|s| s.total_time_us).unwrap_or(0.0);
+            let total_b = b.map(|s| s.total_time_us).unwrap_or(0.0);
             CompareRow {
                 event_name: name.to_string(),
                 count_a: a.map(|s| s.count).unwrap_or(0),
@@ -117,11 +133,20 @@ pub fn analyze_compare(
                 avg_a_us: avg_a,
                 avg_b_us: avg_b,
                 diff_pct: pct_diff(avg_a, avg_b),
+                total_a_us: total_a,
+                total_b_us: total_b,
+                diff_total_pct: pct_diff(total_a, total_b),
             }
         })
         .collect();
 
-    rows.sort_by(|a, b| b.diff_pct.abs().partial_cmp(&a.diff_pct.abs()).unwrap());
+    // Sort by absolute diff in total time (most impactful time change first)
+    rows.sort_by(|a, b| {
+        (b.total_b_us - b.total_a_us)
+            .abs()
+            .partial_cmp(&(a.total_b_us - a.total_a_us).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // ── Scroll frame ──
     let scroll_avg_a = if scroll_a.tasks.is_empty() {
@@ -173,12 +198,14 @@ pub fn analyze_compare(
                 .map(|f| f.source_type.clone())
                 .or_else(|| fb.map(|f| f.source_type.clone()))
                 .unwrap_or(SourceType::Native);
+            let diff_time_us = time_b - time_a;
             CpuFunctionDiff {
                 function_name: name.to_string(),
                 url: url.to_string(),
                 source_type: source,
                 time_a_us: time_a,
                 time_b_us: time_b,
+                diff_time_us,
                 pct_a,
                 pct_b,
                 diff_pct: pct_diff(time_a, time_b),
@@ -187,19 +214,54 @@ pub fn analyze_compare(
         .filter(|d| d.time_a_us > 0.0 || d.time_b_us > 0.0)
         .collect();
 
-    // Sort by absolute diff in percentage points (most impactful first)
+    // Sort by absolute diff in self-time (most impactful first),
+    // tie-breaking by percentage point difference.
     cpu_diff.sort_by(|a, b| {
-        (b.pct_b - b.pct_a)
+        b.diff_time_us
             .abs()
-            .partial_cmp(&(a.pct_b - a.pct_a).abs())
-            .unwrap()
+            .partial_cmp(&a.diff_time_us.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (b.pct_b - b.pct_a)
+                    .abs()
+                    .partial_cmp(&(a.pct_b - a.pct_a).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     cpu_diff.truncate(30); // top 30
 
     // ── Findings ──
     let mut findings = Vec::new();
 
-    // Long task comparison
+    // Total Blocking Time (TBT) comparison
+    let tbt_diff = pct_diff(
+        summary_a.total_blocking_time_us,
+        summary_b.total_blocking_time_us,
+    );
+    if tbt_diff.abs() > 10.0 || (summary_a.total_blocking_time_us - summary_b.total_blocking_time_us).abs() >= 20_000.0 {
+        let improved = summary_b.total_blocking_time_us < summary_a.total_blocking_time_us;
+        findings.push(Finding {
+            severity: if improved {
+                FindingSeverity::Improved
+            } else {
+                FindingSeverity::Regressed
+            },
+            category: "Total Blocking Time".to_string(),
+            message: format!(
+                "{:.1}ms -> {:.1}ms ({:+.0}%)",
+                summary_a.total_blocking_time_us / 1000.0,
+                summary_b.total_blocking_time_us / 1000.0,
+                tbt_diff
+            ),
+            detail: if improved {
+                "Decreased main-thread blocking time".to_string()
+            } else {
+                "Increased main-thread blocking time (>50ms task slices)".to_string()
+            },
+        });
+    }
+
+    // Long task count comparison
     let lt_diff = pct_diff(
         summary_a.long_task_count as f64,
         summary_b.long_task_count as f64,
@@ -222,6 +284,56 @@ pub fn analyze_compare(
                 "More long tasks blocking the main thread".to_string()
             },
         });
+    }
+
+    // Dropped Frames comparison
+    if jank_a.total_dropped != jank_b.total_dropped {
+        let diff = jank_b.total_dropped as isize - jank_a.total_dropped as isize;
+        let improved = diff < 0;
+        findings.push(Finding {
+            severity: if improved {
+                FindingSeverity::Improved
+            } else {
+                FindingSeverity::Regressed
+            },
+            category: "Dropped Frames".to_string(),
+            message: format!("{} -> {} ({:+})", jank_a.total_dropped, jank_b.total_dropped, diff),
+            detail: if improved {
+                "Fewer dropped frames".to_string()
+            } else {
+                "More dropped frames causing visual jank".to_string()
+            },
+        });
+    }
+
+    // Forced Reflow (Layout Thrashing) comparison
+    if forced_reflow_a.total_reflows != forced_reflow_b.total_reflows {
+        let reflow_diff = pct_diff(
+            forced_reflow_a.total_reflows as f64,
+            forced_reflow_b.total_reflows as f64,
+        );
+        let improved = forced_reflow_b.total_reflows < forced_reflow_a.total_reflows;
+        if reflow_diff.abs() > 10.0 || (forced_reflow_a.total_reflows as isize - forced_reflow_b.total_reflows as isize).abs() >= 2 {
+            findings.push(Finding {
+                severity: if improved {
+                    FindingSeverity::Improved
+                } else {
+                    FindingSeverity::Regressed
+                },
+                category: "Forced Reflows".to_string(),
+                message: format!(
+                    "{} -> {} reflows ({:+.0}%)",
+                    forced_reflow_a.total_reflows,
+                    forced_reflow_b.total_reflows,
+                    reflow_diff
+                ),
+                detail: format!(
+                    "Thrashing time: {:.1}ms -> {:.1}ms",
+                    forced_reflow_a.total_layout_time_us / 1000.0,
+                    forced_reflow_b.total_layout_time_us / 1000.0,
+                ),
+            });
+        }
     }
 
     // Scroll frame duration
@@ -391,6 +503,37 @@ pub fn analyze_compare(
         }
     }
 
+    // Specific CPU function regressions (≥20ms and ≥15%)
+    for d in &cpu_diff {
+        if d.diff_time_us >= 20_000.0 && (d.diff_pct >= 15.0 || d.time_a_us == 0.0) {
+            let fn_name = if d.function_name.is_empty() {
+                "(anonymous)"
+            } else {
+                &d.function_name
+            };
+            findings.push(Finding {
+                severity: FindingSeverity::Regressed,
+                category: "CPU Function".to_string(),
+                message: format!(
+                    "{}: +{:.1}ms ({:+.0}%)",
+                    fn_name,
+                    d.diff_time_us / 1000.0,
+                    d.diff_pct
+                ),
+                detail: if d.url.is_empty() {
+                    d.source_type.label().to_string()
+                } else {
+                    let short_url = if let Some(idx) = d.url.rfind('/') {
+                        &d.url[idx + 1..]
+                    } else {
+                        &d.url
+                    };
+                    format!("{short_url} ({})", d.source_type.label())
+                },
+            });
+        }
+    }
+
     // Sort findings: regressions first, then improvements
     findings.sort_by(|a, b| {
         let ord_a = match a.severity {
@@ -421,6 +564,172 @@ pub fn analyze_compare(
         layout_b: layout_b.clone(),
         style_recalc_a: style_recalc_a.clone(),
         style_recalc_b: style_recalc_b.clone(),
+        forced_reflow_a: forced_reflow_a.clone(),
+        forced_reflow_b: forced_reflow_b.clone(),
+        jank_a: jank_a.clone(),
+        jank_b: jank_b.clone(),
         findings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_summary(busy: f64, tbt: f64, lt_count: usize, stats: Vec<EventTypeStat>) -> SummaryResult {
+        SummaryResult {
+            long_task_count: lt_count,
+            long_tasks_top: vec![],
+            total_trace_duration_us: 5_000_000.0,
+            main_thread_busy_us: busy,
+            event_stats: stats,
+            total_blocking_time_us: tbt,
+            long_tasks_total_us: tbt + (lt_count as f64 * 50_000.0),
+        }
+    }
+
+    fn dummy_scroll() -> ScrollFrameResult {
+        ScrollFrameResult {
+            tasks: vec![],
+            avg: FrameTask {
+                ts: 0.0,
+                dur_us: 0.0,
+                js_us: 0.0,
+                ult_us: 0.0,
+                paint_us: 0.0,
+                composite_us: 0.0,
+                hit_test_us: 0.0,
+                layout_us: 0.0,
+            },
+            percentiles: ScrollFramePercentiles {
+                p50_us: 0.0,
+                p90_us: 0.0,
+                p99_us: 0.0,
+            },
+        }
+    }
+
+    fn dummy_cpu(funcs: Vec<FunctionTime>, total: f64) -> CpuProfileResult {
+        CpuProfileResult {
+            functions: funcs,
+            total_sample_time_us: total,
+            app_time_us: total,
+            runtime_time_us: 0.0,
+            native_time_us: 0.0,
+        }
+    }
+
+    fn dummy_layout() -> LayoutDirtyResult {
+        LayoutDirtyResult {
+            entries: vec![],
+            avg_dirty: 0.0,
+            max_dirty: 0,
+            avg_ratio: 0.0,
+        }
+    }
+
+    fn dummy_style() -> StyleRecalcResult {
+        StyleRecalcResult {
+            entries: vec![],
+            avg_elements: 0.0,
+            max_elements: 0,
+            total_count: 0,
+        }
+    }
+
+    fn dummy_reflow(reflows: usize) -> ForcedReflowResult {
+        ForcedReflowResult {
+            entries: vec![],
+            total_reflows: reflows,
+            total_layout_time_us: (reflows as f64) * 10_000.0,
+        }
+    }
+
+    fn dummy_jank(dropped: usize) -> JankResult {
+        JankResult {
+            clusters: vec![],
+            total_dropped: dropped,
+            bucket_ms: 100.0,
+        }
+    }
+
+    #[test]
+    fn cpu_diff_sorts_by_absolute_time_delta() {
+        // Function 1: took 20% in A (200ms) and 20% in B (1200ms) -> +1000ms delta, 0pp difference!
+        // Function 2: took 1% in A (10ms) and 3% in B (180ms) -> +170ms delta, +2pp difference.
+        let f1_a = FunctionTime {
+            function_name: "renderWorld".to_string(),
+            url: "world.ts".to_string(),
+            self_time_us: 200_000.0,
+            source_type: SourceType::AppCode,
+        };
+        let f2_a = FunctionTime {
+            function_name: "tinyHelper".to_string(),
+            url: "helper.ts".to_string(),
+            self_time_us: 10_000.0,
+            source_type: SourceType::AppCode,
+        };
+
+        let f1_b = FunctionTime {
+            function_name: "renderWorld".to_string(),
+            url: "world.ts".to_string(),
+            self_time_us: 1_200_000.0,
+            source_type: SourceType::AppCode,
+        };
+        let f2_b = FunctionTime {
+            function_name: "tinyHelper".to_string(),
+            url: "helper.ts".to_string(),
+            self_time_us: 180_000.0,
+            source_type: SourceType::AppCode,
+        };
+
+        let cpu_a = dummy_cpu(vec![f1_a, f2_a], 1_000_000.0);
+        let cpu_b = dummy_cpu(vec![f1_b, f2_b], 6_000_000.0);
+
+        let sum_a = dummy_summary(1_000_000.0, 0.0, 0, vec![]);
+        let sum_b = dummy_summary(6_000_000.0, 0.0, 0, vec![]);
+
+        let cmp = analyze_compare(
+            &sum_a, &sum_b,
+            &dummy_scroll(), &dummy_scroll(),
+            &cpu_a, &cpu_b,
+            &dummy_layout(), &dummy_layout(),
+            &dummy_style(), &dummy_style(),
+            &dummy_reflow(0), &dummy_reflow(0),
+            &dummy_jank(0), &dummy_jank(0),
+        );
+
+        // renderWorld (+1000ms) must be ranked ahead of tinyHelper (+170ms)
+        assert_eq!(cmp.cpu_diff[0].function_name, "renderWorld");
+        assert_eq!(cmp.cpu_diff[0].diff_time_us, 1_000_000.0);
+        assert_eq!(cmp.cpu_diff[1].function_name, "tinyHelper");
+    }
+
+    #[test]
+    fn compare_flags_tbt_dropped_frames_and_reflow_regressions() {
+        let sum_a = dummy_summary(100_000.0, 20_000.0, 1, vec![]);
+        let sum_b = dummy_summary(800_000.0, 450_000.0, 5, vec![]);
+
+        let cmp = analyze_compare(
+            &sum_a, &sum_b,
+            &dummy_scroll(), &dummy_scroll(),
+            &dummy_cpu(vec![], 0.0), &dummy_cpu(vec![], 0.0),
+            &dummy_layout(), &dummy_layout(),
+            &dummy_style(), &dummy_style(),
+            &dummy_reflow(1), &dummy_reflow(8),
+            &dummy_jank(2), &dummy_jank(15),
+        );
+
+        let tbt_finding = cmp.findings.iter().find(|f| f.category == "Total Blocking Time");
+        assert!(tbt_finding.is_some(), "missing TBT finding");
+        assert_eq!(tbt_finding.unwrap().severity, FindingSeverity::Regressed);
+
+        let jank_finding = cmp.findings.iter().find(|f| f.category == "Dropped Frames");
+        assert!(jank_finding.is_some(), "missing Dropped Frames finding");
+        assert_eq!(jank_finding.unwrap().severity, FindingSeverity::Regressed);
+
+        let reflow_finding = cmp.findings.iter().find(|f| f.category == "Forced Reflows");
+        assert!(reflow_finding.is_some(), "missing Forced Reflows finding");
+        assert_eq!(reflow_finding.unwrap().severity, FindingSeverity::Regressed);
     }
 }

@@ -125,8 +125,13 @@ fn export_overview(out: &mut String, summary: &SummaryResult, name: &str) {
         fmt_us(summary.main_thread_busy_us)
     ));
     out.push_str(&format!(
-        "- **Long Tasks (>50ms)**: {}\n",
-        summary.long_task_count
+        "- **Total Blocking Time (TBT)**: {}\n",
+        fmt_us(summary.total_blocking_time_us)
+    ));
+    out.push_str(&format!(
+        "- **Long Tasks (>50ms)**: {} ({})\n",
+        summary.long_task_count,
+        fmt_us(summary.long_tasks_total_us)
     ));
 
     if !summary.long_tasks_top.is_empty() {
@@ -348,16 +353,32 @@ fn export_forced_reflows(out: &mut String, fr: &ForcedReflowResult) {
     out.push_str(&format!("- **Total reflows**: {}\n", fr.total_reflows));
     out.push_str(&format!("- **Total layout time**: {}\n\n", fmt_us(fr.total_layout_time_us)));
 
-    out.push_str("| # | Task Duration | Reflows | Layout Time |\n");
-    out.push_str("|---|---------------|---------|-------------|\n");
-    for (i, e) in fr.entries.iter().take(10).enumerate() {
-        out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            i + 1,
-            fmt_us(e.task_dur_us),
-            e.reflow_count,
-            fmt_us(e.layout_time_us),
-        ));
+    let has_initiator = fr.entries.iter().any(|e| e.initiator.is_some());
+    if has_initiator {
+        out.push_str("| # | Task Duration | Reflows | Layout Time | Initiator |\n");
+        out.push_str("|---|---------------|---------|-------------|-----------|\n");
+        for (i, e) in fr.entries.iter().take(10).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_us(e.task_dur_us),
+                e.reflow_count,
+                fmt_us(e.layout_time_us),
+                e.initiator.as_deref().unwrap_or("-"),
+            ));
+        }
+    } else {
+        out.push_str("| # | Task Duration | Reflows | Layout Time |\n");
+        out.push_str("|---|---------------|---------|-------------|\n");
+        for (i, e) in fr.entries.iter().take(10).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_us(e.task_dur_us),
+                e.reflow_count,
+                fmt_us(e.layout_time_us),
+            ));
+        }
     }
     out.push('\n');
 }
@@ -628,6 +649,13 @@ fn export_compare_summary(
 
     let mut notes: Vec<String> = Vec::new();
 
+    // Total Blocking Time (TBT)
+    let tbt_change = pct_diff(sa.total_blocking_time_us, sb.total_blocking_time_us);
+    notes.push(format!(
+        "Total Blocking Time (TBT): {} → {} ({}).",
+        fmt_us(sa.total_blocking_time_us), fmt_us(sb.total_blocking_time_us), tbt_change,
+    ));
+
     // Long Tasks
     let lt_change = if sa.long_task_count > 0 {
         pct_diff(sa.long_task_count as f64, sb.long_task_count as f64).to_string()
@@ -638,6 +666,28 @@ fn export_compare_summary(
         "Long Tasks: {} → {} ({}). Includes non-scroll tasks.",
         sa.long_task_count, sb.long_task_count, lt_change,
     ));
+
+    // Dropped Frames
+    if cmp.jank_a.total_dropped > 0 || cmp.jank_b.total_dropped > 0 {
+        let diff = cmp.jank_b.total_dropped as isize - cmp.jank_a.total_dropped as isize;
+        notes.push(format!(
+            "Dropped Frames: {} → {} ({:+}).",
+            cmp.jank_a.total_dropped, cmp.jank_b.total_dropped, diff,
+        ));
+    }
+
+    // Forced Reflows
+    if cmp.forced_reflow_a.total_reflows > 0 || cmp.forced_reflow_b.total_reflows > 0 {
+        let reflow_diff = pct_diff(
+            cmp.forced_reflow_a.total_reflows as f64,
+            cmp.forced_reflow_b.total_reflows as f64,
+        );
+        notes.push(format!(
+            "Forced Reflows: {} → {} ({}). Thrashing time: {} → {}.",
+            cmp.forced_reflow_a.total_reflows, cmp.forced_reflow_b.total_reflows, reflow_diff,
+            fmt_us(cmp.forced_reflow_a.total_layout_time_us), fmt_us(cmp.forced_reflow_b.total_layout_time_us),
+        ));
+    }
 
     // Main Thread Busy
     let busy_change = pct_diff(sa.main_thread_busy_us, sb.main_thread_busy_us);
@@ -714,6 +764,12 @@ fn export_compare(
     let sb = &cmp.summary_b;
 
     out.push_str(&format!(
+        "| Total Blocking Time (TBT) | {} | {} | {} |\n",
+        fmt_us(sa.total_blocking_time_us),
+        fmt_us(sb.total_blocking_time_us),
+        pct_diff(sa.total_blocking_time_us, sb.total_blocking_time_us),
+    ));
+    out.push_str(&format!(
         "| Long Tasks | {} | {} | {} |\n",
         sa.long_task_count,
         sb.long_task_count,
@@ -727,6 +783,22 @@ fn export_compare(
             sa.long_tasks_top.first().copied().unwrap_or(0.0),
             sb.long_tasks_top.first().copied().unwrap_or(0.0)
         ),
+    ));
+    out.push_str(&format!(
+        "| Dropped Frames | {} | {} | {} |\n",
+        cmp.jank_a.total_dropped,
+        cmp.jank_b.total_dropped,
+        if cmp.jank_a.total_dropped == cmp.jank_b.total_dropped {
+            "0%".to_string()
+        } else {
+            format!("{:+}", cmp.jank_b.total_dropped as isize - cmp.jank_a.total_dropped as isize)
+        },
+    ));
+    out.push_str(&format!(
+        "| Forced Reflows | {} | {} | {} |\n",
+        cmp.forced_reflow_a.total_reflows,
+        cmp.forced_reflow_b.total_reflows,
+        pct_diff(cmp.forced_reflow_a.total_reflows as f64, cmp.forced_reflow_b.total_reflows as f64),
     ));
     out.push_str(&format!(
         "| Main Thread Busy | {} | {} | {} |\n",
@@ -758,12 +830,45 @@ fn export_compare(
 
     // Scroll frame comparison
     if let (Some(avg_a), Some(avg_b)) = (&cmp.scroll_avg_a, &cmp.scroll_avg_b) {
-        out.push_str("### Scroll Frame Comparison (per task avg)\n\n");
+        out.push_str("### Scroll Frame Comparison\n\n");
+        out.push_str("| Metric | A | B | Change |\n");
+        out.push_str("|--------|---|---|--------|\n");
+        out.push_str(&format!(
+            "| Tasks | {} | {} | {} |\n",
+            cmp.scroll_count_a,
+            cmp.scroll_count_b,
+            pct_diff(cmp.scroll_count_a as f64, cmp.scroll_count_b as f64)
+        ));
+        out.push_str(&format!(
+            "| Avg Duration | {} | {} | {} |\n",
+            fmt_us(avg_a.dur_us),
+            fmt_us(avg_b.dur_us),
+            pct_diff(avg_a.dur_us, avg_b.dur_us)
+        ));
+        out.push_str(&format!(
+            "| P50 | {} | {} | {} |\n",
+            fmt_us(cmp.scroll_pct_a.p50_us),
+            fmt_us(cmp.scroll_pct_b.p50_us),
+            pct_diff(cmp.scroll_pct_a.p50_us, cmp.scroll_pct_b.p50_us)
+        ));
+        out.push_str(&format!(
+            "| P90 | {} | {} | {} |\n",
+            fmt_us(cmp.scroll_pct_a.p90_us),
+            fmt_us(cmp.scroll_pct_b.p90_us),
+            pct_diff(cmp.scroll_pct_a.p90_us, cmp.scroll_pct_b.p90_us)
+        ));
+        out.push_str(&format!(
+            "| P99 | {} | {} | {} |\n\n",
+            fmt_us(cmp.scroll_pct_a.p99_us),
+            fmt_us(cmp.scroll_pct_b.p99_us),
+            pct_diff(cmp.scroll_pct_a.p99_us, cmp.scroll_pct_b.p99_us)
+        ));
+
+        out.push_str("#### Cost Breakdown (Average per Task)\n\n");
         out.push_str("| Category | A | B | Change |\n");
         out.push_str("|----------|---|---|--------|\n");
 
         let cats = [
-            ("Duration", avg_a.dur_us, avg_b.dur_us),
             ("JS", avg_a.js_us, avg_b.js_us),
             ("Style (ULT)", avg_a.ult_us, avg_b.ult_us),
             ("Layout", avg_a.layout_us, avg_b.layout_us),
@@ -771,6 +876,7 @@ fn export_compare(
             ("Composite", avg_a.composite_us, avg_b.composite_us),
             ("HitTest", avg_a.hit_test_us, avg_b.hit_test_us),
         ];
+
         for (name, a, b) in &cats {
             out.push_str(&format!(
                 "| {} | {} | {} | {} |\n",
@@ -792,17 +898,22 @@ fn export_compare(
         ));
     }
 
-    // Event average comparison
-    out.push_str("### Per-Event Average Comparison\n\n");
-    out.push_str("| Event | Avg (A) | Avg (B) | Change |\n");
-    out.push_str("|-------|---------|---------|--------|\n");
+    // Event comparison (Total, Avg, Count)
+    out.push_str("### Per-Event Comparison\n\n");
+    out.push_str("| Event | Total (A) | Total (B) | Δ Total | Avg (A) | Avg (B) | Δ Avg | Count (A) | Count (B) |\n");
+    out.push_str("|-------|-----------|-----------|---------|---------|---------|-------|-----------|-----------|\n");
     for r in &cmp.rows {
         out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             r.event_name,
+            fmt_us(r.total_a_us),
+            fmt_us(r.total_b_us),
+            pct_diff(r.total_a_us, r.total_b_us),
             fmt_us(r.avg_a_us),
             fmt_us(r.avg_b_us),
             pct_diff(r.avg_a_us, r.avg_b_us),
+            r.count_a,
+            r.count_b,
         ));
     }
     out.push('\n');
@@ -810,8 +921,8 @@ fn export_compare(
     // CPU profile diff
     if !cmp.cpu_diff.is_empty() {
         out.push_str("### CPU Profile Diff (Top Functions by Impact)\n\n");
-        out.push_str("| Source | Function | A % | B % | Change (pp) |\n");
-        out.push_str("|--------|----------|-----|-----|-------------|\n");
+        out.push_str("| Source | Function | Time (A) | Time (B) | Δ Time | A % | B % | Change (pp) |\n");
+        out.push_str("|--------|----------|----------|----------|--------|-----|-----|-------------|\n");
         for d in cmp.cpu_diff.iter().take(20) {
             let name = if d.function_name.is_empty() {
                 "(anonymous)"
@@ -824,10 +935,18 @@ fn export_compare(
             } else {
                 format!("{:.1}pp", pp)
             };
+            let diff_time_str = if d.diff_time_us > 0.0 {
+                format!("+{}", fmt_us(d.diff_time_us))
+            } else {
+                fmt_us(d.diff_time_us)
+            };
             out.push_str(&format!(
-                "| {} | {} | {:.1}% | {:.1}% | {} |\n",
+                "| {} | {} | {} | {} | {} | {:.1}% | {:.1}% | {} |\n",
                 d.source_type.label(),
                 name,
+                fmt_us(d.time_a_us),
+                fmt_us(d.time_b_us),
+                diff_time_str,
                 d.pct_a,
                 d.pct_b,
                 pp_str,

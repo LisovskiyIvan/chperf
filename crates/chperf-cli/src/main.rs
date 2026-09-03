@@ -112,6 +112,10 @@ fn build_app(
             &bb.layout_dirty,
             &a.style_recalc,
             &bb.style_recalc,
+            &a.forced_reflows,
+            &bb.forced_reflows,
+            &a.jank,
+            &bb.jank,
         );
         (Some(cmp), Some(name_b))
     } else {
