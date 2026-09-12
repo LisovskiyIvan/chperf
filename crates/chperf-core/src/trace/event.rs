@@ -2,12 +2,38 @@
 
 use serde::Deserialize;
 
-/// Intern an event name into a `&'static str`. Chrome traces reuse a small
-/// set of names across millions of events, so interning turns one heap
-/// allocation per event into a shared reference — a large memory win and
-/// better cache locality. Distinct names are leaked (bounded by the trace's
-/// vocabulary, a few hundred entries at most).
+/// Intern an event name or category into a `&'static str`. Chrome traces reuse
+/// a small set of names and categories across millions of events, so
+/// interning turns one heap allocation per event into a shared reference —
+/// a large memory win and better cache locality. Distinct strings are leaked
+/// (bounded by the trace's vocabulary, a few hundred entries at most).
+/// Lookups are cached in a per-thread memo, so the hot path never touches
+/// the global lock; every cached value comes from the global table, so equal
+/// strings still share one pointer across threads.
 pub(crate) fn intern_name(s: &str) -> &'static str {
+    thread_local! {
+        // Per-thread memo of the global intern table: the vocabulary is tiny
+        // (a few hundred entries), so after warmup every lookup is a local
+        // hash hit and the global RwLock is never touched on the hot path.
+        // Values always come from the global table, so equal strings still
+        // share one pointer across threads.
+        static LOCAL: std::cell::RefCell<rustc_hash::FxHashMap<&'static str, &'static str>> =
+            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    }
+    LOCAL.with(|m| {
+        if let Some(&v) = m.borrow().get(s) {
+            return v;
+        }
+        let v = intern_global(s);
+        m.borrow_mut().insert(v, v);
+        v
+    })
+}
+
+/// Global intern table backing `intern_name`: the source of truth for
+/// pointer identity. The thread-local memo only ever stores values returned
+/// from here.
+fn intern_global(s: &str) -> &'static str {
     use std::sync::{OnceLock, RwLock};
     static TABLE: OnceLock<RwLock<rustc_hash::FxHashSet<&'static str>>> = OnceLock::new();
     let table = TABLE.get_or_init(|| RwLock::new(rustc_hash::FxHashSet::default()));
@@ -30,9 +56,9 @@ pub(crate) fn intern_name(s: &str) -> &'static str {
     leaked
 }
 
-/// A single parsed event. `name` is interned (see `intern_name`) and `ph` is
-/// a single byte, so the struct is compact: no per-event allocation for the
-/// name or the phase.
+/// A single parsed event. `name` and `cat` are interned (see `intern_name`)
+/// and `ph` is a single byte, so the struct is compact: no per-event
+/// allocation for the name, the category, or the phase.
 pub struct TraceEvent {
     /// Interned event name (see `intern_name`): a shared `&'static str`
     /// instead of a per-event `String` allocation.
@@ -55,13 +81,20 @@ pub struct TraceEvent {
     #[allow(dead_code)]
     pub pid: u64,
     #[allow(dead_code)]
-    pub cat: Option<Box<str>>,
+    /// Interned category (see `intern_name`): categories repeat heavily
+    /// (a few dozen distinct values), so this is a shared `&'static str`
+    /// instead of a per-event allocation.
+    pub cat: Option<&'static str>,
     /// Raw `args` JSON text. The fast tokenizer captures the byte range
     /// without parsing; serde_json's RawValue would validate (full parse) on
     /// construction, which is exactly what we're avoiding. Owned as `Box<str>`
     /// (16 bytes vs 24 for `String`, immutable after parse).
     pub args: Option<Box<str>>,
-    pub(crate) args_cache: std::sync::OnceLock<Option<serde_json::Value>>,
+    /// Lazily-parsed `args` JSON, boxed so the inline representation is
+    /// 8 bytes (`OnceLock<Option<Box<Value>>>`) instead of 32 for an inline
+    /// `Value`. The parsed value is only allocated on the first `args_value()`
+    /// call; unparsed events pay just the `OnceLock` header.
+    pub(crate) args_cache: std::sync::OnceLock<Option<Box<serde_json::Value>>>,
 }
 
 impl<'de> Deserialize<'de> for TraceEvent {
@@ -70,8 +103,8 @@ impl<'de> Deserialize<'de> for TraceEvent {
         D: serde::Deserializer<'de>,
     {
         // Serde fallback (the fast tokenizer is the primary path): deserialize
-        // into an owned shadow struct, then intern the name and fold the phase
-        // to its first byte. A derived impl would treat `name: &'static str`
+        // into an owned shadow struct, then intern the name and category and
+        // fold the phase to its first byte. A derived impl would treat `name: &'static str`
         // as a borrowed `&str` field and force `'de: 'static`, which breaks
         // the streaming `Deserializer::from_slice` borrow.
         #[derive(Deserialize)]
@@ -105,7 +138,7 @@ impl<'de> Deserialize<'de> for TraceEvent {
             dur: h.dur,
             tid: h.tid,
             pid: h.pid,
-            cat: h.cat,
+            cat: h.cat.as_deref().map(intern_name),
             args: h.args,
             args_cache: std::sync::OnceLock::new(),
         })
@@ -152,7 +185,7 @@ impl Clone for TraceEvent {
             dur: self.dur,
             tid: self.tid,
             pid: self.pid,
-            cat: self.cat.clone(),
+            cat: self.cat,
             args: self.args.clone(),
             args_cache: std::sync::OnceLock::new(),
         }
@@ -165,16 +198,134 @@ impl TraceEvent {
     pub fn args_value(&self) -> Option<&serde_json::Value> {
         self.args_cache
             .get_or_init(|| {
-                self.args
-                    .as_deref()
+                self.args.as_deref()
                     .and_then(|r| serde_json::from_str(r).ok())
+                    .map(Box::new)
             })
-            .as_ref()
+            .as_deref()
     }
 
     /// Raw `args` JSON text, or `None`.
     #[allow(dead_code)]
     pub fn args_raw(&self) -> Option<&str> {
         self.args.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_from_json(s: &str) -> TraceEvent {
+        serde_json::from_str(s).expect("test event must deserialize")
+    }
+
+    /// The thread-local memo must not break global pointer identity: the
+    /// same string interned on two different threads yields one pointer.
+    #[test]
+    fn intern_name_shares_pointer_across_threads() {
+        let a = intern_name("chperf-test-cross-thread-cat");
+        let b = std::thread::spawn(|| intern_name("chperf-test-cross-thread-cat"))
+            .join()
+            .expect("worker must not panic");
+        assert!(std::ptr::eq(a, b), "interned pointers must match across threads");
+        // And the main thread's memo serves the same pointer on repeat.
+        assert!(std::ptr::eq(a, intern_name("chperf-test-cross-thread-cat")));
+    }
+
+    /// Equal `cat` values intern to the same pointer (serde fallback path),
+    /// and a different category compares unequal.
+    #[test]
+    fn cat_interning_shares_pointer_for_equal_values() {
+        // Individually-built JSON strings so each `cat` starts as its own
+        // allocation before interning (serde always allocates fresh Strings
+        // while deserializing, whatever the source literal).
+        let a = event_from_json(r#"{"name":"RunTask","cat":"devtools.timeline","ph":"X","ts":1.0}"#);
+        let b = event_from_json(r#"{"name":"RunTask","cat":"devtools.timeline","ph":"X","ts":2.0}"#);
+        let c = event_from_json(r#"{"name":"RunTask","cat":"v8","ph":"X","ts":3.0}"#);
+        let (Some(ca), Some(cb), Some(cc)) = (a.cat, b.cat, c.cat) else {
+            panic!("cats must survive the serde fallback path");
+        };
+        assert_eq!(ca, "devtools.timeline");
+        assert!(std::ptr::eq(ca, cb), "same cat must share one interned pointer");
+        assert_eq!(ca, cb);
+        assert_ne!(ca, cc);
+        assert!(!std::ptr::eq(ca, cc));
+        // Missing `cat` stays `None`.
+        let n = event_from_json(r#"{"name":"RunTask","ph":"X","ts":4.0}"#);
+        assert!(n.cat.is_none());
+    }
+
+    /// The fast tokenizer path interns `cat` too: same-cat events from a
+    /// real `parse_trace` share one pointer.
+    #[test]
+    fn cat_interned_on_fast_path() {
+        let json = serde_json::json!({
+            "traceEvents": [
+                {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1.0, "pid": 1, "tid": 1},
+                {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 2.0, "pid": 1, "tid": 1},
+                {"name": "V8", "cat": "v8", "ph": "X", "ts": 3.0, "pid": 1, "tid": 1}
+            ]
+        });
+        let path =
+            std::env::temp_dir().join(format!("chperf-cat-intern-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let trace = super::super::parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let evs = &trace.trace_events;
+        assert_eq!(evs.len(), 3);
+        let (Some(ca), Some(cb), Some(cc)) = (evs[0].cat, evs[1].cat, evs[2].cat) else {
+            panic!("cats must survive the fast tokenizer path");
+        };
+        assert!(std::ptr::eq(ca, cb), "same cat must share one interned pointer");
+        assert_eq!(ca, cb);
+        assert_ne!(ca, cc);
+    }
+
+    /// `args_value()` parses once and caches: two calls return the same
+    /// pointer; missing or invalid raw args give `None`.
+    #[test]
+    fn args_value_caches_parsed_result() {
+        let with_args = event_from_json(
+            r#"{"name":"E","ph":"X","ts":1.0,"args":{"foo":42,"bar":[1,2]}}"#,
+        );
+        let first = with_args.args_value().expect("args must parse");
+        assert_eq!(first.get("foo").and_then(|v| v.as_u64()), Some(42));
+        let second = with_args.args_value().expect("args must parse again");
+        assert!(std::ptr::eq(first, second), "second call must hit the cache");
+
+        let without_args = event_from_json(r#"{"name":"E","ph":"X","ts":1.0}"#);
+        assert!(without_args.args_value().is_none());
+
+        let invalid = TraceEvent {
+            name: intern_name("E"),
+            id: 0,
+            has_id: false,
+            ph: b'X',
+            ts: 0.0,
+            dur: None,
+            tid: 0,
+            pid: 0,
+            cat: None,
+            args: Some("{not valid json".into()),
+            args_cache: std::sync::OnceLock::new(),
+        };
+        assert!(invalid.args_value().is_none());
+        // A failed parse also caches (stays `None`, never panics).
+        assert!(invalid.args_value().is_none());
+    }
+
+    /// Two events with individually-built equal `cat` values compare equal
+    /// by value (the `contains_ignore_case` filtering in inspect.rs relies
+    /// on value comparison, not pointer identity).
+    #[test]
+    fn equal_cats_compare_equal_by_value() {
+        let a = event_from_json(r#"{"name":"RunTask","cat":"DevTools.Timeline","ph":"X","ts":1.0}"#);
+        let b = event_from_json(r#"{"name":"RunTask","cat":"DevTools.Timeline","ph":"X","ts":2.0}"#);
+        assert_eq!(a.cat, b.cat);
+        assert_eq!(a.cat, Some("DevTools.Timeline"));
+        assert!(
+            crate::inspect::contains_ignore_case(a.cat.unwrap(), "devtools.timeline")
+        );
     }
 }

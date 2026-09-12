@@ -90,7 +90,7 @@ impl Scope {
             && self
                 .cat
                 .as_deref()
-                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| contains_ignore_case(ec, c)))
+                .is_none_or(|c| e.cat.is_some_and(|ec| contains_ignore_case(ec, c)))
     }
 
     /// Thread/process/category filter without the window check — for CPU
@@ -101,7 +101,7 @@ impl Scope {
             && self
                 .cat
                 .as_deref()
-                .is_none_or(|c| e.cat.as_deref().is_some_and(|ec| contains_ignore_case(ec, c)))
+                .is_none_or(|c| e.cat.is_some_and(|ec| contains_ignore_case(ec, c)))
     }
 
     pub(crate) fn window_line(&self, min_ts: f64) -> Option<String> {
@@ -1539,7 +1539,7 @@ mod tests {
             dur: None,
             tid: 1,
             pid: 1,
-            cat: cat.map(|s| s.into()),
+            cat: cat.map(crate::trace::intern_name),
             args: None,
             args_cache: std::sync::OnceLock::new(),
         }

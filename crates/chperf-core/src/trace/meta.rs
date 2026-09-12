@@ -41,7 +41,7 @@ pub fn is_metadata_event(e: &TraceEvent) -> bool {
     matches!(
         e.name,
         "thread_name" | "process_name" | "thread_sort_index" | "process_sort_index"
-    ) || e.cat.as_deref() == Some("__metadata")
+    ) || e.cat == Some("__metadata")
 }
 
 /// Detect main thread: first RunTask with dur > 500ms

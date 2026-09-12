@@ -135,8 +135,8 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                     i = skip_value(bytes, i)?;
                     ev.cat = None;
                 } else {
-                    let (v, a) = parse_string(bytes, i)?;
-                    ev.cat = Some(v.into());
+                    let (v, a) = parse_string_intern(bytes, i)?;
+                    ev.cat = Some(v);
                     i = a;
                 }
             }
@@ -196,28 +196,10 @@ fn parse_key(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
     }
 }
 
-/// Unescaped JSON string value (bytes between quotes). Escaped strings are
-/// handled by the serde fallback. Returns (String, pos after closing quote).
-fn parse_string(bytes: &[u8], p: usize) -> Result<(String, usize), ()> {
-    let len = bytes.len();
-    if p >= len || bytes[p] != b'"' {
-        return Err(());
-    }
-    match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
-        Some(rel) => {
-            let q = p + 1 + rel;
-            if bytes[q] == b'\\' {
-                return Err(());
-            }
-            let s = std::str::from_utf8(&bytes[p + 1..q]).map_err(|_| ())?.to_string();
-            Ok((s, q + 1))
-        }
-        None => Err(()),
-    }
-}
-
-/// Like `parse_string`, but interns the result instead of allocating a new
-/// `String` per event (event names repeat heavily across a trace).
+/// Unescaped JSON string value (bytes between quotes), interned instead of
+/// allocating a new `String` per event (event names and categories repeat
+/// heavily across a trace). Escaped strings are handled by the serde
+/// fallback. Returns (interned str, pos after closing quote).
 fn parse_string_intern(bytes: &[u8], p: usize) -> Result<(&'static str, usize), ()> {
     let len = bytes.len();
     if p >= len || bytes[p] != b'"' {
@@ -238,7 +220,7 @@ fn parse_string_intern(bytes: &[u8], p: usize) -> Result<(&'static str, usize), 
 
 /// Event phase: the first byte of a quoted, unescaped string (`0` when the
 /// string is empty). Escaped phases bail to the serde fallback, same as
-/// `parse_string`. Returns (byte, pos after closing quote).
+/// `parse_string_intern`. Returns (byte, pos after closing quote).
 fn parse_phase(bytes: &[u8], p: usize) -> Result<(u8, usize), ()> {
     let len = bytes.len();
     if p >= len || bytes[p] != b'"' {
@@ -434,11 +416,11 @@ struct Layout {
 }
 
 /// Per-64KB-block JSON structure: brace depth and in-string state at each
-/// block start. Depth is computed from raw brace/bracket counts (ignoring
-/// strings — validated to match the exact state on real traces; strings in
-/// Chrome traces almost never contain braces), in-string state from exact
-/// (escape-aware) quote parity. Both are cheap SIMD-counted, so the full
-/// element walk only runs inside the parse chunks.
+/// block start. Both are exact (string-aware): depth deltas come from a
+/// byte walk that skips string contents — raw brace counts drift on real
+/// traces (e.g. `"origin":"null [internally: ..."` has unbalanced brackets
+/// inside a string) — and in-string state from exact (escape-aware) quote
+/// parity. The full element walk only runs inside the parse chunks.
 struct Blocks {
     depth_at: Vec<i64>,
     in_string_at: Vec<bool>,
@@ -446,21 +428,49 @@ struct Blocks {
 
 const BLOCK: usize = 64 * 1024;
 
+/// Count unescaped quotes in `chunk` for parity. A quote is escaped iff
+/// preceded by an odd run of backslashes; a run reaching the chunk start
+/// continues into `prev_trail` (backslashes ending the previous block).
+fn count_unescaped_quotes(chunk: &[u8], prev_trail: usize) -> (usize, usize) {
+    let mut nq = 0usize;
+    for q in memchr::memchr_iter(b'"', chunk) {
+        let mut run = 0usize;
+        let mut kk = q;
+        while kk > 0 && chunk[kk - 1] == b'\\' {
+            run += 1;
+            kk -= 1;
+        }
+        let escaped = if kk == 0 {
+            (run + prev_trail) % 2 == 1
+        } else {
+            run % 2 == 1
+        };
+        if !escaped {
+            nq += 1;
+        }
+    }
+    let mut trail = 0usize;
+    let mut kk = chunk.len();
+    while kk > 0 && chunk[kk - 1] == b'\\' {
+        trail += 1;
+        kk -= 1;
+    }
+    (nq, trail)
+}
+
 fn build_blocks(bytes: &[u8]) -> Blocks {
     let nb = bytes.len().div_ceil(BLOCK);
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1)
         .max(1);
+    // Full fan-out here: both phases are streaming and bandwidth-bound, so
+    // even efficiency cores help (unlike the parse workers, capped at 6).
     let chunk_count = if threads >= 4 && nb >= 64 { threads } else { 1 };
 
-    // Per-block counts are independent — count in parallel.
-    let mut opens = vec![0i64; nb];
-    let mut closes = vec![0i64; nb];
+    // Phase 1: per-block quote parity is independent — count in parallel.
     let mut quote_parity = vec![false; nb];
     if chunk_count > 1 {
-        let ptr_o: usize = opens.as_mut_ptr() as usize;
-        let ptr_c: usize = closes.as_mut_ptr() as usize;
         let ptr_q: usize = quote_parity.as_mut_ptr() as usize;
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(chunk_count);
@@ -469,45 +479,69 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
                 let hi = nb * (t + 1) / chunk_count;
                 let bstart = lo * BLOCK;
                 let bend = (hi * BLOCK).min(bytes.len());
-                let bytes = &bytes[bstart..bend];
+                let seg = &bytes[bstart..bend];
+                // Seed the backslash run from the preceding byte range so a
+                // `\"` split across a thread-chunk boundary counts correctly.
+                let mut prev_trail = 0usize;
+                let mut kk = bstart;
+                while kk > 0 && bytes[kk - 1] == b'\\' {
+                    prev_trail += 1;
+                    kk -= 1;
+                }
                 handles.push(s.spawn(move || {
-                    let ptr_o = ptr_o as *mut i64;
-                    let ptr_c = ptr_c as *mut i64;
                     let ptr_q = ptr_q as *mut bool;
-                    // Exact unescaped-quote parity per block: a quote is
-                    // escaped iff preceded by an odd run of backslashes.
-                    let mut prev_trail = 0usize; // backslashes ending previous block
-                    for (k, chunk) in bytes.chunks(BLOCK).enumerate() {
-                        let bi = lo + k;
-                        unsafe {
-                            *ptr_o.add(bi) = memchr::memchr2_iter(b'{', b'[', chunk).count() as i64;
-                            *ptr_c.add(bi) = memchr::memchr2_iter(b'}', b']', chunk).count() as i64;
-                        }
-                        let mut nq = 0usize;
-                        for q in memchr::memchr_iter(b'"', chunk) {
-                            let mut run = 0usize;
-                            let mut kk = q;
-                            while kk > 0 && chunk[kk - 1] == b'\\' {
-                                run += 1;
-                                kk -= 1;
-                            }
-                            let escaped = if kk == 0 {
-                                (run + prev_trail) % 2 == 1
-                            } else {
-                                run % 2 == 1
-                            };
-                            if !escaped {
-                                nq += 1;
-                            }
-                        }
-                        unsafe { *ptr_q.add(bi) = nq % 2 == 1; }
-                        let mut t2 = 0usize;
-                        let mut kk = chunk.len();
-                        while kk > 0 && chunk[kk - 1] == b'\\' {
-                            t2 += 1;
-                            kk -= 1;
-                        }
-                        prev_trail = t2;
+                    let mut prev_trail = prev_trail;
+                    for (k, chunk) in seg.chunks(BLOCK).enumerate() {
+                        let (nq, trail) = count_unescaped_quotes(chunk, prev_trail);
+                        unsafe { *ptr_q.add(lo + k) = nq % 2 == 1; }
+                        prev_trail = trail;
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    } else {
+        let mut prev_trail = 0usize;
+        for (k, chunk) in bytes.chunks(BLOCK).enumerate() {
+            let (nq, trail) = count_unescaped_quotes(chunk, prev_trail);
+            quote_parity[k] = nq % 2 == 1;
+            prev_trail = trail;
+        }
+    }
+
+    // Prefix: exact in-string state at each block start.
+    let mut in_string_at = Vec::with_capacity(nb + 1);
+    let mut s = false;
+    in_string_at.push(false);
+    for par in &quote_parity {
+        s ^= *par;
+        in_string_at.push(s);
+    }
+
+    // Phase 2: exact per-block depth deltas via a string-aware walk starting
+    // from each block's known in-string state. Independent per block, so
+    // parallel; the net delta doesn't depend on the starting depth.
+    let mut deltas = vec![0i64; nb];
+    if chunk_count > 1 {
+        let ptr_d: usize = deltas.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(chunk_count);
+            for t in 0..chunk_count {
+                let lo = nb * t / chunk_count;
+                let hi = nb * (t + 1) / chunk_count;
+                let bstart = lo * BLOCK;
+                let bend = (hi * BLOCK).min(bytes.len());
+                let seg = &bytes[bstart..bend];
+                let states = &in_string_at[lo..hi];
+                handles.push(s.spawn(move || {
+                    let ptr_d = ptr_d as *mut i64;
+                    for (k, chunk) in seg.chunks(BLOCK).enumerate() {
+                        let mut dd: i64 = 0;
+                        let mut st = states[k];
+                        walk_range(chunk, &mut dd, &mut st);
+                        unsafe { *ptr_d.add(lo + k) = dd; }
                     }
                 }));
             }
@@ -517,36 +551,20 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
         });
     } else {
         for (k, chunk) in bytes.chunks(BLOCK).enumerate() {
-            opens[k] = memchr::memchr2_iter(b'{', b'[', chunk).count() as i64;
-            closes[k] = memchr::memchr2_iter(b'}', b']', chunk).count() as i64;
-            let mut nq = 0usize;
-            for q in memchr::memchr_iter(b'"', chunk) {
-                let mut run = 0usize;
-                let mut kk = q;
-                while kk > 0 && chunk[kk - 1] == b'\\' {
-                    run += 1;
-                    kk -= 1;
-                }
-                if run.is_multiple_of(2) {
-                    nq += 1;
-                }
-            }
-            quote_parity[k] = nq % 2 == 1;
+            let mut dd: i64 = 0;
+            let mut st = in_string_at[k];
+            walk_range(chunk, &mut dd, &mut st);
+            deltas[k] = dd;
         }
     }
 
-    // Sequential prefix sums: depth and in-string state at each block start.
+    // Sequential prefix sum: exact depth at each block start.
     let mut depth_at = Vec::with_capacity(nb + 1);
-    let mut in_string_at = Vec::with_capacity(nb + 1);
     let mut d = 0i64;
-    let mut s = false;
     depth_at.push(0);
-    in_string_at.push(false);
-    for k in 0..nb {
-        d += opens[k] - closes[k];
-        s ^= quote_parity[k];
+    for dd in &deltas {
+        d += *dd;
         depth_at.push(d);
-        in_string_at.push(s);
     }
     Blocks {
         depth_at,
@@ -768,52 +786,88 @@ type ChunkResult = Result<(Vec<TraceEvent>, Vec<usize>), String>;
 /// (StreamDeserializer rejects commas), then parses the slice directly from
 /// the original buffer — zero copying. On failure all commas are restored
 /// and the caller falls back to a whole-buffer parse.
-fn parse_parallel(bytes: &mut [u8], layout: &Layout, blocks: &Blocks) -> Result<(Vec<TraceEvent>, Option<TraceMetadata>), Box<dyn std::error::Error>> {
+fn parse_parallel(
+    bytes: &mut [u8],
+    layout: &Layout,
+    blocks: &Blocks,
+    threads: usize,
+) -> Result<(Vec<TraceEvent>, Option<TraceMetadata>), Box<dyn std::error::Error>> {
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
-    let threads = parse_thread_count(&(layout.arr_close - layout.arr_open));
+    let threads = threads.max(1);
     let span = layout.arr_close - layout.arr_open;
 
     let t_scope = std::time::Instant::now();
 
-    // Per-thread: (events, comma positions for restore).
-    let results: Vec<ChunkResult> = if threads <= 1 {
+    // Per-unit: (unit index, events, comma positions for restore).
+    let results: Vec<(usize, ChunkResult)> = if threads <= 1 {
         let r = chunk_work(bytes, blocks, layout.arr_open, layout.arr_close);
-        vec![r]
+        vec![(0, r)]
     } else {
-        std::thread::scope(|s| {
-            let ptr: usize = bytes.as_ptr() as usize;
-            let mut handles = Vec::with_capacity(threads);
-            for t in 0..threads {
-                let from = layout.arr_open + span * t / threads;
-                let to = if t + 1 == threads {
-                    layout.arr_close
-                } else {
-                    layout.arr_open + span * (t + 1) / threads
-                };
-                handles.push(s.spawn(move || {
-                    let t0 = std::time::Instant::now();
-                    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, layout.arr_close) };
-                    let r = chunk_work(bytes, blocks, from, to);
-                    if debug {
-                        eprintln!(
-                            "  [parse] chunk {}..{}: {:.1}ms, {} events",
-                            from,
-                            to,
-                            t0.elapsed().as_secs_f64() * 1000.0,
-                            r.as_ref().map(|(v, _)| v.len()).unwrap_or(0)
-                        );
-                    }
-                    r
-                }));
-            }
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("chunk thread panicked".into()))).collect()
-        })
+        let unit = (span / (threads * 8)).clamp(BLOCK, 4 * 1024 * 1024);
+        let n_units = span.div_ceil(unit).max(1);
+        if n_units <= 1 {
+            let r = chunk_work(bytes, blocks, layout.arr_open, layout.arr_close);
+            vec![(0, r)]
+        } else {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            // More workers than fast cores hurts: on heterogeneous chips
+            // (4P+6E here) threads spilling onto efficiency cores run ~3x
+            // slower and gate wall time (measured: 10 workers ~148ms vs 4
+            // workers ~74ms on a 120MB trace). Cap workers; the many small
+            // units still balance the remaining threads via work-stealing.
+            let workers = threads.min(n_units).min(6);
+            let cursor = AtomicUsize::new(0);
+            let out: std::sync::Mutex<Vec<(usize, ChunkResult)>> =
+                std::sync::Mutex::new(Vec::with_capacity(n_units));
+            let total_len = bytes.len();
+            let arr_open = layout.arr_open;
+            let arr_close = layout.arr_close;
+            std::thread::scope(|s| {
+                let ptr: usize = bytes.as_ptr() as usize;
+                let cursor_ref = &cursor;
+                let out_ref = &out;
+                for _ in 0..workers {
+                    s.spawn(move || {
+                        loop {
+                            let idx = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                            if idx >= n_units {
+                                break;
+                            }
+                            let from = arr_open + idx * unit;
+                            let to = (from + unit).min(arr_close);
+                            let t0 = std::time::Instant::now();
+                            // Units are disjoint, so the serde-fallback comma
+                            // mutation is safe despite the shared raw pointer.
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts_mut(ptr as *mut u8, total_len)
+                            };
+                            let r = chunk_work(bytes, blocks, from, to);
+                            if debug {
+                                eprintln!(
+                                    "  [parse] chunk {}..{}: {:.1}ms, {} events",
+                                    from,
+                                    to,
+                                    t0.elapsed().as_secs_f64() * 1000.0,
+                                    r.as_ref().map(|(v, _)| v.len()).unwrap_or(0)
+                                );
+                            }
+                            out_ref.lock().unwrap().push((idx, r));
+                        }
+                    });
+                }
+            });
+            out.into_inner().unwrap()
+        }
     };
 
+    // Sort units into file order before merging.
+    let mut results = results;
+    results.sort_by_key(|(idx, _)| *idx);
+
     // Unwrap chunk results; on any failure restore commas and propagate.
-    let mut parsed: Vec<Vec<TraceEvent>> = Vec::with_capacity(threads);
+    let mut parsed: Vec<Vec<TraceEvent>> = Vec::with_capacity(results.len());
     let mut replaced: Vec<usize> = Vec::new();
-    for r in results {
+    for (_, r) in results {
         match r {
             Ok((events, commas)) => {
                 parsed.push(events);
@@ -876,12 +930,12 @@ fn chunk_work(
     let mut elem_start: Option<usize> = None;
     let mut finished_last = false; // the element containing `to` was completed
 
-    // Walk to the end of the chunk (and finish the element containing `to`).
-    let end = if to + BLOCK > bytes.len() {
-        bytes.len()
-    } else {
-        to + BLOCK
-    };
+    // Walk to the end of the buffer so the element containing `to` always
+    // reaches its closing `}` (elements can exceed 64KB). The walk still
+    // stops at the first element boundary at/after `to` (or at EOF on
+    // truncated input), and the memchr iterators are lazy, so this costs
+    // nothing for normal chunks.
+    let end = bytes.len();
     let mut strings = memchr::memchr3_iter(b'"', b'{', b'[', &bytes[start..end]);
     let mut closes = memchr::memchr2_iter(b'}', b']', &bytes[start..end]);
     let mut q = strings.next();
@@ -1004,12 +1058,30 @@ fn chunk_work(
 
 
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(path)?;
     // Decompress (if .gz) and parse from an in-memory slice. This is far
     // faster than streaming serde_json through the gzip decoder: zlib-rs
     // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
     let mut bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        let mut out = Vec::new();
+        // Preallocate from the gzip footer ISIZE (last 4 bytes, LE u32):
+        // a hint for the uncompressed size. Never fail because of it.
+        let hint: Option<usize> = (|| {
+            use std::io::Seek;
+            let len = file.metadata().ok()?.len();
+            if len < 4 {
+                return None;
+            }
+            file.seek(std::io::SeekFrom::End(-4)).ok()?;
+            let mut footer = [0u8; 4];
+            std::io::Read::read_exact(&mut file, &mut footer).ok()?;
+            file.seek(std::io::SeekFrom::Start(0)).ok()?;
+            let isize = u32::from_le_bytes(footer) as usize;
+            if isize == 0 {
+                return None;
+            }
+            Some(isize.min(1 << 30))
+        })();
+        let mut out = Vec::with_capacity(hint.unwrap_or(0));
         flate2::read::GzDecoder::new(file).read_to_end(&mut out)?;
         out
     } else {
@@ -1021,6 +1093,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // Fast path: chunk-parallel parse of the traceEvents array.
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let mut trace: Option<TraceFile> = None;
+    let mut scan_none = false;
     let t_scan = std::time::Instant::now();
     if let Some((layout, blocks)) = scan_layout(&bytes) {
         if debug {
@@ -1032,14 +1105,12 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
                 layout.metadata.is_some()
             );
         }
+        let threads = parse_thread_count(&(layout.arr_close - layout.arr_open));
         let t_par = std::time::Instant::now();
         if debug {
-            eprintln!(
-                "  [parse] threads: {}",
-                parse_thread_count(&(layout.arr_close - layout.arr_open))
-            );
+            eprintln!("  [parse] threads: {}", threads);
         }
-        match parse_parallel(&mut bytes, &layout, &blocks) {
+        match parse_parallel(&mut bytes, &layout, &blocks, threads) {
             Ok((trace_events, metadata)) => {
                 if debug {
                     eprintln!(
@@ -1056,15 +1127,31 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             Err(e) if debug => eprintln!("  [parse] parallel failed: {}", e),
             _ => {}
         }
-    } else if debug {
-        eprintln!("  [parse] scan returned None, falling back");
+    } else {
+        scan_none = true;
+        if debug {
+            eprintln!("  [parse] scan returned None, falling back");
+        }
     }
     // Fallback: whole-buffer parse (unusual layout, non-object elements, …).
     // Note: must NOT use unwrap_or — its argument is evaluated eagerly and
     // would re-parse the comma-mutated buffer on the happy path.
     let mut trace = match trace {
         Some(t) => t,
-        None => serde_json::from_slice(&bytes)?,
+        None => {
+            if scan_none
+                && memchr::memmem::find(&bytes, b"traceEvents").is_none()
+            {
+                return Err(format!(
+                    "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
+                    path.display()
+                )
+                .into());
+            }
+            serde_json::from_slice(&bytes).map_err(|e| {
+                format!("{}: failed to parse trace: {}", path.display(), e)
+            })?
+        }
     };
     if debug {
         eprintln!("  [parse] trace ready: {} events", trace.trace_events.len());
@@ -1139,6 +1226,97 @@ mod tests {
         // Absent / string / negative ids: present event, no id.
         for (k, e) in evs.iter().enumerate().skip(2) {
             assert!(!e.has_id, "event {} should have no id", k);
+        }
+    }
+
+    fn tiny_event(ts: f64) -> String {
+        format!("{{\"name\":\"Tiny\",\"ph\":\"X\",\"ts\":{ts},\"pid\":1,\"tid\":1}}")
+    }
+
+    fn giant_event(ts: f64, blob_len: usize) -> String {
+        format!(
+            "{{\"name\":\"BigEvent\",\"ph\":\"X\",\"ts\":{ts},\"pid\":1,\"tid\":1,\"args\":{{\"blob\":\"{}\"}}}}",
+            "A".repeat(blob_len)
+        )
+    }
+
+    fn histogram(evs: &[super::super::TraceEvent]) -> std::collections::HashMap<&str, usize> {
+        let mut m = std::collections::HashMap::new();
+        for e in evs {
+            *m.entry(e.name).or_insert(0) += 1;
+        }
+        m
+    }
+
+    /// A >64KB event starting just before `to` but closing well beyond
+    /// `to + BLOCK` must still be owned by the chunk starting before `to`
+    /// (regression: the old `to + BLOCK` walk cap dropped it entirely).
+    #[test]
+    fn chunk_work_keeps_giant_event_across_block_cap() {
+        let t1 = tiny_event(1.0);
+        let g = giant_event(2.0, 100 * 1024);
+        let t2 = tiny_event(3.0);
+        let bytes = format!("{{\"traceEvents\":[{t1},{g},{t2}]}}").into_bytes();
+        assert!(g.len() > BLOCK + 1024, "giant event must exceed BLOCK");
+        let (layout, blocks) = scan_layout(&bytes).expect("layout");
+        // Giant element offsets within the buffer.
+        let prefix = "{\"traceEvents\":[".len() + t1.len() + 1;
+        let giant_start = prefix;
+        let giant_end = giant_start + g.len();
+        let to = giant_start + 50;
+        assert!(
+            giant_end > to + BLOCK,
+            "giant must close well beyond to + BLOCK"
+        );
+        let mut buf = bytes.clone();
+        let (first, _) = chunk_work(&mut buf, &blocks, layout.arr_open, to).expect("chunk 1");
+        assert_eq!(first.len(), 2, "first chunk owns tiny + giant");
+        assert_eq!(first[0].name, "Tiny");
+        assert_eq!(first[1].name, "BigEvent");
+        let args_len = first[1].args.as_ref().map(|s| s.len()).unwrap_or(0);
+        assert!(args_len > BLOCK, "giant args preserved, got {args_len}");
+        let (second, _) = chunk_work(&mut buf, &blocks, to, layout.arr_close).expect("chunk 2");
+        assert_eq!(second.len(), 1, "second chunk owns only the trailing tiny");
+        assert_eq!(second[0].name, "Tiny");
+        assert_eq!(second[0].ts, 3.0);
+        let big_total = first.iter().chain(&second).filter(|e| e.name == "BigEvent").count();
+        assert_eq!(big_total, 1, "giant event exactly once across adjacent ranges");
+        assert_eq!(first.len() + second.len(), 3);
+    }
+
+    /// `parse_parallel` with different thread counts must agree exactly
+    /// (1000 events incl. one 120KB BigEvent, mirroring big_elem.json).
+    #[test]
+    fn parse_parallel_thread_counts_agree_on_big_elem() {
+        let mut body = String::with_capacity(300 * 1024);
+        for i in 0..1000 {
+            if i > 0 {
+                body.push(',');
+            }
+            if i == 500 {
+                body.push_str(&giant_event(i as f64, 120 * 1024));
+            } else {
+                body.push_str(&tiny_event(i as f64));
+            }
+        }
+        let bytes = format!("{{\"traceEvents\":[{body}]}}").into_bytes();
+        let (layout, blocks) = scan_layout(&bytes).expect("layout");
+        let mut all: Vec<Vec<super::super::TraceEvent>> = Vec::new();
+        for threads in [1usize, 3, 4] {
+            let mut buf = bytes.clone();
+            let (evs, _) = parse_parallel(&mut buf, &layout, &blocks, threads).expect("parallel");
+            assert_eq!(evs.len(), 1000, "threads={threads}");
+            all.push(evs);
+        }
+        let h0 = histogram(&all[0]);
+        assert_eq!(h0.get("BigEvent"), Some(&1));
+        assert_eq!(h0.get("Tiny"), Some(&999));
+        for (k, evs) in all.iter().enumerate().skip(1) {
+            assert_eq!(histogram(evs), h0, "histogram differs for run {k}");
+            assert_eq!(evs.len(), all[0].len());
+            let ts0: Vec<f64> = all[0].iter().map(|e| e.ts).collect();
+            let tsk: Vec<f64> = evs.iter().map(|e| e.ts).collect();
+            assert_eq!(tsk, ts0, "event order differs for run {k}");
         }
     }
 }
