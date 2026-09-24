@@ -44,27 +44,95 @@ pub fn is_metadata_event(e: &TraceEvent) -> bool {
     ) || e.cat == Some("__metadata")
 }
 
-/// Detect main thread: first RunTask with dur > 500ms
-pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
-    for e in events {
-        if e.name == "RunTask" && e.ph == b'X'
-            && let Some(dur) = e.dur
-                && dur > 500_000.0 {
-                    return e.tid;
-                }
+/// Threads that carry RunTasks but are never "the main thread" for jank
+/// analysis. `Chrome_IOThread` regularly blocks for >500ms and, when its
+/// events come first in the file, used to win the long-task heuristic below —
+/// reporting IO/GPU/compositor busy time as main-thread busy.
+fn is_known_non_main(name: &str) -> bool {
+    name.contains("IOThread")
+        || name == "CrGpuMain"
+        || name.contains("Compositor") // VizCompositorThread, renderer Compositor
+        || name.starts_with("ThreadPool")
+        || name.contains("Worker") // DedicatedWorker/ServiceWorker threads
+        || name == "AudioThread"
+        || name == "MemoryInfra"
+}
+
+/// Detection priority for thread names seen in Chrome traces; 0 = no opinion.
+/// The renderer main is where scroll/jank/script live, so it outranks the
+/// browser main.
+fn main_name_priority(name: &str) -> u8 {
+    match name {
+        "CrRendererMain" | "RendererMain" => 3,
+        "Renderer" => 2, // legacy renderer main
+        "CrBrowserMain" | "Main" => 1,
+        _ => 0,
     }
-    // Fallback: tid with most RunTask events
-    let mut counts: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
+}
+
+/// Detect the main thread for busy/long-task analysis.
+///
+/// 1. A thread with RunTask activity whose `thread_name` metadata marks it as
+///    a main thread (`CrRendererMain` > `Renderer` > `CrBrowserMain`/`Main`);
+///    ties broken by RunTask count, then lower tid.
+/// 2. First RunTask > 500ms on a thread not ruled out by `is_known_non_main`.
+/// 3. Most RunTask events, non-main threads excluded first, then unrestricted
+///    for nameless traces.
+pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
+    // One pass: per-thread name (from `thread_name` metadata) + RunTask count.
+    let mut threads: rustc_hash::FxHashMap<u64, (Option<&str>, usize)> =
+        rustc_hash::FxHashMap::default();
     for e in events {
-        if e.name == "RunTask" && e.ph == b'X' {
-            *counts.entry(e.tid).or_default() += 1;
+        if e.name == "thread_name" {
+            let name = e
+                .args_value()
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str());
+            threads.entry(e.tid).or_default().0 = name;
+        } else if e.name == "RunTask" && e.ph == b'X' {
+            threads.entry(e.tid).or_default().1 += 1;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(tid, _)| tid)
-        .unwrap_or(0)
+
+    // 1. Named main thread with RunTask activity.
+    if let Some((tid, _)) = threads
+        .iter()
+        .filter(|(_, (name, n))| *n > 0 && (*name).is_some_and(|n| main_name_priority(n) > 0))
+        .max_by_key(|(tid, (name, n))| {
+            (main_name_priority((*name).unwrap()), *n, std::cmp::Reverse(*tid))
+        })
+    {
+        return *tid;
+    }
+
+    // 2. First long RunTask on a thread that can't be ruled out by name.
+    for e in events {
+        if e.name == "RunTask"
+            && e.ph == b'X'
+            && let Some(dur) = e.dur
+            && dur > 500_000.0
+            && !threads
+                .get(&e.tid)
+                .and_then(|(name, _)| *name)
+                .is_some_and(is_known_non_main)
+        {
+            return e.tid;
+        }
+    }
+
+    // 3. Most RunTask events, non-main threads excluded, then unrestricted.
+    for exclude_known in [true, false] {
+        if let Some((tid, _)) = threads
+            .iter()
+            .filter(|(_, (name, n))| {
+                *n > 0 && !(exclude_known && (*name).is_some_and(is_known_non_main))
+            })
+            .max_by_key(|(tid, (_, n))| (*n, std::cmp::Reverse(*tid)))
+        {
+            return *tid;
+        }
+    }
+    0
 }
 
 /// Stable stem for a trace file: strips both `.json` and `.json.gz`.
@@ -108,4 +176,91 @@ pub fn list_traces(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error
         }
     }
     Ok(by_stem.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_main_thread;
+    use crate::trace::{TraceEvent, intern_name};
+
+    fn ev(name: &str, ph: u8, tid: u64, dur: Option<f64>, args: Option<String>) -> TraceEvent {
+        TraceEvent {
+            name: intern_name(name),
+            id: 0,
+            has_id: false,
+            ph,
+            ts: 0.0,
+            dur,
+            tid,
+            pid: 1,
+            cat: None,
+            args: args.map(|s| s.into_boxed_str()),
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn thread_name(tid: u64, name: &str) -> TraceEvent {
+        ev("thread_name", b'M', tid, None, Some(format!(r#"{{"name":"{name}"}}"#)))
+    }
+
+    /// Regression: Chrome_IOThread's long RunTask appearing first in the file
+    /// used to win detection; the named renderer main must take precedence.
+    #[test]
+    fn renderer_name_beats_io_thread_long_task() {
+        let events = vec![
+            thread_name(74_465, "Chrome_IOThread"),
+            thread_name(74_480, "CrGpuMain"),
+            thread_name(104_561, "CrRendererMain"),
+            ev("RunTask", b'X', 74_465, Some(600_000.0), None),
+            ev("RunTask", b'X', 104_561, Some(16_700.0), None),
+            ev("RunTask", b'X', 104_561, Some(30_000.0), None),
+        ];
+        assert_eq!(detect_main_thread(&events), 104_561);
+    }
+
+    #[test]
+    fn unnamed_long_task_skips_known_non_main_threads() {
+        let events = vec![
+            thread_name(100, "Chrome_IOThread"),
+            ev("RunTask", b'X', 100, Some(600_000.0), None),
+            ev("RunTask", b'X', 300, Some(550_000.0), None),
+            ev("RunTask", b'X', 300, Some(100.0), None),
+        ];
+        assert_eq!(detect_main_thread(&events), 300);
+    }
+
+    #[test]
+    fn renderer_outranks_browser_main_count_breaks_ties() {
+        let events = vec![
+            thread_name(1, "CrBrowserMain"),
+            thread_name(2, "Renderer"),
+            thread_name(3, "Renderer"),
+            ev("RunTask", b'X', 1, Some(100.0), None),
+            ev("RunTask", b'X', 3, Some(100.0), None),
+            ev("RunTask", b'X', 3, Some(100.0), None),
+            ev("RunTask", b'X', 2, Some(100.0), None),
+        ];
+        assert_eq!(detect_main_thread(&events), 3);
+    }
+
+    #[test]
+    fn named_main_without_runtasks_is_ignored() {
+        let events = vec![
+            thread_name(5, "CrRendererMain"),
+            thread_name(6, "ThreadPoolForegroundWorker"),
+            ev("RunTask", b'X', 6, Some(600_000.0), None),
+            ev("RunTask", b'X', 7, Some(10.0), None),
+        ];
+        assert_eq!(detect_main_thread(&events), 7);
+    }
+
+    #[test]
+    fn nameless_trace_keeps_long_task_then_most_runtasks() {
+        let events = vec![
+            ev("RunTask", b'X', 1, Some(100.0), None),
+            ev("RunTask", b'X', 2, Some(100.0), None),
+            ev("RunTask", b'X', 2, Some(100.0), None),
+        ];
+        assert_eq!(detect_main_thread(&events), 2);
+    }
 }

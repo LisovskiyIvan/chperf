@@ -10,8 +10,12 @@
 //! Semantics cross-checked (all verified against the tool at commit 2ce4455):
 //! - events: traceEvents array; name/ph (strings), ts (f64, default 0),
 //!   dur (Option<f64>), tid/pid (u64), args (optional JSON object)
-//! - main thread: first RunTask ph X with dur > 500_000 us, else the tid
-//!   with the most RunTask ph X events
+//! - main thread: a thread with RunTask ph X activity whose `thread_name`
+//!   marks it a main thread (CrRendererMain/RendererMain > Renderer >
+//!   CrBrowserMain/Main; ties by RunTask count, then lower tid), else the
+//!   first RunTask ph X with dur > 500_000 us on a thread not known non-main
+//!   (IOThread/CrGpuMain/Compositor/ThreadPool/Worker/AudioThread/MemoryInfra),
+//!   else the tid with the most RunTask ph X events (non-main excluded first)
 //! - CPU samples: ProfileChunk events in array order; per-pid walk anchored
 //!   on the first Profile (ph P) event, `prev += timeDeltas[i]` with RAW
 //!   values (may be negative), sample weight = max(0, timeDeltas[i]);
@@ -89,26 +93,76 @@ fn load_trace(path: &Path) -> Vec<Event> {
 }
 
 // ── Main thread ──
+// Mirror of chperf-core trace::detect_main_thread.
+
+fn thread_name_of(e: &Event) -> Option<&str> {
+    e.args
+        .as_ref()
+        .and_then(|a| a.get("name"))
+        .and_then(|v| v.as_str())
+}
+
+fn is_known_non_main(name: &str) -> bool {
+    name.contains("IOThread")
+        || name == "CrGpuMain"
+        || name.contains("Compositor")
+        || name.starts_with("ThreadPool")
+        || name.contains("Worker")
+        || name == "AudioThread"
+        || name == "MemoryInfra"
+}
+
+fn main_name_priority(name: &str) -> u8 {
+    match name {
+        "CrRendererMain" | "RendererMain" => 3,
+        "Renderer" => 2,
+        "CrBrowserMain" | "Main" => 1,
+        _ => 0,
+    }
+}
 
 fn detect_main_tid(events: &[Event]) -> u64 {
+    let mut threads: HashMap<u64, (Option<&str>, usize)> = HashMap::new();
+    for e in events {
+        if e.name == "thread_name" {
+            threads.entry(e.tid).or_default().0 = thread_name_of(e);
+        } else if e.name == "RunTask" && e.ph == "X" {
+            threads.entry(e.tid).or_default().1 += 1;
+        }
+    }
+    if let Some((tid, _)) = threads
+        .iter()
+        .filter(|(_, (name, n))| *n > 0 && (*name).is_some_and(|n| main_name_priority(n) > 0))
+        .max_by_key(|(tid, (name, n))| {
+            (main_name_priority((*name).unwrap()), *n, std::cmp::Reverse(*tid))
+        })
+    {
+        return *tid;
+    }
     for e in events {
         if e.name == "RunTask" && e.ph == "X"
             && let Some(dur) = e.dur
-            && dur > 500_000.0 {
-                return e.tid;
-            }
-    }
-    let mut counts: HashMap<u64, usize> = HashMap::new();
-    for e in events {
-        if e.name == "RunTask" && e.ph == "X" {
-            *counts.entry(e.tid).or_default() += 1;
+            && dur > 500_000.0
+            && !threads
+                .get(&e.tid)
+                .and_then(|(name, _)| *name)
+                .is_some_and(is_known_non_main)
+        {
+            return e.tid;
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(tid, _)| tid)
-        .unwrap_or(0)
+    for exclude_known in [true, false] {
+        if let Some((tid, _)) = threads
+            .iter()
+            .filter(|(_, (name, n))| {
+                *n > 0 && !(exclude_known && (*name).is_some_and(is_known_non_main))
+            })
+            .max_by_key(|(tid, (_, n))| (*n, std::cmp::Reverse(*tid)))
+        {
+            return *tid;
+        }
+    }
+    0
 }
 
 // ── CPU sample walk ──
