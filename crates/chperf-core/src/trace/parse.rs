@@ -118,12 +118,12 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                 }
             }
             b"tid" => {
-                let (v, a) = parse_num_u64(bytes, i)?;
+                let (v, a) = parse_num_i64(bytes, i)?;
                 ev.tid = v;
                 i = a;
             }
             b"pid" => {
-                let (v, a) = parse_num_u64(bytes, i)?;
+                let (v, a) = parse_num_i64(bytes, i)?;
                 ev.pid = v;
                 i = a;
             }
@@ -310,6 +310,22 @@ fn parse_num_u64(bytes: &[u8], p: usize) -> Result<(u64, usize), ()> {
     Ok((acc, i))
 }
 
+/// Signed integer value: optional `-`, then digits. Used for tid/pid, which
+/// Chromium's exporter can emit as negative i32 (Windows ids above 2³¹);
+/// they wrap to the same u64 the serde path produces.
+fn parse_num_i64(bytes: &[u8], p: usize) -> Result<(u64, usize), ()> {
+    let len = bytes.len();
+    let mut i = p;
+    let neg = if i < len && bytes[i] == b'-' {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    let (v, next) = parse_num_u64(bytes, i)?;
+    Ok((if neg { (v as i64).wrapping_neg() as u64 } else { v }, next))
+}
+
 /// The value starting at p is exactly the literal `null` (not `nullx`).
 fn is_literal_null(bytes: &[u8], p: usize) -> bool {
     let len = bytes.len();
@@ -424,6 +440,12 @@ struct Layout {
 struct Blocks {
     depth_at: Vec<i64>,
     in_string_at: Vec<bool>,
+    /// Escape-pending state at each block start: inside a string whose last
+    /// byte of the previous block was a backslash opening an escape. Without
+    /// it, an escaped quote split across a block boundary (`\` last byte of
+    /// block k, `"` first byte of block k+1) is misread as closing the
+    /// string, and depth drifts for every block after it.
+    esc_at: Vec<bool>,
 }
 
 const BLOCK: usize = 64 * 1024;
@@ -470,8 +492,10 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
 
     // Phase 1: per-block quote parity is independent — count in parallel.
     let mut quote_parity = vec![false; nb];
+    let mut trails = vec![0usize; nb];
     if chunk_count > 1 {
         let ptr_q: usize = quote_parity.as_mut_ptr() as usize;
+        let ptr_t: usize = trails.as_mut_ptr() as usize;
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(chunk_count);
             for t in 0..chunk_count {
@@ -490,10 +514,12 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
                 }
                 handles.push(s.spawn(move || {
                     let ptr_q = ptr_q as *mut bool;
+                    let ptr_t = ptr_t as *mut usize;
                     let mut prev_trail = prev_trail;
                     for (k, chunk) in seg.chunks(BLOCK).enumerate() {
                         let (nq, trail) = count_unescaped_quotes(chunk, prev_trail);
                         unsafe { *ptr_q.add(lo + k) = nq % 2 == 1; }
+                        unsafe { *ptr_t.add(lo + k) = trail; }
                         prev_trail = trail;
                     }
                 }));
@@ -507,6 +533,7 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
         for (k, chunk) in bytes.chunks(BLOCK).enumerate() {
             let (nq, trail) = count_unescaped_quotes(chunk, prev_trail);
             quote_parity[k] = nq % 2 == 1;
+            trails[k] = trail;
             prev_trail = trail;
         }
     }
@@ -520,9 +547,17 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
         in_string_at.push(s);
     }
 
+    // Escape-pending state at each block start: in a string whose previous
+    // block ends with an odd trailing backslash run (that backslash escapes
+    // this block's first byte).
+    let mut esc_at = vec![false; nb];
+    for k in 1..nb {
+        esc_at[k] = in_string_at[k] && trails[k - 1] % 2 == 1;
+    }
+
     // Phase 2: exact per-block depth deltas via a string-aware walk starting
-    // from each block's known in-string state. Independent per block, so
-    // parallel; the net delta doesn't depend on the starting depth.
+    // from each block's known in-string and escape state. Independent per
+    // block, so parallel; the net delta doesn't depend on the starting depth.
     let mut deltas = vec![0i64; nb];
     if chunk_count > 1 {
         let ptr_d: usize = deltas.as_mut_ptr() as usize;
@@ -535,12 +570,14 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
                 let bend = (hi * BLOCK).min(bytes.len());
                 let seg = &bytes[bstart..bend];
                 let states = &in_string_at[lo..hi];
+                let escs = &esc_at[lo..hi];
                 handles.push(s.spawn(move || {
                     let ptr_d = ptr_d as *mut i64;
                     for (k, chunk) in seg.chunks(BLOCK).enumerate() {
                         let mut dd: i64 = 0;
                         let mut st = states[k];
-                        walk_range(chunk, &mut dd, &mut st);
+                        let mut esc = escs[k];
+                        walk_range(chunk, &mut dd, &mut st, &mut esc);
                         unsafe { *ptr_d.add(lo + k) = dd; }
                     }
                 }));
@@ -553,7 +590,8 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
         for (k, chunk) in bytes.chunks(BLOCK).enumerate() {
             let mut dd: i64 = 0;
             let mut st = in_string_at[k];
-            walk_range(chunk, &mut dd, &mut st);
+            let mut esc = esc_at[k];
+            walk_range(chunk, &mut dd, &mut st, &mut esc);
             deltas[k] = dd;
         }
     }
@@ -569,6 +607,7 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
     Blocks {
         depth_at,
         in_string_at,
+        esc_at,
     }
 }
 
@@ -578,20 +617,23 @@ fn state_at(bytes: &[u8], blocks: &Blocks, pos: usize) -> (i64, bool) {
     let block = pos / BLOCK;
     let mut d = blocks.depth_at[block];
     let mut s = blocks.in_string_at[block];
-    walk_range(&bytes[block * BLOCK..pos], &mut d, &mut s);
+    let mut esc = blocks.esc_at[block];
+    walk_range(&bytes[block * BLOCK..pos], &mut d, &mut s, &mut esc);
     (d, s)
 }
 
 /// String-aware walk over a byte range, updating depth and in-string state.
-fn walk_range(r: &[u8], d: &mut i64, s: &mut bool) {
+/// `esc` carries the escape-pending state in/out (a backslash whose escaped
+/// byte may lie past the end of the range).
+fn walk_range(r: &[u8], d: &mut i64, s: &mut bool, esc: &mut bool) {
     let mut in_str = *s;
-    let mut esc = false;
+    let mut e = *esc;
     for &b in r {
         if in_str {
-            if esc {
-                esc = false;
+            if e {
+                e = false;
             } else if b == b'\\' {
-                esc = true;
+                e = true;
             } else if b == b'"' {
                 in_str = false;
             }
@@ -605,6 +647,7 @@ fn walk_range(r: &[u8], d: &mut i64, s: &mut bool) {
         }
     }
     *s = in_str;
+    *esc = e;
 }
 
 /// Find the `[` (traceEvents) or `{` (metadata) opening the value of a
@@ -668,20 +711,17 @@ fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
         let be = (bs + BLOCK).min(bytes.len());
         let mut d = blocks.depth_at[k];
         let mut s = blocks.in_string_at[k];
+        let mut esc = blocks.esc_at[k];
         let mut i = bs;
         while i < be {
             let b = bytes[i];
             if s {
-                if b == b'"' {
-                    let mut run = 0usize;
-                    let mut kk = i;
-                    while kk > bs && bytes[kk - 1] == b'\\' {
-                        run += 1;
-                        kk -= 1;
-                    }
-                    if run.is_multiple_of(2) {
-                        s = false;
-                    }
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    s = false;
                 }
             } else {
                 match b {
@@ -720,20 +760,17 @@ fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
         let bs = block * BLOCK;
         let mut d = blocks.depth_at[block];
         let mut s = blocks.in_string_at[block];
+        let mut esc = blocks.esc_at[block];
         let mut end = None;
         for (i, &b) in bytes[bs..].iter().enumerate() {
             let idx = bs + i;
             if s {
-                if b == b'"' {
-                    let mut run = 0usize;
-                    let mut k = idx;
-                    while k > bs && bytes[k - 1] == b'\\' {
-                        run += 1;
-                        k -= 1;
-                    }
-                    if run.is_multiple_of(2) {
-                        s = false;
-                    }
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    s = false;
                 }
             } else {
                 match b {
@@ -961,7 +998,14 @@ fn chunk_work(
                     run += 1;
                     k -= 1;
                 }
-                if run.is_multiple_of(2) {
+                // A run reaching the block start continues the previous
+                // block's trailing backslash run; `esc_at` encodes its parity.
+                let escaped = if k == start {
+                    (run + blocks.esc_at[block] as usize) % 2 == 1
+                } else {
+                    run % 2 == 1
+                };
+                if !escaped {
                     in_string = false;
                 }
             }
@@ -1048,6 +1092,14 @@ fn chunk_work(
         .into_iter()
         .collect::<Result<Vec<TraceEvent>, _>>()
         .map_err(|err| {
+            // Restore this chunk's commas before returning: parse_parallel's
+            // Err arm only restores chunks that finished BEFORE this one, so
+            // a `?` here would leave the buffer corrupted for the
+            // whole-buffer fallback — its error would then point at spaces
+            // instead of the real defect.
+            for j in &replaced {
+                bytes[*j] = b',';
+            }
             if std::env::var("CHPERF_DEBUG").is_ok() {
                 eprintln!("  [dbg] slice [{s}..{e}): {}", String::from_utf8_lossy(&bytes[s..e]));
             }
@@ -1197,6 +1249,47 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An escaped quote split across a 64KB block boundary (`\` last byte of
+    /// block 0, `"` first byte of block 1) used to reset the walk's escape
+    /// state at the boundary: the quote was misread as closing the string,
+    /// depth drifted, and every event after a `]]]`-style trap inside that
+    /// string was silently dropped. The block-start escape state must carry.
+    #[test]
+    fn escape_split_across_block_boundary_does_not_truncate() {
+        let mut json = String::from(
+            r#"{"traceEvents":[{"name":"trap","ph":"X","ts":1,"dur":1,"args":{"s":""#,
+        );
+        // 16 (prefix) + 52 (trap event head) puts the next byte at 68.
+        json.push_str(&"x".repeat(65_467));
+        // Backslash now at byte 65535 (last of block 0), quote at 65536.
+        json.push_str("\\\"");
+        json.push_str("y]]]y");
+        // Close the string with a plain quote, close args + event.
+        json.push_str("\",\"z\":1}}");
+        for i in 0..300 {
+            json.push_str(&format!(
+                r#",{{"name":"tail{i}","ph":"X","ts":{},"dur":1}}"#,
+                10 + i
+            ));
+        }
+        json.push_str("]}");
+
+        // Pin the boundary condition: the split escape straddles block 0/1.
+        let b = json.as_bytes();
+        assert_eq!(b[65_535], b'\\');
+        assert_eq!(b[65_536], b'"');
+        assert_eq!(b[65_537], b'y');
+
+        let path = std::env::temp_dir().join(format!("chperf-esc-split-{}.json", std::process::id()));
+        std::fs::write(&path, json).unwrap();
+        let trace = parse_trace(&path).expect("parse must succeed");
+        std::fs::remove_file(&path).ok();
+        // 1 trap + 300 tail events; the old walk saw 763/1063-style loss.
+        assert_eq!(trace.trace_events.len(), 301);
+        assert_eq!(trace.trace_events[0].name, "trap");
+        assert_eq!(trace.trace_events[300].name, "tail299");
+    }
 
     /// The fast tokenizer must capture async `id`s (integer) for s/f pairing,
     /// leave `has_id` false when the field is absent, and not bail the chunk

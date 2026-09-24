@@ -119,9 +119,9 @@ impl<'de> Deserialize<'de> for TraceEvent {
             ts: f64,
             #[serde(default)]
             dur: Option<f64>,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_tid_pid")]
             tid: u64,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_tid_pid")]
             pid: u64,
             #[serde(default)]
             cat: Option<Box<str>>,
@@ -155,6 +155,16 @@ where
 {
     let v = Option::<serde_json::Value>::deserialize(d)?;
     Ok(v.and_then(|v| v.as_u64()))
+}
+
+/// tid/pid can legitimately be negative: Windows thread/process ids above 2³¹
+/// come out of Chromium's exporter as negative i32s, and Chrome's own tooling
+/// accepts them. Wrap through i64 instead of failing the whole trace.
+fn deserialize_tid_pid<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(i64::deserialize(d)? as u64)
 }
 
 /// Serde fallback: capture the `args` field as raw JSON bytes (zero-copy via
