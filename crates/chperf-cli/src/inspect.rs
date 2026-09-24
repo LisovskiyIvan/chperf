@@ -253,7 +253,18 @@ fn resolve_windows(
     // Resolve --tid (numeric or "main" → auto-detected main thread).
     let tid = match &cli.tid {
         None => None,
-        Some(s) if s == "main" => Some(trace::detect_main_thread(events)),
+        Some(s) if s == "main" => {
+            // detect_main_thread returns 0 when nothing matches (no RunTask
+            // activity, no known thread names); filtering on tid 0 would
+            // present an arbitrary thread — or empty sections — as "main".
+            let t = trace::detect_main_thread(events);
+            if t == 0 {
+                return Err("no main thread found: trace has no RunTask activity \
+                            and no known thread names (pass --tid <n> explicitly)"
+                    .into());
+            }
+            Some(t)
+        }
         Some(s) => Some(s.parse::<u64>().map_err(|e| {
             format!("invalid --tid `{}` (use a number or \"main\"): {}", s, e)
         })?),

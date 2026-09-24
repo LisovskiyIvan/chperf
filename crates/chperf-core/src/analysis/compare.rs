@@ -79,6 +79,11 @@ pub struct CompareResult {
 fn pct_diff(a: f64, b: f64) -> f64 {
     if a > 0.0 {
         (b - a) / a * 100.0
+    } else if b > 0.0 {
+        // Zero baseline: any new activity is an unbounded relative jump.
+        // Report a full regression so the >10% / >15% threshold rules fire
+        // (0 long tasks -> 15 must not silently read as "no change").
+        100.0
     } else {
         0.0
     }

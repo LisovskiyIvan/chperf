@@ -86,16 +86,20 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     }
 
     // Pass 2: CPU profile node names / URLs, by earliest sample time.
-    // Sample times walk the chunk sequence anchored on the per-process
-    // `Profile` (ph=P) event; timeDeltas are inter-sample gaps.
-    let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
+    // Sample times walk each session's chunk sequence anchored on the
+    // session's `Profile` (ph=P) event; timeDeltas are inter-sample gaps.
+    // Sessions (workers, multiple processes) have independent node id
+    // spaces and walks, so both are keyed by (pid, session).
+    let mut starts: rustc_hash::FxHashMap<(u64, u64), f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "Profile" && e.ph == b'P' {
-            starts.entry(e.pid).or_insert(e.ts);
+            starts.entry((e.pid, if e.has_id { e.id } else { e.tid })).or_insert(e.ts);
+            starts.entry((e.pid, e.tid)).or_insert(e.ts);
         }
     }
-    let mut node_first: rustc_hash::FxHashMap<u64, (f64, String, String)> = rustc_hash::FxHashMap::default();
-    let mut prev_last: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
+    let mut node_first: rustc_hash::FxHashMap<(u64, u64, u64), (f64, String, String)> =
+        rustc_hash::FxHashMap::default();
+    let mut prev_last: rustc_hash::FxHashMap<(u64, u64), f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name != "ProfileChunk" {
             continue;
@@ -112,6 +116,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             Some(cp) => cp,
             None => continue,
         };
+        let sess = (e.pid, if e.has_id { e.id } else { e.tid });
         for node in cpu_profile
             .get("nodes")
             .and_then(|n| n.as_array())
@@ -119,7 +124,8 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             .flatten()
         {
             let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-            if id == 0 || node_first.contains_key(&id) {
+            let key = (sess.0, sess.1, id);
+            if id == 0 || node_first.contains_key(&key) {
                 continue;
             }
             let call_frame = node.get("callFrame");
@@ -133,7 +139,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            node_first.insert(id, (f64::INFINITY, name, url));
+            node_first.insert(key, (f64::INFINITY, name, url));
         }
         let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
         let deltas = data.get("timeDeltas").and_then(|t| t.as_array());
@@ -143,19 +149,19 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             // before recording so the first sample lands on `prev_last +
             // delta[0]` (same walk as `profile_chunk_bases`).
             let mut sample_ts = prev_last
-                .get(&e.pid)
+                .get(&sess)
                 .copied()
-                .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
+                .unwrap_or_else(|| starts.get(&sess).copied().unwrap_or(0.0));
             for (i, s) in samples.iter().enumerate().take(n) {
                 sample_ts += deltas[i].as_f64().unwrap_or(0.0);
                 let id = s.as_u64().unwrap_or(0);
                 if id != 0
-                    && let Some(entry) = node_first.get_mut(&id)
+                    && let Some(entry) = node_first.get_mut(&(sess.0, sess.1, id))
                         && sample_ts < entry.0 {
                             entry.0 = sample_ts;
                         }
             }
-            prev_last.insert(e.pid, sample_ts);
+            prev_last.insert(sess, sample_ts);
         }
     }
     // Prefer function-name matches over URL-only matches: a substring like
@@ -317,7 +323,8 @@ pub fn frames_section(
 // ── GC & Long Tasks (--gc) ──
 
 /// GC + long-task report scoped to the window. Long tasks are main-thread
-/// RunTasks ≥ `lt_ms` (default 50). GC split into major / minor / other
+/// RunTasks > `lt_ms` (default 50; the Long Task API counts tasks strictly
+/// over 50ms). GC split into major / minor / other
 /// (all other V8.GC*/CppGC* X-events, mostly background work).
 pub fn gc_section(
     events: &[TraceEvent],
@@ -356,7 +363,7 @@ pub fn gc_section(
             if d > g.3 {
                 g.3 = d;
             }
-        } else if e.name == "RunTask" && e.tid == main_tid && d >= lt_us {
+        } else if e.name == "RunTask" && e.tid == main_tid && d > lt_us {
             long_tasks.push(d);
         }
     }
@@ -385,7 +392,7 @@ pub fn gc_section(
     }
     out.push('\n');
     out.push_str(&format!(
-        "- **Long tasks ≥{}ms**: {} total, {:.1}ms combined, max {:.1}ms\n",
+        "- **Long tasks >{}ms**: {} total, {:.1}ms combined, max {:.1}ms\n",
         lt_ms as i64,
         long_tasks.len(),
         lt_total.max(0.0) / 1000.0,
@@ -442,19 +449,28 @@ pub fn calltree_section(
     let nodes = cpu.nodes;
     let self_time = cpu.leaf_time;
 
-    // Children map + roots.
-    let mut children: rustc_hash::FxHashMap<u64, Vec<u64>> = rustc_hash::FxHashMap::default();
-    let mut roots: Vec<u64> = Vec::new();
-    for (id, (_, _, parent)) in nodes.iter() {
+    // Children map + roots. Keys are (pid, session, node id); a parent id
+    // resolves within its own session only.
+    let mut children: rustc_hash::FxHashMap<crate::analysis::NodeKey, Vec<crate::analysis::NodeKey>> =
+        rustc_hash::FxHashMap::default();
+    let mut roots: Vec<crate::analysis::NodeKey> = Vec::new();
+    for (key, (_, _, parent)) in nodes.iter() {
         match parent {
-            Some(p) if nodes.contains_key(p) => children.entry(*p).or_default().push(*id),
-            _ => roots.push(*id),
+            Some(p) => {
+                let pk = (key.0, key.1, *p);
+                if nodes.contains_key(&pk) {
+                    children.entry(pk).or_default().push(*key);
+                } else {
+                    roots.push(*key);
+                }
+            }
+            None => roots.push(*key),
         }
     }
 
     // Pre-order DFS (deterministic: children sorted by self-time desc).
-    let mut order: Vec<u64> = Vec::new();
-    let mut stack: Vec<u64> = roots.clone();
+    let mut order: Vec<crate::analysis::NodeKey> = Vec::new();
+    let mut stack: Vec<crate::analysis::NodeKey> = roots.clone();
     while let Some(id) = stack.pop() {
         order.push(id);
         if let Some(ch) = children.get(&id) {
@@ -476,9 +492,10 @@ pub fn calltree_section(
     let mut inclusive: crate::analysis::ProfileSelfTimes = self_time.clone();
     for &id in order.iter().rev() {
         let Some(Some(p)) = nodes.get(&id).map(|n| n.2) else { continue };
-        if nodes.contains_key(&p) {
+        let pk = (id.0, id.1, p);
+        if nodes.contains_key(&pk) {
             let inc = *inclusive.get(&id).unwrap_or(&0.0);
-            *inclusive.entry(p).or_default() += inc;
+            *inclusive.entry(pk).or_default() += inc;
         }
     }
 
@@ -491,7 +508,8 @@ pub fn calltree_section(
     let has_filter = name_matcher.is_some() || url_matcher.is_some();
 
     // has_match: node itself or any descendant matches.
-    let mut has_match: rustc_hash::FxHashMap<u64, bool> = rustc_hash::FxHashMap::default();
+    let mut has_match: rustc_hash::FxHashMap<crate::analysis::NodeKey, bool> =
+        rustc_hash::FxHashMap::default();
     for &id in order.iter().rev() {
         let m = matched(nodes.get(&id).unwrap());
         let kids = children
@@ -506,7 +524,7 @@ pub fn calltree_section(
     // Emit pruned tree, depth-first, children by inclusive desc, top-limit.
     struct Row {
         depth: usize,
-        id: u64,
+        id: crate::analysis::NodeKey,
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut roots_sorted = roots.clone();
@@ -517,7 +535,8 @@ pub fn calltree_section(
             .partial_cmp(inclusive.get(a).unwrap_or(&0.0))
             .unwrap()
     });
-    let mut stack: Vec<(u64, usize)> = roots_sorted.into_iter().map(|r| (r, 0)).collect();
+    let mut stack: Vec<(crate::analysis::NodeKey, usize)> =
+        roots_sorted.into_iter().map(|r| (r, 0)).collect();
     while let Some((id, depth)) = stack.pop() {
         if !has_match.get(&id).copied().unwrap_or(false) {
             continue;
@@ -527,7 +546,7 @@ pub fn calltree_section(
             break;
         }
         if let Some(ch) = children.get(&id) {
-            let mut ch: Vec<u64> = ch
+            let mut ch: Vec<crate::analysis::NodeKey> = ch
                 .iter()
                 .copied()
                 .filter(|c| has_match.get(c).copied().unwrap_or(false))
@@ -694,7 +713,7 @@ fn delta_windows_stats(
                     "RunTask" => {
                         if let Some(d) = e.dur {
                             accs[wi].runtask += d;
-                            if d >= lt_us {
+                            if d > lt_us {
                                 accs[wi].lt_count += 1;
                                 accs[wi].lt_us += d;
                             }
@@ -704,8 +723,11 @@ fn delta_windows_stats(
                     _ => {}
                 }
             }
+            // Same minor-GC family `gc_section` counts (MinorGC / V8.GCScavenger);
+            // omitting the scavenger name made --delta report 0 GC where --gc
+            // showed scavenges.
             match e.name {
-                "MajorGC" | "MinorGC" if e.ph == b'X' => {
+                "MajorGC" | "MinorGC" | "V8.GCScavenger" if e.ph == b'X' => {
                     accs[wi].gc += e.dur.unwrap_or(0.0);
                     accs[wi].gc_count += 1;
                 }
@@ -819,7 +841,7 @@ pub fn delta_data(
     }
     push("dropped frames", "n", s_pre.dropped as f64, s_shoot.dropped as f64, s_post.dropped as f64);
     push(
-        &format!("long tasks ≥{:.0}ms", lt_ms),
+        &format!("long tasks >{:.0}ms", lt_ms),
         "n",
         s_pre.lt_count as f64,
         s_shoot.lt_count as f64,
@@ -1144,7 +1166,7 @@ mod tests {
         let scope = Scope { window: None, tid: None, pid: None, cat: None };
         let (md, json) = gc_section(&events, &scope, 50.0, 1_000_000.0);
         assert!(md.contains("| MajorGC | 1 | 5.00 | 5.00 |"));
-        assert!(md.contains("Long tasks ≥50ms**: 1 total, 600.0ms combined"));
+        assert!(md.contains("Long tasks >50ms**: 1 total, 600.0ms combined"));
         let row = json.as_array().unwrap()[0].clone();
         assert_eq!(row["gc"][0]["count"], 1);
         assert_eq!(row["gc"][0]["total_us"], 5000.0);

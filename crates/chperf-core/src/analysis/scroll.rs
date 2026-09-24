@@ -97,7 +97,10 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
             let e = main_x[j];
             if e.name != "RunTask" {
                 let d = e.dur.unwrap_or(0.0);
-                if d > 50_000.0 {
+                // Containment: back-to-back RunTasks share the boundary
+                // (rt2.ts == rt1_end), so a child of the NEXT task starting
+                // exactly at rt_end must not flag this task.
+                if d > 50_000.0 && e.ts + d <= rt_end {
                     if e.name == "UpdateLayoutTree" {
                         has_heavy_ult = true;
                     } else if e.name == "FunctionCall" {
@@ -178,5 +181,65 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
         }
     };
 
+    // Worst-first: consumers render "Worst Scroll Tasks" with take(10/15),
+    // and every sibling analysis (layout/style/reflow) also returns sorted.
+    // avg/percentiles are order-independent.
+    tasks.sort_by(|a, b| b.dur_us.partial_cmp(&a.dur_us).unwrap());
+
     ScrollFrameResult { tasks, avg, percentiles }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::intern_name;
+
+    fn ev(name: &str, ts: f64, dur: f64) -> TraceEvent {
+        TraceEvent {
+            name: intern_name(name),
+            id: 0,
+            has_id: false,
+            ph: b'X',
+            ts,
+            dur: Some(dur),
+            tid: 1,
+            pid: 1,
+            cat: None,
+            args: None,
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn boundary_child_of_next_task_does_not_flag_previous() {
+        // Back-to-back RunTasks share the boundary (rt2.ts == rt1_end): the
+        // next task's 55ms child starting exactly there must not turn the
+        // tiny previous task into a scroll frame.
+        let events = vec![
+            ev("RunTask", 1_000.0, 1_000.0),
+            ev("RunTask", 2_000.0, 60_000.0),
+            ev("FunctionCall", 2_000.0, 55_000.0),
+        ];
+        let r = analyze_scroll_frames(&events, 1);
+        assert_eq!(r.tasks.len(), 1);
+        assert_eq!(r.tasks[0].dur_us, 60_000.0);
+        assert_eq!(r.tasks[0].js_us, 55_000.0);
+    }
+
+    #[test]
+    fn tasks_are_sorted_worst_first() {
+        // "Worst Scroll Tasks" tables take(10/15) chronologically-ordered
+        // tasks showed the earliest, not the worst.
+        let events = vec![
+            ev("RunTask", 1_000.0, 60_000.0),
+            ev("FunctionCall", 1_000.0, 55_000.0),
+            ev("RunTask", 100_000.0, 70_000.0),
+            ev("FunctionCall", 100_000.0, 60_000.0),
+            ev("RunTask", 200_000.0, 65_000.0),
+            ev("UpdateLayoutTree", 200_000.0, 52_000.0),
+        ];
+        let r = analyze_scroll_frames(&events, 1);
+        let durs: Vec<f64> = r.tasks.iter().map(|t| t.dur_us).collect();
+        assert_eq!(durs, vec![70_000.0, 65_000.0, 60_000.0]);
+    }
 }

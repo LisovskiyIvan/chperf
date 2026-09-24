@@ -64,6 +64,8 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
         .collect();
 
     let mut entries = Vec::new();
+    let mut all_task_reflows: Vec<usize> = Vec::new();
+    let mut all_task_layout: Vec<f64> = Vec::new();
 
     // Single sweep: children are in ts order already.
     let mut lo = 0usize;
@@ -110,6 +112,10 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
             j += 1;
         }
 
+        if reflow_count > 0 {
+            all_task_reflows.push(reflow_count);
+            all_task_layout.push(layout_time);
+        }
         if reflow_count >= 2 {
             entries.push(ForcedReflowEntry {
                 task_dur_us: rt_dur,
@@ -122,8 +128,11 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
 
     entries.sort_by_key(|b| std::cmp::Reverse(b.reflow_count));
 
-    let total_reflows: usize = entries.iter().map(|e| e.reflow_count).sum();
-    let total_layout_time_us: f64 = entries.iter().map(|e| e.layout_time_us).sum();
+    // Totals cover every task with at least one forced reflow; the `entries`
+    // table keeps the >=2 (thrashing) gate. Summing entries only reported 0
+    // for pages whose handlers force exactly one reflow per task.
+    let total_reflows: usize = all_task_reflows.iter().sum();
+    let total_layout_time_us: f64 = all_task_layout.iter().sum();
 
     ForcedReflowResult {
         entries,

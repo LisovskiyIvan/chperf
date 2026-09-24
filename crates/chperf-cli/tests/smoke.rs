@@ -64,8 +64,8 @@ fn smoke_windowed() {
 fn smoke_frames_gc_find() {
     contains(&[FIXTURE, "--frames"], "2 paired");
     contains(&[FIXTURE, "--frames"], "Dropped frames**: 2");
-    contains(&[FIXTURE, "--gc"], "Long tasks ≥50ms**: 1 total, 600.0ms combined");
-    contains(&[FIXTURE, "--gc", "--lt", "30"], "Long tasks ≥30ms");
+    contains(&[FIXTURE, "--gc"], "Long tasks >50ms**: 1 total, 600.0ms combined");
+    contains(&[FIXTURE, "--gc", "--lt", "30"], "Long tasks >30ms");
     contains(&[FIXTURE, "--find", "player_shoot"], "1 matches");
     contains(&[FIXTURE, "--find", "player_shoot"], "CPU profile matches (0");
     contains(&[FIXTURE, "--anchor", "shoot", "--gc"], "windowed");

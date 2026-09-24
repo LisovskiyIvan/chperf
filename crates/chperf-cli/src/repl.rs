@@ -209,6 +209,35 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         }
     };
 
+    // Inspect queries run against the session data (no re-parse), unless a
+    // compare was requested in the same command: `compare b.json --gc` must
+    // build the comparison (loading B) before the flags apply — dropping the
+    // compare silently left the user on single-trace output.
+    if let Some(b_path) = &cmd.compare {
+        let t0 = Instant::now();
+        let analyzed_b = load_and_analyze(Path::new(b_path))?;
+        let name_b = trace::trace_stem(Path::new(b_path));
+        // build_app constructs a fresh App; carry the session throttle over
+        // or a previously set `throttle N` silently resets to 1x.
+        let throttle = session.app.throttle_factor;
+        session.app = build_app(
+            &session.analyzed,
+            Some((&analyzed_b, name_b.clone())),
+            session.name_a.clone(),
+        );
+        session.app.throttle_factor = throttle;
+        session.compare_name = Some(name_b.clone());
+        println!(
+            "# compare `{}` vs `{}` built in {:.1}s\n",
+            session.name_a,
+            name_b,
+            t0.elapsed().as_secs_f64()
+        );
+        if !cmd.is_inspect() {
+            return Ok(Cmd::Done);
+        }
+    }
+
     // Inspect queries run against the session data (no re-parse).
     if cmd.is_inspect() {
         inspect_output(
@@ -218,26 +247,6 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
             &cmd,
             Some(&session.analyzed.cpu_cache),
         )?;
-        return Ok(Cmd::Done);
-    }
-
-    // Compare: load the second trace once and rebuild the app.
-    if let Some(b_path) = &cmd.compare {
-        let t0 = Instant::now();
-        let analyzed_b = load_and_analyze(Path::new(b_path))?;
-        let name_b = trace::trace_stem(Path::new(b_path));
-        session.app = build_app(
-            &session.analyzed,
-            Some((&analyzed_b, name_b.clone())),
-            session.name_a.clone(),
-        );
-        session.compare_name = Some(name_b.clone());
-        println!(
-            "# compare `{}` vs `{}` built in {:.1}s\n",
-            session.name_a,
-            name_b,
-            t0.elapsed().as_secs_f64()
-        );
         return Ok(Cmd::Done);
     }
 

@@ -442,18 +442,22 @@ pub fn collect_cpu_profile(
     CpuProfile { nodes, leaf_time }
 }
 
-fn node_chain_names(nodes: &crate::analysis::ProfileNodes, leaf: u64) -> Vec<String> {
-    let mut ids: Vec<u64> = Vec::new();
+fn node_chain_names(nodes: &crate::analysis::ProfileNodes, leaf: crate::analysis::NodeKey) -> Vec<String> {
+    // Parent ids resolve within the leaf's own (pid, session).
+    let mut keys: Vec<crate::analysis::NodeKey> = Vec::new();
     let mut cur = Some(leaf);
-    while let Some(id) = cur {
-        ids.push(id);
-        cur = nodes.get(&id).and_then(|n| n.2);
+    while let Some(key) = cur {
+        keys.push(key);
+        cur = nodes
+            .get(&key)
+            .and_then(|n| n.2)
+            .map(|p| (key.0, key.1, p));
     }
-    ids.reverse();
-    ids.iter()
-        .map(|id| {
+    keys.reverse();
+    keys.iter()
+        .map(|key| {
             nodes
-                .get(id)
+                .get(key)
                 .map(|(n, _, _)| {
                     if n.is_empty() { "(anonymous)".to_string() } else { n.clone() }
                 })
@@ -476,7 +480,7 @@ pub fn stacks_section(
     let node_map = cpu.nodes;
     let leaf_time = cpu.leaf_time;
 
-    let mut leaves: Vec<(u64, f64)> = leaf_time
+    let mut leaves: Vec<(crate::analysis::NodeKey, f64)> = leaf_time
         .into_iter()
         .filter(|(id, _)| match matcher {
             Some(m) => node_map.get(id).map(|(n, _, _)| m.matches(n)).unwrap_or(false),
@@ -558,7 +562,7 @@ pub fn stacks_folded(
     cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> String {
     let cpu = collect_cpu_profile(events, scope, cache);
-    let mut leaves: Vec<(u64, f64)> = cpu
+    let mut leaves: Vec<(crate::analysis::NodeKey, f64)> = cpu
         .leaf_time
         .iter()
         .filter(|(id, _)| match matcher {
@@ -728,10 +732,25 @@ pub fn find_section(
     (out, Value::Array(json_rows))
 }
 
+/// `idx`/`len` are BYTE offsets into `s` (from `find()`/regex `start()` on
+/// possibly-lowercased text); convert to a char range before slicing the char
+/// vec, or multibyte text before the match panics / renders the wrong span.
+/// Non-boundary offsets (the Substr path matches on a lowercased copy whose
+/// byte layout can differ) are floored/ceiled to the nearest boundary.
 fn snippet_around(s: &str, idx: usize, len: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
-    let start = idx.saturating_sub(60);
-    let end = (idx + len + 60).min(chars.len());
+    let mut start_byte = idx.min(s.len());
+    while start_byte > 0 && !s.is_char_boundary(start_byte) {
+        start_byte -= 1;
+    }
+    let mut end_byte = (idx.saturating_add(len)).min(s.len());
+    while end_byte < s.len() && !s.is_char_boundary(end_byte) {
+        end_byte += 1;
+    }
+    let match_start = s[..start_byte].chars().count();
+    let match_end = s[..end_byte].chars().count();
+    let start = match_start.saturating_sub(60);
+    let end = (match_end + 60).min(chars.len());
     chars[start..end].iter().collect()
 }
 
@@ -1416,21 +1435,24 @@ pub fn async_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    // Pass 1: in-scope `s` events → (pid, id) → (name, start ts).
+    // Single sweep in event order: `s` overwrites any pending start for its
+    // (pid, id), `f` consumes it. Chrome recycles flow ids, so entries must
+    // not survive their finish — a two-pass or_insert kept the FIRST start
+    // and reused ids measured against a stale begin.
     let mut starts: rustc_hash::FxHashMap<(u64, u64), (&'static str, f64)> = rustc_hash::FxHashMap::default();
-    for e in events {
-        if e.ph == b's' && e.has_id && scope.allows_event(e) {
-            starts.entry((e.pid, e.id)).or_insert((e.name, e.ts));
-        }
-    }
-    // Pass 2: `f` events complete the pair; duration = finish − start.
     let mut by_name: rustc_hash::FxHashMap<&'static str, Vec<f64>> = rustc_hash::FxHashMap::default();
     let mut longest: Vec<(&'static str, f64, f64)> = Vec::new(); // (name, start ts, dur)
     for e in events {
-        if e.ph != b'f' || !e.has_id {
+        if !e.has_id {
             continue;
         }
-        if let Some(&(name, start_ts)) = starts.get(&(e.pid, e.id)) {
+        if e.ph == b's' {
+            if scope.allows_event(e) {
+                starts.insert((e.pid, e.id), (e.name, e.ts));
+            }
+        } else if e.ph == b'f'
+            && let Some((name, start_ts)) = starts.remove(&(e.pid, e.id))
+        {
             let dur = (e.ts - start_ts).max(0.0);
             by_name.entry(name).or_default().push(dur);
             longest.push((name, start_ts, dur));
@@ -1543,6 +1565,51 @@ mod tests {
             args: None,
             args_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    fn flow(ph: u8, id: u64, ts: f64) -> TraceEvent {
+        TraceEvent {
+            name: crate::trace::intern_name("AnimationFrame"),
+            id,
+            has_id: true,
+            ph,
+            ts,
+            dur: None,
+            tid: 1,
+            pid: 1,
+            cat: None,
+            args: None,
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn async_pairs_consume_reused_ids() {
+        // Chrome recycles flow ids: the second s/f pair with the same id must
+        // measure against ITS start, not the first one (30ms total was the
+        // stale pairing; the truth is 10ms + 1ms).
+        let events = vec![
+            flow(b's', 7, 1_000.0),
+            flow(b'f', 7, 11_000.0),
+            flow(b's', 7, 20_000.0),
+            flow(b'f', 7, 21_000.0),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let (_, json) = async_section(&events, &scope, 10, 0.0);
+        let row = &json["tasks"][0];
+        assert_eq!(row["count"], 2);
+        assert_eq!(row["max_us"], 10_000.0);
+        assert_eq!(row["total_us"], 11_000.0);
+    }
+
+    #[test]
+    fn snippet_handles_multibyte_before_match() {
+        // idx is a byte offset; slicing a char vec with it panicked (or
+        // rendered the wrong span) once multibyte text preceded the match.
+        let s = format!("{{\"t\":\"{}needle here\"}}", "日".repeat(50));
+        let idx = s.find("needle").unwrap();
+        let snip = snippet_around(&s, idx, 6);
+        assert!(snip.contains("needle"), "snippet: {snip}");
     }
 
     #[test]

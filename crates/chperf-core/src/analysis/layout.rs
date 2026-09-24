@@ -57,12 +57,15 @@ pub fn analyze_layout_dirty(events: &[TraceEvent], main_tid: u64) -> LayoutDirty
     let n = entries.len().max(1) as f64;
     let avg_dirty = entries.iter().map(|e| e.dirty_count as f64).sum::<f64>() / n;
     let max_dirty = entries.iter().map(|e| e.dirty_count).max().unwrap_or(0);
+    // Average only over entries that actually report totalObjects; dividing
+    // by every entry would dilute the ratio with events missing the field.
+    let with_total = entries.iter().filter(|e| e.total_count > 0).count().max(1) as f64;
     let avg_ratio = entries
         .iter()
         .filter(|e| e.total_count > 0)
         .map(|e| e.dirty_count as f64 / e.total_count as f64 * 100.0)
         .sum::<f64>()
-        / n;
+        / with_total;
 
     LayoutDirtyResult {
         entries,

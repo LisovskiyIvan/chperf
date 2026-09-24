@@ -408,7 +408,7 @@ mod tests {
             50.0,
             1_000_000.0,
         );
-        assert!(md.contains("Long tasks ≥50ms**: 1 total, 600.0ms combined"));
+        assert!(md.contains("Long tasks >50ms**: 1 total, 600.0ms combined"));
 
         // Anchor: FunctionCall functionName wins.
         let m = inspect::Matcher::new("shoot", false).unwrap();
@@ -593,7 +593,7 @@ mod tests {
             let scope_half = Scope { window: Some((min_ts, mid)), tid: None, pid: None, cat: None };
             let (_, win_half) = analysis::scan_profile_chunks(&events, Some(&scope_half), 0);
             for (id, t) in &win_half {
-                assert!(*t <= full.get(id).copied().unwrap_or(0.0) + 1e-9, "iter {}: windowed > full for node {}", iter, id);
+                assert!(*t <= full.get(id).copied().unwrap_or(0.0) + 1e-9, "iter {}: windowed > full for node {:?}", iter, id);
             }
 
             // Analysis passes must not panic on garbage.

@@ -6,12 +6,29 @@ use crate::trace::{TraceEvent, is_metadata_event};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// CPU-profile node id -> (function name, source URL, parent id), first-wins.
-/// FxHash: u64 keys on hot scan paths; SipHash costs ~2-4x on millions of
+/// (pid, session, node id) -> (function name, source URL, parent node id,
+/// first-wins). Node ids are only unique within one profiler session: a web
+/// worker or a second renderer process restarts its counter at 1, so keys
+/// must be session-scoped or cross-session collisions merge unrelated
+/// functions under one row.
+///
+/// Session = (pid, profiler session): chunks carry the Profile head's `id`
+/// when present, otherwise the sampled tid stands in.
+///
+/// FxHash: tuple keys on hot scan paths; SipHash costs ~2-4x on millions of
 /// per-sample lookups.
-pub type ProfileNodes = rustc_hash::FxHashMap<u64, (String, String, Option<u64>)>;
-/// CPU-profile node id -> sampled self-time (µs).
-pub type ProfileSelfTimes = rustc_hash::FxHashMap<u64, f64>;
+pub type SessionKey = (u64, u64);
+/// (pid, session, node id): node ids are only unique within one session.
+pub type NodeKey = (u64, u64, u64);
+/// Node table: key -> (functionName, url, per-session parent node id).
+pub type ProfileNodes = rustc_hash::FxHashMap<NodeKey, (String, String, Option<u64>)>;
+/// CPU-profile node -> sampled self-time (µs).
+pub type ProfileSelfTimes = rustc_hash::FxHashMap<NodeKey, f64>;
+
+/// Session a Profile/ProfileChunk event belongs to.
+fn session_of(e: &TraceEvent) -> SessionKey {
+    (e.pid, if e.has_id { e.id } else { e.tid })
+}
 
 #[derive(Clone)]
 pub struct FunctionTime {
@@ -168,15 +185,21 @@ fn profile_chunk_bases(
     events: &[TraceEvent],
     collect_bases: bool,
 ) -> (HashMap<usize, f64>, rustc_hash::FxHashSet<usize>) {
-    let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
+    // Profile heads register their anchor under both the session key and
+    // (pid, tid): chunks of a session may lack the head's `id`, and the tid
+    // fallback must then still find the right anchor.
+    let mut starts: rustc_hash::FxHashMap<SessionKey, f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "Profile" && e.ph == b'P' {
-            starts.entry(e.pid).or_insert(e.ts);
+            starts.entry(session_of(e)).or_insert(e.ts);
+            starts.entry((e.pid, e.tid)).or_insert(e.ts);
         }
     }
     let mut bases: HashMap<usize, f64> = HashMap::new();
     let mut first_chunks: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-    let mut prev_last: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default(); // last sample time per pid
+    // Last sample time per session; concurrent sessions (workers, multiple
+    // processes) must not continue each other's walks.
+    let mut prev_last: rustc_hash::FxHashMap<SessionKey, f64> = rustc_hash::FxHashMap::default();
     // Sample-time bounds (first sample of the walk, last sample per pid) for
     // the CHPERF_CHECK sanity pass.
     let mut sample_min = f64::INFINITY;
@@ -197,17 +220,17 @@ fn profile_chunk_bases(
             continue;
         };
         let pl = prev_last
-            .get(&e.pid)
+            .get(&session_of(e))
             .copied()
-            .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
-        if !prev_last.contains_key(&e.pid) {
-            // First delta-bearing chunk of this pid: its deltas[0] reaches
+            .unwrap_or_else(|| starts.get(&session_of(e)).copied().unwrap_or(0.0));
+        if !prev_last.contains_key(&session_of(e)) {
+            // First delta-bearing chunk of this session: its deltas[0] reaches
             // back to the Profile event's ts, not to a previous sample.
             first_chunks.insert(idx);
         }
         let base = pl + first;
         let sum: f64 = td.iter().filter_map(|v| v.as_f64()).sum();
-        prev_last.insert(e.pid, pl + sum);
+        prev_last.insert(session_of(e), pl + sum);
         if check_enabled() {
             if base < sample_min {
                 sample_min = base;
@@ -292,6 +315,7 @@ fn scan_profile_chunk(
         };
 
         if let Some(nodes) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
+            let sess = session_of(e);
             for node in nodes {
                 let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
                 let call_frame = node.get("callFrame");
@@ -306,7 +330,9 @@ fn scan_profile_chunk(
                     .unwrap_or("")
                     .to_string();
                 let parent = node.get("parent").and_then(|v| v.as_u64());
-                node_map.entry(id).or_insert((func_name, url, parent));
+                node_map
+                    .entry((sess.0, sess.1, id))
+                    .or_insert((func_name, url, parent));
             }
         }
 
@@ -358,32 +384,43 @@ fn scan_profile_chunk(
             };
             let windowed = windows.iter().any(|w| w.is_some());
             if !windowed {
+                let sess = session_of(e);
                 let t0 = &mut self_times[0];
                 for (k, sample) in samples.iter().take(n).enumerate() {
                     let weight = weight_at(k);
                     if weight > 0.0 {
                         let node_id = sample.as_u64().unwrap_or(0);
-                        *t0.entry(node_id).or_default() += weight;
+                        *t0.entry((sess.0, sess.1, node_id)).or_default() += weight;
                     }
                 }
                 continue;
             }
             let base = bases.get(&(global_offset + i)).copied().unwrap_or(0.0);
+            let sess = session_of(e);
+            // Sample i lives at `base + sum(deltas[1..=i])` (base already
+            // includes deltas[0]); advancing by deltas[k+1] keeps the walk in
+            // step with Chrome's own advance-first sample times even when
+            // deltas are non-uniform (idle gap before the chunk's first
+            // sample used to shift every sample of the chunk by deltas[0]).
             let mut sample_ts = base;
             for (k, sample) in samples.iter().take(n).enumerate() {
                 // Weights clamp negative deltas and cap the attach warm-up
-                // (first sample of a pid); the time walk uses the raw deltas
-                // so timestamps stay true.
+                // (first sample of a session); the time walk uses the raw
+                // deltas so timestamps stay true.
                 let weight = weight_at(k);
                 if weight > 0.0 {
                     let node_id = sample.as_u64().unwrap_or(0);
                     for (wi, w) in windows.iter().enumerate() {
                         if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts <= hi) {
-                            *self_times[wi].entry(node_id).or_default() += weight;
+                            *self_times[wi]
+                                .entry((sess.0, sess.1, node_id))
+                                .or_default() += weight;
                         }
                     }
                 }
-                sample_ts += deltas[k].as_f64().unwrap_or(0.0);
+                if let Some(d) = deltas.get(k + 1) {
+                    sample_ts += d.as_f64().unwrap_or(0.0);
+                }
             }
         }
     }
@@ -407,23 +444,29 @@ pub fn analyze_cpu_profile_full(events: &[TraceEvent]) -> (CpuProfileResult, Cpu
 }
 
 fn build_cpu_profile_result(node_map: &ProfileNodes, self_times: &ProfileSelfTimes) -> CpuProfileResult {
-    let mut functions: Vec<FunctionTime> = self_times
-        .iter()
-        .map(|(id, time)| {
-            // Clone only the (name, url) of nodes that were actually sampled —
-            // rebuilding the whole node table first would clone every node's
-            // strings, including the (often large) unsampled majority.
-            let (name, url) = node_map
-                .get(id)
-                .map(|(n, u, _)| (n.clone(), u.clone()))
-                .unwrap_or_default();
-            let source_type = classify_url(&url);
-            FunctionTime {
-                function_name: name,
-                url,
-                self_time_us: *time,
-                source_type,
-            }
+    // Aggregate per node first, then merge into one row per (name, url): a
+    // function sampled at several call sites (recursion) has one node per
+    // frame, and per-node rows would split — or, after sorting, mislead
+    // consumers that pick a single entry — its total self-time.
+    let mut by_func: rustc_hash::FxHashMap<(String, String), (f64, SourceType)> =
+        rustc_hash::FxHashMap::default();
+    for (key, time) in self_times {
+        let (name, url) = node_map
+            .get(key)
+            .map(|(n, u, _)| (n.clone(), u.clone()))
+            .unwrap_or_default();
+        let source_type = classify_url(&url);
+        let entry = by_func.entry((name, url)).or_insert((0.0, source_type));
+        entry.0 += time;
+    }
+
+    let mut functions: Vec<FunctionTime> = by_func
+        .into_iter()
+        .map(|((name, url), (time, source_type))| FunctionTime {
+            function_name: name,
+            url,
+            self_time_us: time,
+            source_type,
         })
         .filter(|f| f.self_time_us > 0.0)
         .collect();
@@ -580,6 +623,11 @@ mod tests {
         times.values().sum()
     }
 
+    /// Node key in the fixture's single session: pid 2, session = tid 65.
+    fn nk(n: u64) -> crate::analysis::NodeKey {
+        (2, 65, n)
+    }
+
     #[test]
     fn scan_attribution_weights_are_per_sample_deltas() {
         // Regression: the old code summed cumulative deltas (~83x inflation);
@@ -588,10 +636,10 @@ mod tests {
         let (nodes, times) = scan_profile_chunks(&events, None, 0);
         assert_eq!(nodes.len(), 4);
         assert_eq!(total(&times), 46_000.0);
-        assert_eq!(*times.get(&2).unwrap_or(&0.0), 20_000.0); // 4 × 5ms (idx 0,2,4,6)
-        assert_eq!(*times.get(&3).unwrap_or(&0.0), 15_000.0);
+        assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 20_000.0); // 4 × 5ms (idx 0,2,4,6)
+        assert_eq!(*times.get(&nk(3)).unwrap_or(&0.0), 15_000.0);
         // Node 4: 4000 + 3000 + clamp(-1000 → 0) + 4000.
-        assert_eq!(*times.get(&4).unwrap_or(&0.0), 11_000.0);
+        assert_eq!(*times.get(&nk(4)).unwrap_or(&0.0), 11_000.0);
     }
 
     #[test]
@@ -609,11 +657,11 @@ mod tests {
         // Fast path: capped at the median of chunk 1's other deltas (1ms) →
         // 1000 + 3 × 1000 + uncapped 50_000.
         let (_, times) = scan_profile_chunks(&events, None, 0);
-        assert_eq!(*times.get(&2).unwrap_or(&0.0), 54_000.0);
+        assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 54_000.0);
         // Windowed path caps the same way.
         let windows = [Some((0.0, 2_000_000.0))];
         let (_, times) = scan_profile_chunks_windows(&events, None, &windows, 0);
-        assert_eq!(*times[0].get(&2).unwrap_or(&0.0), 54_000.0);
+        assert_eq!(*times[0].get(&nk(2)).unwrap_or(&0.0), 54_000.0);
     }
 
     #[test]
@@ -627,7 +675,94 @@ mod tests {
             chunk_event(1_000_000.0, nodes, &[2], &[1_000.0]),
         ];
         let (_, times) = scan_profile_chunks(&events, None, 0);
-        assert_eq!(*times.get(&2).unwrap_or(&0.0), 1_000.0);
+        assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 1_000.0);
+    }
+
+    fn profile_event_sess(ts: f64, pid: u64, tid: u64) -> TraceEvent {
+        let mut e = profile_event(ts);
+        e.pid = pid;
+        e.tid = tid;
+        e
+    }
+
+    fn chunk_event_sess(
+        ts: f64,
+        pid: u64,
+        tid: u64,
+        nodes: &[(u64, &str, Option<u64>)],
+        samples: &[u64],
+        deltas: &[f64],
+    ) -> TraceEvent {
+        let mut e = chunk_event(ts, nodes, samples, deltas);
+        e.pid = pid;
+        e.tid = tid;
+        e
+    }
+
+    #[test]
+    fn concurrent_sessions_do_not_share_walks_or_node_ids() {
+        // Two isolates that both restart node ids at 1 (web worker, second
+        // renderer): pid-keyed walks continued each other's sample times and
+        // or_insert merged same-id nodes under one name. Sessions must stay
+        // independent — here keyed by (pid, tid) since the chunks carry no id.
+        let events = vec![
+            profile_event_sess(0.0, 2, 65),
+            chunk_event_sess(
+                0.0,
+                2,
+                65,
+                &[(1, "(root)", None), (2, "funcA", Some(1))],
+                &[2, 2, 2],
+                &[360_000.0, 1_000.0, 1_000.0],
+            ),
+            profile_event_sess(1_000_000.0, 3, 65),
+            chunk_event_sess(
+                1_000_000.0,
+                3,
+                65,
+                &[(1, "(root)", None), (2, "funcB", Some(1))],
+                &[2, 2],
+                &[500.0, 500.0],
+            ),
+        ];
+        let (nodes, times) = scan_profile_chunks(&events, None, 0);
+        // Same node id 2, different sessions: both names survive; each keeps
+        // its own self-time (A capped at 1ms interval; B at its own 500µs).
+        assert_eq!(nodes.get(&nk(2)).map(|n| n.0.as_str()), Some("funcA"));
+        assert_eq!(
+            nodes.get(&(3, 65, 2)).map(|n| n.0.as_str()),
+            Some("funcB")
+        );
+        assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 3_000.0);
+        assert_eq!(*times.get(&(3, 65, 2)).unwrap_or(&0.0), 1_000.0);
+        // Aggregated per (name, url): funcB is not folded into funcA.
+        let result = build_cpu_profile_result(&nodes, &times);
+        let f = |name: &str| {
+            result
+                .functions
+                .iter()
+                .find(|f| f.function_name == name)
+                .map(|f| f.self_time_us)
+                .unwrap_or_default()
+        };
+        assert_eq!(f("funcA"), 3_000.0);
+        assert_eq!(f("funcB"), 1_000.0);
+    }
+
+    #[test]
+    fn windowed_walk_does_not_double_count_deltas0() {
+        // Chunk deltas [4000, 300, 300]: samples sit at base, +300, +600.
+        // The old walk advanced by deltas[k] AFTER recording, drifting every
+        // sample after the first by deltas[0] and emptying mid-chunk windows.
+        let nodes = &[(1, "(root)", None), (2, "funcA", Some(1))];
+        let events = vec![
+            profile_event(1_000_000.0),
+            chunk_event(1_000_000.0, nodes, &[2, 2, 2], &[4_000.0, 300.0, 300.0]),
+        ];
+        // Window covers only sample 1 (at 1_004_300).
+        let windows = [Some((1_004_200.0, 1_004_500.0))];
+        let (_, times) = scan_profile_chunks_windows(&events, None, &windows, 0);
+        assert_eq!(*times[0].get(&nk(2)).unwrap_or(&0.0), 300.0);
     }
 
     #[test]
@@ -704,7 +839,7 @@ mod tests {
         }
         assert_eq!(times_serial[0].len(), times_par[0].len());
         for (id, t) in &times_serial[0] {
-            assert_eq!(times_par[0].get(id), Some(t), "node {} self-time diverged", id);
+            assert_eq!(times_par[0].get(id), Some(t), "node {:?} self-time diverged", id);
         }
     }
 

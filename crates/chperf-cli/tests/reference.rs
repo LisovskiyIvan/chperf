@@ -16,13 +16,14 @@
 //!   first RunTask ph X with dur > 500_000 us on a thread not known non-main
 //!   (IOThread/CrGpuMain/Compositor/ThreadPool/Worker/AudioThread/MemoryInfra),
 //!   else the tid with the most RunTask ph X events (non-main excluded first)
-//! - CPU samples: ProfileChunk events in array order; per-pid walk anchored
-//!   on the first Profile (ph P) event, `prev += timeDeltas[i]` with RAW
-//!   values (may be negative), sample weight = max(0, timeDeltas[i]);
-//!   `prev` carries across chunks of the same pid. Exception: the first
-//!   delta-bearing chunk of each pid has deltas[0] spanning profiler attach
-//!   (the Profile event's ts), so that sample's weight is capped at the
-//!   median of the chunk's other positive deltas (0 if none) — otherwise
+//! - CPU samples: ProfileChunk events in array order; per-session walk
+//!   (session = pid + the Profile head's numeric id, else the sampled tid)
+//!   anchored on the session's Profile (ph P) event, `prev += timeDeltas[i]`
+//!   with RAW values (may be negative), sample weight = max(0, timeDeltas[i]);
+//!   `prev` carries across chunks of the same session. Exception: the first
+//!   delta-bearing chunk of each session has deltas[0] spanning profiler
+//!   attach (the Profile event's ts), so that sample's weight is capped at
+//!   the median of the chunk's other positive deltas (0 if none) — otherwise
 //!   whatever was mid-call at attach inherits the whole warm-up gap
 //! - anchor (cpu-profile pass): earliest sample time per node id, function
 //!   name match preferred over URL match, case-insensitive substring
@@ -32,9 +33,9 @@
 //! - dropped frames: events named DroppedFrame with ts in window
 //! - GC groups (ph X only, dur.unwrap_or(0.0)): major = MajorGC,
 //!   minor = MinorGC | V8.GCScavenger, other = V8.GC*/CppGC* prefixes
-//! - delta metrics: MajorGC+MinorGC only, counted on any tid; RunTask /
+//! - delta metrics: MajorGC+MinorGC+V8.GCScavenger only, counted on any tid; RunTask /
 //!   FunctionCall restricted to the main tid
-//! - long tasks: RunTask on the main tid with dur >= threshold
+//! - long tasks: RunTask on the main tid with dur > threshold
 //! - percentiles: sorted ascending, idx = round(p/100 * (n-1)) clamped
 
 use flate2::read::GzDecoder;
@@ -58,6 +59,9 @@ struct Event {
     dur: Option<f64>,
     tid: u64,
     pid: u64,
+    /// Numeric async/flow id; string ids ("0x2") are None, matching the
+    /// binary's lenient parser.
+    id: Option<u64>,
     args: Option<Value>,
 }
 
@@ -88,8 +92,11 @@ fn load_trace(path: &Path) -> Vec<Event> {
             ph: it.get("ph").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             ts: it.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0),
             dur: it.get("dur").and_then(|v| v.as_f64()),
-            tid: it.get("tid").and_then(|v| v.as_u64()).unwrap_or(0),
-            pid: it.get("pid").and_then(|v| v.as_u64()).unwrap_or(0),
+            tid: it.get("tid").and_then(|v| v.as_i64()).map(|v| v as u64).unwrap_or(0),
+            pid: it.get("pid").and_then(|v| v.as_i64()).map(|v| v as u64).unwrap_or(0),
+            // as_u64 is None for string ids ("0x2") and negatives — both leave
+            // has_id false in the binary's lenient parser.
+            id: it.get("id").and_then(|v| v.as_u64()),
             args: it.get("args").cloned(),
         });
     }
@@ -182,42 +189,43 @@ struct CpuScan {
     /// All samples in chunk-walk order with absolute times and weights.
     samples: Vec<Sample>,
     /// Node table: id -> (functionName, url). First occurrence wins.
-    nodes: HashMap<u64, (String, String)>,
+    nodes: HashMap<(u64, u64, u64), (String, String)>,
 }
 
 /// Walk ProfileChunk events in array order (scan-style, mirroring the
-/// binary's windowed scan): per pid, `prev` starts at the first Profile
-/// (ph P) event's ts (or 0) and carries across chunks. The `prev` advance
-/// depends ONLY on `args.data.timeDeltas`: a chunk with a non-empty
+/// binary's windowed scan): per session, `prev` starts at the session's
+/// Profile (ph P) event's ts (or 0) and carries across chunks. The `prev`
+/// advance depends ONLY on `args.data.timeDeltas`: a chunk with a non-empty
 /// timeDeltas array advances `prev` by the FULL delta sum even when the
 /// cpuProfile/samples arrays are absent (Chrome emits such chunks).
 /// Chunks without timeDeltas contribute nothing and do not advance `prev`.
 ///
 /// Sample times use the scan's record-first formula: a chunk's first
-/// sample sits at `base = prev_at_chunk_start + timeDeltas[0]`, and each
-/// sample is recorded BEFORE its delta is added — so sample i sits at
-/// `base + timeDeltas[0..i]` (unlike the anchor walk's advance-first
-/// formula, which puts sample i at `prev + timeDeltas[0..=i]`; the two
-/// agree when a chunk's deltas are uniform). Weight is `max(0.0, delta)`,
-/// except on the first delta-bearing chunk of a pid, where sample 0's
+/// sample sits at `base = prev_at_chunk_start + timeDeltas[0]`, each sample
+/// is recorded BEFORE advancing, and the advance uses timeDeltas[i+1] — so
+/// sample i sits at `base + timeDeltas[1..=i]`, the same absolute times the
+/// anchor walk's advance-first formula produces. Weight is `max(0.0, delta)`,
+/// except on the first delta-bearing chunk of a session, where sample 0's
 /// weight is capped at the median of the chunk's other positive deltas
 /// (0 if none) — that delta spans profiler attach, not a real interval.
 fn cpu_scan(events: &[Event]) -> CpuScan {
-    let mut starts: HashMap<u64, f64> = HashMap::new();
+    let mut starts: HashMap<(u64, u64), f64> = HashMap::new();
     for e in events {
         if e.name == "Profile" && e.ph == "P" {
-            starts.entry(e.pid).or_insert(e.ts);
+            starts.entry(session_of(e)).or_insert(e.ts);
+            starts.entry((e.pid, e.tid)).or_insert(e.ts);
         }
     }
     let mut samples = Vec::new();
-    let mut nodes: HashMap<u64, (String, String)> = HashMap::new();
-    let mut prev_last: HashMap<u64, f64> = HashMap::new();
+    let mut nodes: HashMap<(u64, u64, u64), (String, String)> = HashMap::new();
+    let mut prev_last: HashMap<(u64, u64), f64> = HashMap::new();
     for e in events {
         if e.name != "ProfileChunk" {
             continue;
         }
         let Some(args) = &e.args else { continue };
         let Some(data) = args.get("data") else { continue };
+        let sess = session_of(e);
         if let Some(cp) = data.get("cpuProfile")
             && let Some(list) = cp.get("nodes").and_then(|n| n.as_array()) {
                 for node in list {
@@ -233,7 +241,7 @@ fn cpu_scan(events: &[Event]) -> CpuScan {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    nodes.entry(id).or_insert((name, url));
+                    nodes.entry((sess.0, sess.1, id)).or_insert((name, url));
                 }
             }
         let Some(deltas) = data.get("timeDeltas").and_then(|t| t.as_array()) else {
@@ -243,12 +251,12 @@ fn cpu_scan(events: &[Event]) -> CpuScan {
             continue;
         };
         let pl = prev_last
-            .get(&e.pid)
+            .get(&sess)
             .copied()
-            .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
-        // First delta-bearing chunk of this pid: deltas[0] spans profiler
+            .unwrap_or_else(|| starts.get(&sess).copied().unwrap_or(0.0));
+        // First delta-bearing chunk of this session: deltas[0] spans profiler
         // attach (the Profile event's ts), cap its sample weight.
-        let first_chunk = !prev_last.contains_key(&e.pid);
+        let first_chunk = !prev_last.contains_key(&sess);
         if let Some(cp) = data.get("cpuProfile")
             && let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array()) {
                 let n = samples_arr.len().min(deltas.len());
@@ -276,11 +284,17 @@ fn cpu_scan(events: &[Event]) -> CpuScan {
                         ts: cur,
                         weight,
                     });
-                    cur += d;
+                    // Advance with the NEXT delta: base already includes
+                    // deltas[0], so sample i sits at base + sum(deltas[1..=i])
+                    // (matches the binary's windowed walk and the anchor walk
+                    // even for non-uniform deltas).
+                    if let Some(next) = deltas.get(si + 1) {
+                        cur += next.as_f64().unwrap_or(0.0);
+                    }
                 }
             }
         let sum: f64 = deltas.iter().filter_map(|v| v.as_f64()).sum();
-        prev_last.insert(e.pid, pl + sum);
+        prev_last.insert(sess, pl + sum);
     }
     CpuScan { samples, nodes }
 }
@@ -305,14 +319,25 @@ fn matches_ignore_case(hay: &str, needle: &str) -> bool {
     !needle.is_empty() && hay.to_lowercase().contains(&needle.to_lowercase())
 }
 
+/// A CPU profiler session: node id spaces and sample-time walks are
+/// per (pid, session). Chunks carry the Profile head's numeric `id` when
+/// present (string ids stay None after load, like the binary's lenient
+/// parser), else the sampled tid stands in.
+fn session_of(e: &Event) -> (u64, u64) {
+    (e.pid, e.id.unwrap_or(e.tid))
+}
+
 /// First sample time per node id, using the binary's anchor-pass walk: the
-/// per-pid `prev` advances ONLY when a chunk carries both a samples and a
+/// per-session `prev` advances ONLY when a chunk carries both a samples and a
 /// timeDeltas array (by the iterated min-length prefix) — unlike the scan
 /// walk, which advances on timeDeltas alone. Both walks exist in the tool
 /// and give the same times on well-formed chunks.
-fn anchor_node_first(events: &[Event], starts: &HashMap<u64, f64>) -> HashMap<u64, f64> {
-    let mut first: HashMap<u64, f64> = HashMap::new();
-    let mut prev_last: HashMap<u64, f64> = HashMap::new();
+fn anchor_node_first(
+    events: &[Event],
+    starts: &HashMap<(u64, u64), f64>,
+) -> HashMap<(u64, u64, u64), f64> {
+    let mut first: HashMap<(u64, u64, u64), f64> = HashMap::new();
+    let mut prev_last: HashMap<(u64, u64), f64> = HashMap::new();
     for e in events {
         if e.name != "ProfileChunk" {
             continue;
@@ -323,22 +348,23 @@ fn anchor_node_first(events: &[Event], starts: &HashMap<u64, f64>) -> HashMap<u6
         let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array()) else { continue };
         let Some(deltas) = data.get("timeDeltas").and_then(|t| t.as_array()) else { continue };
         let n = samples_arr.len().min(deltas.len());
+        let sess = session_of(e);
         let mut cur = prev_last
-            .get(&e.pid)
+            .get(&sess)
             .copied()
-            .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
+            .unwrap_or_else(|| starts.get(&sess).copied().unwrap_or(0.0));
         for i in 0..n {
             let d = deltas[i].as_f64().unwrap_or(0.0);
             cur += d;
             let node = samples_arr[i].as_u64().unwrap_or(0);
             if node != 0 {
-                let t = first.entry(node).or_insert(f64::INFINITY);
+                let t = first.entry((sess.0, sess.1, node)).or_insert(f64::INFINITY);
                 if cur < *t {
                     *t = cur;
                 }
             }
         }
-        prev_last.insert(e.pid, cur);
+        prev_last.insert(sess, cur);
     }
     first
 }
@@ -368,20 +394,21 @@ fn find_anchor(events: &[Event], scan: &CpuScan, pattern: &str) -> Option<Anchor
         return Some(AnchorHit { ts, kind: AnchorKind::FunctionCall, label });
     }
 
-    let mut starts: HashMap<u64, f64> = HashMap::new();
+    let mut starts: HashMap<(u64, u64), f64> = HashMap::new();
     for e in events {
         if e.name == "Profile" && e.ph == "P" {
-            starts.entry(e.pid).or_insert(e.ts);
+            starts.entry(session_of(e)).or_insert(e.ts);
+            starts.entry((e.pid, e.tid)).or_insert(e.ts);
         }
     }
     let first = anchor_node_first(events, &starts);
     let pick = |name: &str| -> Option<(f64, String)> {
         let mut b: Option<(f64, String)> = None;
-        for (id, t) in &first {
+        for (key, t) in &first {
             if *t == f64::INFINITY {
                 continue;
             }
-            let Some((n, u)) = scan.nodes.get(id) else { continue };
+            let Some((n, u)) = scan.nodes.get(key) else { continue };
             let hay = if name == "functionName" { n } else { u };
             if matches_ignore_case(hay, pattern) && b.as_ref().is_none_or(|old| *t < old.0) {
                 b = Some((*t, hay.clone()));
@@ -515,7 +542,7 @@ fn window_stats(
                 "RunTask" => {
                     if let Some(d) = e.dur {
                         st.runtask_us += d;
-                        if d >= lt_us {
+                        if d > lt_us {
                             st.lt_count += 1;
                             st.lt_us += d;
                         }
@@ -526,7 +553,7 @@ fn window_stats(
             }
         }
         match e.name.as_str() {
-            "MajorGC" | "MinorGC" if e.ph == "X" => {
+            "MajorGC" | "MinorGC" | "V8.GCScavenger" if e.ph == "X" => {
                 st.gc_us += e.dur.unwrap_or(0.0);
                 st.gc_count += 1;
             }
@@ -571,7 +598,7 @@ fn gc_stats(events: &[Event], win: (f64, f64), main_tid: u64, lt_us: f64) -> GcS
                 st.groups[g] += 1;
                 st.totals[g] += d;
             }
-            None if e.name == "RunTask" && e.tid == main_tid && d >= lt_us => {
+            None if e.name == "RunTask" && e.tid == main_tid && d > lt_us => {
                 st.lt_count += 1;
                 st.lt_total += d;
             }
@@ -726,7 +753,7 @@ fn verify_trace(path: &Path, pattern: &str) -> Verify {
     let shoot_stats = window_stats(&events, &scan, shoot, main_tid, threshold_us);
     let post_stats = window_stats(&events, &scan, post, main_tid, threshold_us);
 
-    let lt_metric = format!("long tasks ≥{:.0}ms", threshold_us / 1000.0);
+    let lt_metric = format!("long tasks >{:.0}ms", threshold_us / 1000.0);
     for (label, stats) in [
         ("PRE", &pre_stats),
         ("SHOOT", &shoot_stats),
@@ -884,8 +911,8 @@ fn reference_medium_fixture() {
     check_eq("fixture SHOOT long tasks count", s.lt_count as f64, 2.0);
     check_eq("fixture SHOOT main busy (ms)", s.runtask_us / 1000.0, 680.0);
     check_eq("fixture SHOOT JS (ms)", s.js_us / 1000.0, 40.0);
-    check_eq("fixture SHOOT GC (ms)", s.gc_us / 1000.0, 6.0);
-    check_eq("fixture SHOOT GC count", s.gc_count as f64, 2.0);
+    check_eq("fixture SHOOT GC (ms)", s.gc_us / 1000.0, 6.5);
+    check_eq("fixture SHOOT GC count", s.gc_count as f64, 3.0);
 
     let p = &v.pre_stats;
     check_eq("fixture PRE CPU samples (ms)", p.cpu_us / 1000.0, 0.0);
