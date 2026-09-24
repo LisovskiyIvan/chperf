@@ -105,8 +105,9 @@ fn scan_threads(reserve_threads: usize) -> usize {
 
 /// Shared scan core. `windows` may be empty (attribute nothing) or contain
 /// one window per output map; a `None` window matches every sample. The
-/// sequential `profile_chunk_bases` walk only runs when at least one window
-/// needs sample times.
+/// sequential `profile_chunk_bases` walk always runs: windowed attribution
+/// needs sample-time bases, and the profiler-attach cap needs each pid's
+/// first chunk even without windows.
 fn scan_profile_chunks_core(
     events: &[TraceEvent],
     scope: Option<&Scope>,
@@ -115,21 +116,20 @@ fn scan_profile_chunks_core(
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     const MIN_CHUNK_WORK: usize = 64_000;
     let any_window = windows.iter().any(|w| w.is_some());
-    let bases = if any_window {
-        profile_chunk_bases(events)
-    } else {
-        HashMap::default()
-    };
+    let (bases, first_chunks) = profile_chunk_bases(events, any_window);
+    let bases = &bases;
+    let first_chunks = &first_chunks;
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
-        return scan_profile_chunk(events, 0, scope, &bases, windows);
+        return scan_profile_chunk(events, 0, scope, bases, first_chunks, windows);
     }
     let chunk = events.len().div_ceil(threads);
-    let bases = &bases;
     std::thread::scope(|s| {
         let handles: Vec<_> = events
             .chunks(chunk)
             .enumerate()
-            .map(|(ci, c)| s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases, windows)))
+            .map(|(ci, c)| {
+                s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases, first_chunks, windows))
+            })
             .collect();
         let mut nodes: ProfileNodes = ProfileNodes::default();
         let mut times: Vec<ProfileSelfTimes> =
@@ -156,12 +156,18 @@ fn scan_profile_chunks_core(
 /// therefore the weight of its sample, and the absolute time of sample i is
 /// `base + sum(deltas[0..=i])`, where `base` = time of the previous chunk's
 /// last sample + this chunk's first delta. The walk is anchored per process
-/// on the `Profile` (ph=P) event's ts. Returns the base per event index.
+/// on the `Profile` (ph=P) event's ts. Returns the base per event index plus
+/// the event indices of each pid's first chunk — the only chunks whose
+/// deltas[0] spans profiler attach instead of a previous sample (needed to
+/// cap the attach warm-up out of self-time, even without windows).
 ///
 /// With `CHPERF_CHECK` set, also verifies that reconstructed sample times
 /// stay inside the trace bounds — if Chrome ever changes `timeDeltas`
 /// semantics, the drift shows up here instead of silently skewing windows.
-fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
+fn profile_chunk_bases(
+    events: &[TraceEvent],
+    collect_bases: bool,
+) -> (HashMap<usize, f64>, rustc_hash::FxHashSet<usize>) {
     let mut starts: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "Profile" && e.ph == b'P' {
@@ -169,6 +175,7 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
         }
     }
     let mut bases: HashMap<usize, f64> = HashMap::new();
+    let mut first_chunks: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     let mut prev_last: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default(); // last sample time per pid
     // Sample-time bounds (first sample of the walk, last sample per pid) for
     // the CHPERF_CHECK sanity pass.
@@ -193,6 +200,11 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
             .get(&e.pid)
             .copied()
             .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
+        if !prev_last.contains_key(&e.pid) {
+            // First delta-bearing chunk of this pid: its deltas[0] reaches
+            // back to the Profile event's ts, not to a previous sample.
+            first_chunks.insert(idx);
+        }
         let base = pl + first;
         let sum: f64 = td.iter().filter_map(|v| v.as_f64()).sum();
         prev_last.insert(e.pid, pl + sum);
@@ -205,7 +217,9 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
                 sample_max = last;
             }
         }
-        bases.insert(idx, base);
+        if collect_bases {
+            bases.insert(idx, base);
+        }
     }
     if check_enabled() {
         // Compare sample bounds against the trace's own event bounds (skipping
@@ -236,7 +250,7 @@ fn profile_chunk_bases(events: &[TraceEvent]) -> HashMap<usize, f64> {
             );
         }
     }
-    bases
+    (bases, first_chunks)
 }
 
 /// Cached check of the `CHPERF_CHECK` env flag.
@@ -253,6 +267,7 @@ fn scan_profile_chunk(
     global_offset: usize,
     scope: Option<&Scope>,
     bases: &HashMap<usize, f64>,
+    first_chunks: &rustc_hash::FxHashSet<usize>,
     windows: &[Option<(f64, f64)>],
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     let mut node_map: ProfileNodes = ProfileNodes::default();
@@ -315,13 +330,39 @@ fn scan_profile_chunk(
             if n == 0 {
                 continue;
             }
+            // First chunk of a pid: deltas[0] spans profiler attach (the
+            // Profile event's ts) to the first sample instead of a previous
+            // sample, so whatever was mid-call at attach inherits the whole
+            // warm-up gap (hundreds of ms on slow starts). Cap that sample's
+            // weight at the chunk's typical sampling interval; with no
+            // interval to reference, count it as free.
+            let first_cap: f64 = if first_chunks.contains(&(global_offset + i)) {
+                let mut rest: Vec<f64> = deltas[..n]
+                    .iter()
+                    .skip(1)
+                    .filter_map(|v| v.as_f64())
+                    .filter(|d| *d > 0.0)
+                    .collect();
+                if rest.is_empty() {
+                    0.0
+                } else {
+                    rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    rest[rest.len() / 2]
+                }
+            } else {
+                f64::INFINITY
+            };
+            let weight_at = |k: usize| {
+                let w = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
+                if k == 0 { w.min(first_cap) } else { w }
+            };
             let windowed = windows.iter().any(|w| w.is_some());
             if !windowed {
                 let t0 = &mut self_times[0];
-                for k in 0..n {
-                    let weight = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
+                for (k, sample) in samples.iter().take(n).enumerate() {
+                    let weight = weight_at(k);
                     if weight > 0.0 {
-                        let node_id = samples[k].as_u64().unwrap_or(0);
+                        let node_id = sample.as_u64().unwrap_or(0);
                         *t0.entry(node_id).or_default() += weight;
                     }
                 }
@@ -329,12 +370,13 @@ fn scan_profile_chunk(
             }
             let base = bases.get(&(global_offset + i)).copied().unwrap_or(0.0);
             let mut sample_ts = base;
-            for k in 0..n {
-                // Weights clamp negative deltas (V8 sampling jitter); the
-                // time walk uses the raw deltas so timestamps stay true.
-                let weight = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
+            for (k, sample) in samples.iter().take(n).enumerate() {
+                // Weights clamp negative deltas and cap the attach warm-up
+                // (first sample of a pid); the time walk uses the raw deltas
+                // so timestamps stay true.
+                let weight = weight_at(k);
                 if weight > 0.0 {
-                    let node_id = samples[k].as_u64().unwrap_or(0);
+                    let node_id = sample.as_u64().unwrap_or(0);
                     for (wi, w) in windows.iter().enumerate() {
                         if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts <= hi) {
                             *self_times[wi].entry(node_id).or_default() += weight;
@@ -550,6 +592,42 @@ mod tests {
         assert_eq!(*times.get(&3).unwrap_or(&0.0), 15_000.0);
         // Node 4: 4000 + 3000 + clamp(-1000 → 0) + 4000.
         assert_eq!(*times.get(&4).unwrap_or(&0.0), 11_000.0);
+    }
+
+    #[test]
+    fn profiler_attach_warmup_is_capped_on_first_chunk() {
+        // First chunk of the pid: deltas[0] spans profiler attach (360ms of
+        // warm-up landing on whatever was mid-call at attach), the rest are
+        // normal 1ms sampling intervals. Second chunk's deltas[0] is a real
+        // inter-sample gap and must stay uncapped.
+        let nodes = &[(1, "(root)", None), (2, "spatialWebAudioUpdater", Some(1))];
+        let events = vec![
+            profile_event(0.0),
+            chunk_event(0.0, nodes, &[2, 2, 2, 2], &[360_000.0, 1_000.0, 1_000.0, 1_000.0]),
+            chunk_event(1_000_000.0, nodes, &[2], &[50_000.0]),
+        ];
+        // Fast path: capped at the median of chunk 1's other deltas (1ms) →
+        // 1000 + 3 × 1000 + uncapped 50_000.
+        let (_, times) = scan_profile_chunks(&events, None, 0);
+        assert_eq!(*times.get(&2).unwrap_or(&0.0), 54_000.0);
+        // Windowed path caps the same way.
+        let windows = [Some((0.0, 2_000_000.0))];
+        let (_, times) = scan_profile_chunks_windows(&events, None, &windows, 0);
+        assert_eq!(*times[0].get(&2).unwrap_or(&0.0), 54_000.0);
+    }
+
+    #[test]
+    fn attach_cap_with_no_reference_interval_counts_free() {
+        // A single-sample first chunk has no other deltas to derive a
+        // sampling interval from → the attach sample weighs nothing.
+        let nodes = &[(1, "(root)", None), (2, "i", Some(1))];
+        let events = vec![
+            profile_event(0.0),
+            chunk_event(0.0, nodes, &[2], &[360_000.0]),
+            chunk_event(1_000_000.0, nodes, &[2], &[1_000.0]),
+        ];
+        let (_, times) = scan_profile_chunks(&events, None, 0);
+        assert_eq!(*times.get(&2).unwrap_or(&0.0), 1_000.0);
     }
 
     #[test]

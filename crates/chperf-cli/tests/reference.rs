@@ -19,7 +19,11 @@
 //! - CPU samples: ProfileChunk events in array order; per-pid walk anchored
 //!   on the first Profile (ph P) event, `prev += timeDeltas[i]` with RAW
 //!   values (may be negative), sample weight = max(0, timeDeltas[i]);
-//!   `prev` carries across chunks of the same pid
+//!   `prev` carries across chunks of the same pid. Exception: the first
+//!   delta-bearing chunk of each pid has deltas[0] spanning profiler attach
+//!   (the Profile event's ts), so that sample's weight is capped at the
+//!   median of the chunk's other positive deltas (0 if none) — otherwise
+//!   whatever was mid-call at attach inherits the whole warm-up gap
 //! - anchor (cpu-profile pass): earliest sample time per node id, function
 //!   name match preferred over URL match, case-insensitive substring
 //! - frames: same-tid b/e pairs via a stack (e.ts - b.ts when positive);
@@ -194,7 +198,10 @@ struct CpuScan {
 /// sample is recorded BEFORE its delta is added — so sample i sits at
 /// `base + timeDeltas[0..i]` (unlike the anchor walk's advance-first
 /// formula, which puts sample i at `prev + timeDeltas[0..=i]`; the two
-/// agree when a chunk's deltas are uniform). Weight is `max(0.0, delta)`.
+/// agree when a chunk's deltas are uniform). Weight is `max(0.0, delta)`,
+/// except on the first delta-bearing chunk of a pid, where sample 0's
+/// weight is capped at the median of the chunk's other positive deltas
+/// (0 if none) — that delta spans profiler attach, not a real interval.
 fn cpu_scan(events: &[Event]) -> CpuScan {
     let mut starts: HashMap<u64, f64> = HashMap::new();
     for e in events {
@@ -239,15 +246,35 @@ fn cpu_scan(events: &[Event]) -> CpuScan {
             .get(&e.pid)
             .copied()
             .unwrap_or_else(|| starts.get(&e.pid).copied().unwrap_or(0.0));
+        // First delta-bearing chunk of this pid: deltas[0] spans profiler
+        // attach (the Profile event's ts), cap its sample weight.
+        let first_chunk = !prev_last.contains_key(&e.pid);
         if let Some(cp) = data.get("cpuProfile")
             && let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array()) {
                 let n = samples_arr.len().min(deltas.len());
+                let attach_cap: f64 = if first_chunk {
+                    let mut rest: Vec<f64> = deltas[..n]
+                        .iter()
+                        .skip(1)
+                        .filter_map(|v| v.as_f64())
+                        .filter(|d| *d > 0.0)
+                        .collect();
+                    if rest.is_empty() {
+                        0.0
+                    } else {
+                        rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        rest[rest.len() / 2]
+                    }
+                } else {
+                    f64::INFINITY
+                };
                 let mut cur = pl + first;
-                for d in deltas.iter().take(n) {
+                for (si, d) in deltas.iter().take(n).enumerate() {
                     let d = d.as_f64().unwrap_or(0.0);
+                    let weight = if si == 0 { d.max(0.0).min(attach_cap) } else { d.max(0.0) };
                     samples.push(Sample {
                         ts: cur,
-                        weight: d.max(0.0),
+                        weight,
                     });
                     cur += d;
                 }
