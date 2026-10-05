@@ -1,6 +1,6 @@
 //! The hand-rolled, block-parallel `traceEvents` tokenizer and `parse_trace`.
 
-use super::{TraceEvent, TraceFile, TraceMetadata, intern_name};
+use super::{FrameInfo, TraceEvent, TraceFile, TraceMetadata, intern_name};
 use std::io::Read;
 use std::path::Path;
 
@@ -1209,7 +1209,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         eprintln!("  [parse] trace ready: {} events", trace.trace_events.len());
     }
 
-    // Extract page URL from TracingStartedInBrowser event
+    // Extract page URL and frames from TracingStartedInBrowser event
     {
         let meta = trace.metadata.get_or_insert(TraceMetadata {
             cpu_throttling: None,
@@ -1219,8 +1219,9 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             hardware_concurrency: None,
             host_dpr: None,
             page_url: None,
+            frames: Vec::new(),
         });
-        if meta.page_url.is_none() {
+        if meta.page_url.is_none() || meta.frames.is_empty() {
             for e in &trace.trace_events {
                 if e.name == "TracingStartedInBrowser" {
                     if let Some(args) = e.args_value()
@@ -1230,11 +1231,24 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
                             .and_then(|f| f.as_array())
                         {
                             for frame in frames {
-                                if let Some(url) = frame.get("url").and_then(|u| u.as_str())
-                                    && !url.is_empty() && url != "about:blank" {
-                                        meta.page_url = Some(url.to_string());
-                                        break;
-                                    }
+                                let id = frame.get("frame").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let parent_id = frame.get("parent").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                let process_id = frame.get("processId").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let is_main_frame = frame.get("isInPrimaryMainFrame").and_then(|v| v.as_bool()).unwrap_or(false)
+                                    || frame.get("isOutermostMainFrame").and_then(|v| v.as_bool()).unwrap_or(false);
+                                if meta.page_url.is_none() && !url.is_empty() && url != "about:blank" {
+                                    meta.page_url = Some(url.clone());
+                                }
+                                meta.frames.push(FrameInfo {
+                                    id,
+                                    parent_id,
+                                    process_id,
+                                    url,
+                                    name,
+                                    is_main_frame,
+                                });
                             }
                         }
                     break;

@@ -406,6 +406,11 @@ fn build_sections(
         sections.push(("threads", m, j));
     }
 
+    if cli.frame_tree {
+        let (m, j) = inspect::frame_tree_section(events, None, min_ts);
+        sections.push(("frame_tree", m, j));
+    }
+
     if let Some(names_raw) = &cli.events {
         let names: Vec<String> = names_raw
             .split(',')
@@ -413,7 +418,9 @@ fn build_sections(
             .filter(|s| !s.is_empty())
             .collect();
         let filter = inspect::NameFilter::new(&names, cli.regex)?;
-        let (m, j) = if cli.stats {
+        let (m, j) = if cli.gaps {
+            inspect::gaps_section(events, &filter, names_raw.trim(), scope, min_dur_us, cli.top, min_ts)
+        } else if cli.stats {
             inspect::stats_section(events, &filter, names_raw.trim(), scope, min_dur_us, min_ts)
         } else {
             inspect::events_section(
@@ -428,7 +435,12 @@ fn build_sections(
                 min_ts,
             )
         };
-        sections.push((if cli.stats { "stats" } else { "events" }, m, j));
+        sections.push((if cli.gaps { "gaps" } else if cli.stats { "stats" } else { "events" }, m, j));
+    } else if cli.gaps && !cli.input {
+        let names = vec!["EventDispatch".to_string()];
+        let filter = inspect::NameFilter::new(&names, false)?;
+        let (m, j) = inspect::gaps_section(events, &filter, "EventDispatch", scope, min_dur_us, cli.top, min_ts);
+        sections.push(("gaps", m, j));
     }
 
     // Functions and stacks can share a single matcher (filter by name).

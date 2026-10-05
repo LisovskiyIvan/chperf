@@ -44,6 +44,8 @@ const BARE: &[(&str, &str)] = &[
     ("memory", "--memory"),
     ("input", "--input"),
     ("async", "--async"),
+    ("gaps", "--gaps"),
+    ("frame-tree", "--frame-tree"),
 ];
 
 struct Session {
@@ -164,6 +166,11 @@ fn map_bare(tokens: &mut Vec<String>) {
     if t == "stats" {
         tokens[0] = "--events".to_string();
         tokens.push("--stats".to_string());
+        return;
+    }
+    if t == "gaps" && tokens.len() > 1 && !tokens[1].starts_with('-') {
+        tokens[0] = "--events".to_string();
+        tokens.push("--gaps".to_string());
         return;
     }
     if let Some((name, val)) = t.split_once('=')
@@ -326,10 +333,10 @@ fn print_help() {
     println!("  events <name[,name]> [--sort dur|ts|name|count] [--top N] [--min-dur US]");
     println!("      [--tid TID|main] [--pid N] [--cat S] [--around MS] [--window MS] [--regex] [--full-args] [--json]");
     println!("  names [--top N] | threads [--top N] | timeline [--around MS] [--window MS] [--bucket MS]");
-    println!("  stats <names> | function <pat> [--regex] | find <pat> [--regex] [--full-args] | jank [--top N]");
+    println!("  stats <names> | gaps <names> | function <pat> [--regex] | find <pat> [--regex] [--full-args] | jank [--top N]");
     println!("  worst [--task] [--stacks] [--top N] | task [--top N] | stacks [--function P] [--top N] | flame [--function P]");
     println!("  anchor <pat> [--delta] [--pre MS] [--post MS] [--window MS] | delta | calltree [--url P] [--function P]");
-    println!("  gc [--lt MS] | frames [--frame-event NAME] | csv (add --csv to any query)");
+    println!("  gc [--lt MS] | frames [--frame-event NAME] | frame-tree | csv (add --csv to any query)");
     println!("  memory [--around MS] [--window MS] | input [--top N] | async [--top N]");
     println!("  compare <file2> | export [file] | html [file] | summary | throttle N | status | clear | help | quit");
     println!("  every query also accepts [--json] for jq/pipelines");

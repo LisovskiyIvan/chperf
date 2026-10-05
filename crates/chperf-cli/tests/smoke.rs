@@ -46,6 +46,8 @@ fn smoke_basic_sections() {
     contains(&[FIXTURE, "--timeline", "--around", "1000"], "## Timeline");
     contains(&[FIXTURE, "--task", "--top", "2"], "## RunTask breakdown");
     contains(&[FIXTURE, "--events", "RunTask", "--stats"], "## Duration stats");
+    contains(&[FIXTURE, "--events", "RunTask", "--gaps"], "## Event gaps & cadence");
+    contains(&[FIXTURE, "--frame-tree"], "## Frame / Document Tree");
     contains(&[FIXTURE, "--worst", "--events", "RunTask"], "## Events");
 }
 

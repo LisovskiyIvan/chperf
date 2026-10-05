@@ -139,13 +139,23 @@ chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].ar
 chperf trace.json --jank
 
 # Memory timeline: JS heap / DOM nodes / documents / listeners over time,
-# with peak and growth (leak check). JSON gives the full sample list.
+# with peak, growth velocity, and significant change points (leak check). JSON gives the full sample list.
 chperf trace.json --memory
 chperf trace.json --memory --around 5000 --window 2000 --top 100 --json | jq '.sections.memory.summary'
 
-# Input latency by event type (pointer/mouse/key): percentiles + worst events.
+# Input & media latency by event type (EventDispatch): categories (Input/Media/DOM),
+# cadence / frequency (Hz), first-vs-last-5s activity, percentiles + worst events.
 chperf trace.json --input
 chperf trace.json --input --top 10
+
+# Inter-event gaps and cadence/periodicity: detects timer loops, audio/video seek loops,
+# RAF cadence, gap distribution histogram, jitter, and event sequences.
+chperf trace.json --events seeking --gaps
+chperf trace.json --events RunTask --gaps
+
+# Browser frame/document hierarchy from TracingStartedInBrowser:
+# reveals iframes, embedded SVGs, and document topology across processes.
+chperf trace.json --frame-tree
 
 # Async task timings (s/f events paired by id): RAF, GC jobs, timers, …
 chperf trace.json --async
@@ -207,8 +217,10 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--json` | Emit JSON (for jq/pipelines) instead of Markdown |
 | `--csv` | Emit CSV (one block per section) instead of Markdown |
 | `--jank` | Jank clusters: dropped frames / spikes below the Long Task threshold |
-| `--memory` | Memory timeline (JS heap, DOM nodes, documents, listeners) with peak/growth |
-| `--input` | Input latency by type (`EventDispatch`): percentiles + worst events |
+| `--memory` | Memory timeline (JS heap, DOM nodes, documents, listeners) with peak/growth, velocity & jumps |
+| `--input` | Input & media latency by type (`EventDispatch`): categories, cadence, percentiles + worst events |
+| `--gaps` | Inter-event gap distribution, cadence (Hz), jitter & sequence (use with `--events`) |
+| `--frame-tree` | Browser frame & document hierarchy from `TracingStartedInBrowser` (iframes, SVGs, pids) |
 | `--async` | Async task timings (`s`/`f` paired by id): per-name percentiles + longest tasks |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |

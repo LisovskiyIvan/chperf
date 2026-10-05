@@ -5,6 +5,16 @@ use super::TraceEvent;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+#[derive(Deserialize, serde::Serialize, Clone, Debug, PartialEq)]
+pub struct FrameInfo {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub process_id: u64,
+    pub url: String,
+    pub name: String,
+    pub is_main_frame: bool,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct TraceMetadata {
     #[serde(rename = "cpuThrottling", default)]
@@ -23,6 +33,9 @@ pub struct TraceMetadata {
     /// Extracted from TracingStartedInBrowser (not in JSON metadata)
     #[serde(skip)]
     pub page_url: Option<String>,
+    /// Extracted frame tree from TracingStartedInBrowser
+    #[serde(skip)]
+    pub frames: Vec<FrameInfo>,
 }
 
 #[derive(Deserialize)]

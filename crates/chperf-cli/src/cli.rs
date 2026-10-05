@@ -191,6 +191,14 @@ pub(crate) struct Cli {
     /// Inspect: frame event name for --frames/--delta
     #[arg(long, default_value = "SubmitCompositorFrameToPresentationCompositorFrame")]
     pub(crate) frame_event: String,
+
+    /// Inspect: inter-event gap distribution and cadence/periodicity (use with --events or alone)
+    #[arg(long)]
+    pub(crate) gaps: bool,
+
+    /// Inspect: browser frame/document hierarchy from TracingStartedInBrowser
+    #[arg(long = "frame-tree")]
+    pub(crate) frame_tree: bool,
 }
 
 impl Cli {
@@ -215,5 +223,7 @@ impl Cli {
             || self.calltree
             || self.gc
             || self.frames
+            || self.gaps
+            || self.frame_tree
     }
 }
