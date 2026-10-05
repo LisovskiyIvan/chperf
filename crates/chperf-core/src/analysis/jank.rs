@@ -1,7 +1,10 @@
 //! Jank-cluster detection: spikes below the 50ms Long Task threshold.
 
 use crate::inspect::Scope;
-use crate::trace::{TraceEvent, is_metadata_event};
+use crate::trace::{
+    TraceEvent, effective_runtask_dur, find_profiler_overhead, is_metadata_event,
+    is_profiler_dropped_frame,
+};
 
 #[derive(Clone)]
 pub struct JankCluster {
@@ -42,6 +45,7 @@ fn bucket_hot(busy: f64, max_run: f64, max_faf: f64, max_gpu: f64, dropped: u32)
 /// cluster, the dominating FunctionCalls are collected (the "what happened"
 /// chain). This catches spikes that the 50ms Long Task summary misses.
 pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>) -> JankResult {
+    let overheads = find_profiler_overhead(events);
     // One pass for both bounds: min_ts skips metadata events (their ts is the
     // process start), max_ts includes everything.
     let mut min_ts = f64::INFINITY;
@@ -82,10 +86,11 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         match e.name {
             "RunTask" if e.ph == b'X' && e.tid == main_tid => {
-                if let Some(d) = e.dur {
-                    busy[b] += d;
-                    if d > max_run[b] {
-                        max_run[b] = d;
+                if e.dur.is_some() {
+                    let eff = effective_runtask_dur(e, &overheads);
+                    busy[b] += eff;
+                    if eff > max_run[b] {
+                        max_run[b] = eff;
                     }
                 }
             }
@@ -101,7 +106,7 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
                         max_gpu[b] = d;
                     }
             }
-            "DroppedFrame" => {
+            "DroppedFrame" if !is_profiler_dropped_frame(e.ts, &overheads) => {
                 dropped[b] += 1;
             }
             _ => {}
@@ -221,3 +226,44 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         bucket_ms,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
+        TraceEvent {
+            name,
+            id: 0,
+            has_id: false,
+            ph,
+            ts,
+            dur,
+            tid,
+            pid: 1,
+            cat: None,
+            args: None,
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn jank_ignores_profiler_startup_task_and_dropped_frames() {
+        let events = vec![
+            // Profiler startup task with dropped frames during it
+            ev("RunTask", b'X', 1_000_000.0, Some(1_079_000.0), 1),
+            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(1_076_000.0), 1),
+            ev("DroppedFrame", b'I', 1_010_000.0, None, 7),
+            ev("DroppedFrame", b'I', 1_030_000.0, None, 7),
+            // Trace end marker to give span
+            ev("RunTask", b'X', 3_000_000.0, Some(5_000.0), 1),
+        ];
+
+        let res = analyze_jank(&events, 1, None);
+        // All dropped frames were inside profiler freeze, so total_dropped is 0
+        assert_eq!(res.total_dropped, 0);
+        // Profiler task effective duration is 3ms (<16.67ms frame budget and <50ms busy), so no hot clusters
+        assert!(res.clusters.is_empty(), "expected no jank clusters, found {}", res.clusters.len());
+    }
+}
+

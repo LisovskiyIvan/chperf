@@ -5,7 +5,7 @@
 //! Each inspector returns `(markdown, json)` built from a single aggregation
 //! pass, so `--json` stays in sync with the Markdown output.
 
-use crate::trace::TraceEvent;
+use crate::trace::{TraceEvent, effective_runtask_dur, find_profiler_overhead};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -836,6 +836,7 @@ pub fn threads_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
+    let overheads = find_profiler_overhead(events);
     let mut tids: rustc_hash::FxHashMap<u64, (usize, f64, rustc_hash::FxHashMap<&str, usize>)> = rustc_hash::FxHashMap::default();
     for e in events {
         if !scope.allows_event(e) {
@@ -844,7 +845,7 @@ pub fn threads_section(
         let entry = tids.entry(e.tid).or_default();
         entry.0 += 1;
         if e.name == "RunTask" {
-            entry.1 += e.dur.unwrap_or(0.0);
+            entry.1 += effective_runtask_dur(e, &overheads);
         }
         *entry.2.entry(e.name).or_default() += 1;
     }
@@ -932,6 +933,7 @@ pub fn timeline_section(
     let bucket_ms = bucket_ms.unwrap_or_else(|| (span_ms / 40.0).round().clamp(10.0, 500.0));
     let bucket_us = (bucket_ms * 1000.0).max(1.0);
     let n_buckets = (((end - start) / bucket_us).ceil() as usize).max(1);
+    let overheads = find_profiler_overhead(events);
     let mut runtask = vec![0.0f64; n_buckets];
     let mut counts = vec![0usize; n_buckets];
 
@@ -943,10 +945,11 @@ pub fn timeline_section(
         if bi < n_buckets {
             counts[bi] += 1;
             if e.name == "RunTask" {
-                runtask[bi] += e.dur.unwrap_or(0.0);
+                runtask[bi] += effective_runtask_dur(e, &overheads);
             }
         }
     }
+
 
     out.push_str(&format!(
         "## Timeline ({} buckets × {:.0}ms, {})\n\n",
@@ -990,10 +993,16 @@ pub fn timeline_section(
 
 /// Find the longest RunTask (ts, dur) in scope (window ignored). Used by --worst.
 pub fn worst_runtask(events: &[TraceEvent], scope: &Scope) -> Option<(f64, f64)> {
+    let overheads = find_profiler_overhead(events);
     events
         .iter()
         .filter(|e| e.name == "RunTask" && e.ph == b'X' && scope.allows_event(e))
-        .filter_map(|e| e.dur.map(|d| (e.ts, d)))
+        .filter_map(|e| {
+            e.dur.map(|_| {
+                let eff = effective_runtask_dur(e, &overheads);
+                (e.ts, eff)
+            })
+        })
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
 }
 
@@ -1005,11 +1014,16 @@ pub fn task_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut tasks: Vec<&TraceEvent> = events
+    let overheads = find_profiler_overhead(events);
+    let mut tasks: Vec<(&TraceEvent, f64)> = events
         .iter()
         .filter(|e| e.name == "RunTask" && e.ph == b'X' && e.dur.is_some() && scope.allows_event(e))
+        .map(|e| {
+            let eff = effective_runtask_dur(e, &overheads);
+            (e, eff)
+        })
         .collect();
-    tasks.sort_by(|a, b| b.dur.unwrap().partial_cmp(&a.dur.unwrap()).unwrap());
+    tasks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| b.0.dur.unwrap().partial_cmp(&a.0.dur.unwrap()).unwrap()));
     let total = tasks.len();
 
     let mut out = String::new();
@@ -1025,10 +1039,11 @@ pub fn task_section(
 
     let mut json_rows: Vec<Value> = Vec::new();
 
-    for (rank, rt) in tasks.iter().take(top).enumerate() {
+    for (rank, &(rt, eff_dur)) in tasks.iter().take(top).enumerate() {
         let rt_ts = rt.ts;
         let rt_end = rt.ts + rt.dur.unwrap();
         let rt_dur = rt.dur.unwrap();
+        let overhead = (rt_dur - eff_dur).max(0.0);
 
         let mut groups: rustc_hash::FxHashMap<String, (usize, f64)> = rustc_hash::FxHashMap::default();
         let mut top_fc: Option<(String, f64)> = None;
@@ -1055,11 +1070,16 @@ pub fn task_section(
         let mut children: Vec<(String, usize, f64)> = groups.into_iter().map(|(n, (c, d))| (n, c, d)).collect();
         children.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0)));
 
+        let dur_str = if overhead > 0.0 {
+            format!("{}ms (raw {}ms, profiler overhead {}ms)", fmt_ms(eff_dur), fmt_ms(rt_dur), fmt_ms(overhead))
+        } else {
+            format!("{}ms", fmt_ms(rt_dur))
+        };
         out.push_str(&format!(
-            "### #{}  t={:.2}ms  dur={}ms  tid={}\n\n",
+            "### #{}  t={:.2}ms  dur={}  tid={}\n\n",
             rank + 1,
             (rt_ts - min_ts) / 1000.0,
-            fmt_ms(rt_dur),
+            dur_str,
             rt.tid,
         ));
         if children.is_empty() {
@@ -1091,7 +1111,9 @@ pub fn task_section(
         json_rows.push(json!({
             "rank": rank + 1,
             "t_us": (rt_ts - min_ts).round(),
-            "dur_us": rt_dur.round(),
+            "dur_us": eff_dur.round(),
+            "raw_dur_us": rt_dur.round(),
+            "profiler_overhead_us": overhead.round(),
             "tid": rt.tid,
             "children": json_children,
             "top_function_call": top_fc.as_ref().map(|(n, d)| json!({
@@ -1736,4 +1758,29 @@ mod tests {
         // longest first: the 4ms task.
         assert_eq!(j["longest"].as_array().unwrap()[0]["dur_us"], 4_000.0);
     }
+
+    #[test]
+    fn worst_runtask_and_task_section_disregard_profiler_overhead() {
+        let events = vec![
+            evx(1_000_000.0, "RunTask", b'X', Some(1_079_000.0), 0, false, None),
+            evx(1_001_000.0, "CpuProfiler::StartProfiling", b'X', Some(1_076_000.0), 0, false, None),
+            evx(3_000_000.0, "RunTask", b'X', Some(80_000.0), 0, false, None),
+        ];
+        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+
+        // worst_runtask should pick the 80ms task, not the profiler startup task
+        let worst = worst_runtask(&events, &scope);
+        assert_eq!(worst, Some((3_000_000.0, 80_000.0)));
+
+        // task_section should rank the 80ms task #1, and report profiler overhead on the 1079ms task
+        let (md, j) = task_section(&events, &scope, 5, 0.0);
+        let rows = j.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["dur_us"], 80_000.0);
+        assert_eq!(rows[1]["dur_us"], 3_000.0);
+        assert_eq!(rows[1]["raw_dur_us"], 1_079_000.0);
+        assert_eq!(rows[1]["profiler_overhead_us"], 1_076_000.0);
+        assert!(md.contains("profiler overhead 1076.00ms"));
+    }
 }
+

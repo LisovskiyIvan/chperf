@@ -5,7 +5,9 @@
 //! `--csv` stay in sync with the Markdown output.
 
 use crate::inspect::{Matcher, Scope};
-use crate::trace::TraceEvent;
+use crate::trace::{
+    TraceEvent, effective_runtask_dur, find_profiler_overhead, is_profiler_dropped_frame,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -269,11 +271,12 @@ pub fn frames_section(
     frame_event: &str,
     min_ts: f64,
 ) -> (String, Value) {
+    let overheads = find_profiler_overhead(events);
     let mut durs = paired_durations(events, frame_event, scope.window);
     durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let dropped = events
         .iter()
-        .filter(|e| e.name == "DroppedFrame" && scope.allows_event(e))
+        .filter(|e| e.name == "DroppedFrame" && scope.allows_event(e) && !is_profiler_dropped_frame(e.ts, &overheads))
         .count();
     let n = durs.len();
     let (p50, p90, p99, max) = percentiles(&durs);
@@ -333,6 +336,7 @@ pub fn gc_section(
     min_ts: f64,
 ) -> (String, Value) {
     let main_tid = crate::trace::detect_main_thread(events);
+    let overheads = find_profiler_overhead(events);
     let lt_us = lt_ms * 1000.0;
 
     let mut groups: [(&str, usize, f64, f64); 3] = [
@@ -363,10 +367,14 @@ pub fn gc_section(
             if d > g.3 {
                 g.3 = d;
             }
-        } else if e.name == "RunTask" && e.tid == main_tid && d > lt_us {
-            long_tasks.push(d);
+        } else if e.name == "RunTask" && e.tid == main_tid {
+            let eff = effective_runtask_dur(e, &overheads);
+            if eff > lt_us {
+                long_tasks.push(eff);
+            }
         }
     }
+
     long_tasks.sort_by(|a, b| b.partial_cmp(a).unwrap());
     let lt_total: f64 = long_tasks.iter().sum();
     let lt_max = long_tasks.first().copied().unwrap_or(0.0);
@@ -695,6 +703,7 @@ fn delta_windows_stats(
     main_tid: u64,
 ) -> (WindowStats, WindowStats, WindowStats) {
     let lt_us = lt_ms * 1000.0;
+    let overheads = find_profiler_overhead(events);
     let wins = [pre, shoot, post];
     let mut accs = [
         WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
@@ -711,11 +720,12 @@ fn delta_windows_stats(
             if e.ph == b'X' && e.tid == main_tid {
                 match e.name {
                     "RunTask" => {
-                        if let Some(d) = e.dur {
-                            accs[wi].runtask += d;
-                            if d > lt_us {
+                        if e.dur.is_some() {
+                            let eff = effective_runtask_dur(e, &overheads);
+                            accs[wi].runtask += eff;
+                            if eff > lt_us {
                                 accs[wi].lt_count += 1;
-                                accs[wi].lt_us += d;
+                                accs[wi].lt_us += eff;
                             }
                         }
                     }
@@ -731,10 +741,13 @@ fn delta_windows_stats(
                     accs[wi].gc += e.dur.unwrap_or(0.0);
                     accs[wi].gc_count += 1;
                 }
-                "DroppedFrame" => accs[wi].dropped += 1,
+                "DroppedFrame" if !is_profiler_dropped_frame(e.ts, &overheads) => {
+                    accs[wi].dropped += 1;
+                }
                 _ => {}
             }
         }
+
     }
 
     let frame_wins = [

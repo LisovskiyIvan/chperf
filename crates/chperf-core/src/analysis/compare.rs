@@ -737,4 +737,70 @@ mod tests {
         assert!(reflow_finding.is_some(), "missing Forced Reflows finding");
         assert_eq!(reflow_finding.unwrap().severity, FindingSeverity::Regressed);
     }
+
+    #[test]
+    fn compare_profiler_overhead_traces_does_not_produce_false_tbt_or_jank_findings() {
+        use crate::analysis::summary::analyze_summary;
+        use crate::analysis::jank::analyze_jank;
+        use crate::trace::TraceEvent;
+
+        fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
+            TraceEvent {
+                name,
+                id: 0,
+                has_id: false,
+                ph,
+                ts,
+                dur,
+                tid,
+                pid: 1,
+                cat: None,
+                args: None,
+                args_cache: std::sync::OnceLock::new(),
+            }
+        }
+
+        // Trace A: RunTask 1079ms, StartProfiling 1076ms, 3 dropped frames
+        let events_a = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(1_079_000.0), 1),
+            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(1_076_000.0), 1),
+            ev("DroppedFrame", b'I', 1_010_000.0, None, 7),
+            ev("DroppedFrame", b'I', 1_020_000.0, None, 7),
+            ev("DroppedFrame", b'I', 1_030_000.0, None, 7),
+        ];
+
+        // Trace B: RunTask 890ms, StartProfiling 886ms, 1 dropped frame
+        let events_b = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(890_000.0), 1),
+            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(886_000.0), 1),
+            ev("DroppedFrame", b'I', 1_010_000.0, None, 7),
+        ];
+
+        let sum_a = analyze_summary(&events_a, 1);
+        let sum_b = analyze_summary(&events_b, 1);
+        let jank_a = analyze_jank(&events_a, 1, None);
+        let jank_b = analyze_jank(&events_b, 1, None);
+
+        assert_eq!(sum_a.long_task_count, 0);
+        assert_eq!(sum_b.long_task_count, 0);
+        assert_eq!(sum_a.total_blocking_time_us, 0.0);
+        assert_eq!(sum_b.total_blocking_time_us, 0.0);
+        assert_eq!(jank_a.total_dropped, 0);
+        assert_eq!(jank_b.total_dropped, 0);
+
+        let cmp = analyze_compare(
+            &sum_a, &sum_b,
+            &dummy_scroll(), &dummy_scroll(),
+            &dummy_cpu(vec![], 0.0), &dummy_cpu(vec![], 0.0),
+            &dummy_layout(), &dummy_layout(),
+            &dummy_style(), &dummy_style(),
+            &dummy_reflow(0), &dummy_reflow(0),
+            &jank_a, &jank_b,
+        );
+
+        // Neither TBT nor Dropped Frames should generate a finding
+        assert!(cmp.findings.iter().all(|f| f.category != "Total Blocking Time"));
+        assert!(cmp.findings.iter().all(|f| f.category != "Dropped Frames"));
+    }
 }
+

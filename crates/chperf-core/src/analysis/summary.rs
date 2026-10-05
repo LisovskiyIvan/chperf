@@ -1,7 +1,7 @@
 //! Whole-trace summary: duration, long tasks, main-thread busy time and a
 //! per-event-name breakdown.
 
-use crate::trace::{TraceEvent, is_metadata_event};
+use crate::trace::{TraceEvent, effective_runtask_dur, find_profiler_overhead, is_metadata_event};
 
 #[derive(Clone)]
 pub struct EventTypeStat {
@@ -46,6 +46,7 @@ fn target_key(name: &str) -> Option<&'static str> {
 }
 
 pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
+    let overheads = find_profiler_overhead(events);
     // Single pass over the trace: duration bounds, long tasks, busy time, stats.
     let mut long_task_durs: Vec<f64> = Vec::new();
     let mut total_blocking_time_us = 0.0f64;
@@ -69,19 +70,24 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         if e.tid != main_tid || e.ph != b'X' {
             continue;
         }
-        if e.name == "RunTask"
-            && let Some(d) = e.dur {
-                main_thread_busy_us += d;
-                if d > 50_000.0 {
-                    long_task_durs.push(d);
-                    total_blocking_time_us += d - 50_000.0;
-                    long_tasks_total_us += d;
-                }
+        if e.name == "RunTask" && e.dur.is_some() {
+            let eff = effective_runtask_dur(e, &overheads);
+            main_thread_busy_us += eff;
+            if eff > 50_000.0 {
+                long_task_durs.push(eff);
+                total_blocking_time_us += eff - 50_000.0;
+                long_tasks_total_us += eff;
             }
+        }
         if let Some(key) = target_key(e.name)
             && let Some(d) = e.dur {
+                let dur = if e.name == "RunTask" {
+                    effective_runtask_dur(e, &overheads)
+                } else {
+                    d
+                };
                 let entry = stats_map.entry(key).or_default();
-                entry.0 += d;
+                entry.0 += dur;
                 entry.1 += 1;
             }
     }
@@ -121,3 +127,45 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         long_tasks_total_us,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
+        TraceEvent {
+            name,
+            id: 0,
+            has_id: false,
+            ph,
+            ts,
+            dur,
+            tid,
+            pid: 1,
+            cat: None,
+            args: None,
+            args_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn summary_excludes_cpu_profiler_start_from_tbt_and_long_tasks() {
+        // RunTask of 1079ms contains CpuProfiler::StartProfiling of 1076ms.
+        // Effective duration is 3ms -> NOT a long task, 0 TBT, 3ms busy time.
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(1_079_000.0), 1),
+            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(1_076_000.0), 1),
+            ev("RunTask", b'X', 3_000_000.0, Some(80_000.0), 1), // Real 80ms long task
+        ];
+
+        let res = analyze_summary(&events, 1);
+        assert_eq!(res.long_task_count, 1);
+        assert_eq!(res.long_tasks_top, vec![80_000.0]);
+        assert_eq!(res.long_tasks_total_us, 80_000.0);
+        // TBT: (80ms - 50ms) = 30ms. Profiler task contributed 0ms TBT.
+        assert_eq!(res.total_blocking_time_us, 30_000.0);
+        // Main thread busy: 3ms (profiler task effective) + 80ms = 83ms.
+        assert_eq!(res.main_thread_busy_us, 83_000.0);
+    }
+}
+
