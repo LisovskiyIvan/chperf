@@ -13,9 +13,13 @@ fn parse_events_fast(bytes: &[u8], s: usize, e: usize) -> Result<Vec<TraceEvent>
     // ~200 bytes per event on Chrome traces: reserve to skip reallocs.
     let mut events: Vec<TraceEvent> = Vec::with_capacity((e - s).max(1) / 200);
     let mut p = s;
+    p = skip_ws(bytes, p);
+    if p < e && bytes[p] == b'[' {
+        p += 1;
+    }
     loop {
         p = skip_ws(bytes, p);
-        if p >= e {
+        if p >= e || (p < bytes.len() && bytes[p] == b']') {
             break;
         }
         if bytes[p] == b',' {
@@ -27,6 +31,89 @@ fn parse_events_fast(bytes: &[u8], s: usize, e: usize) -> Result<Vec<TraceEvent>
         p = next;
     }
     Ok(events)
+}
+
+fn parse_events_array_fast(bytes: &[u8], s: usize) -> Result<(Vec<TraceEvent>, usize), ()> {
+    let len = bytes.len();
+    let mut p = skip_ws(bytes, s);
+    if p >= len || bytes[p] != b'[' {
+        return Err(());
+    }
+    p += 1;
+    let mut events: Vec<TraceEvent> = Vec::with_capacity((len - p).max(1) / 200);
+    loop {
+        p = skip_ws(bytes, p);
+        if p >= len {
+            return Err(());
+        }
+        if bytes[p] == b']' {
+            return Ok((events, p + 1));
+        }
+        if bytes[p] == b',' {
+            p += 1;
+            continue;
+        }
+        let (ev, next) = parse_event_fast(bytes, p)?;
+        events.push(ev);
+        p = next;
+    }
+}
+
+fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
+    let len = bytes.len();
+    let mut p = skip_ws(bytes, 0);
+    if p >= len || bytes[p] != b'{' {
+        return Err(());
+    }
+    p += 1;
+    let mut trace_events: Option<Vec<TraceEvent>> = None;
+    let mut metadata_span: Option<(usize, usize)> = None;
+
+    loop {
+        p = skip_ws(bytes, p);
+        if p >= len {
+            return Err(());
+        }
+        match bytes[p] {
+            b'}' => break,
+            b',' => {
+                p += 1;
+                continue;
+            }
+            b'"' => {}
+            _ => return Err(()),
+        }
+        let (key, after_key) = parse_key(bytes, p)?;
+        p = skip_ws(bytes, after_key);
+        if p >= len || bytes[p] != b':' {
+            return Err(());
+        }
+        p = skip_ws(bytes, p + 1);
+        if p >= len {
+            return Err(());
+        }
+        if key == b"traceEvents" {
+            let (evs, next_p) = parse_events_array_fast(bytes, p)?;
+            trace_events = Some(evs);
+            p = next_p;
+        } else if key == b"metadata" {
+            if bytes[p] != b'{' {
+                return Err(());
+            }
+            let next_p = skip_value(bytes, p)?;
+            metadata_span = Some((p, next_p));
+            p = next_p;
+        } else {
+            p = skip_value(bytes, p)?;
+        }
+    }
+
+    let trace_events = trace_events.ok_or(())?;
+    let metadata = metadata_span.and_then(|(s, e)| serde_json::from_slice(&bytes[s..e]).ok());
+    Ok(TraceFile {
+        trace_events,
+        metadata,
+    })
 }
 
 /// Parse one event object starting at bytes[p] == b'{'. Returns the event
@@ -48,7 +135,6 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
         pid: 0,
         cat: None,
         args: None,
-        args_cache: std::sync::OnceLock::new(),
     };
     i += 1;
     loop {
@@ -149,7 +235,9 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                     ev.args = None;
                 } else {
                     let end = skip_value(bytes, i)?;
-                    ev.args = Some(std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?.into());
+                    let s = std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?;
+                    let s_static: &'static str = unsafe { std::mem::transmute(s) };
+                    ev.args = Some(s_static);
                     i = end;
                 }
             }
@@ -482,13 +570,11 @@ fn count_unescaped_quotes(chunk: &[u8], prev_trail: usize) -> (usize, usize) {
 
 fn build_blocks(bytes: &[u8]) -> Blocks {
     let nb = bytes.len().div_ceil(BLOCK);
-    let threads = std::thread::available_parallelism()
+    let _threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1)
         .max(1);
-    // Full fan-out here: both phases are streaming and bandwidth-bound, so
-    // even efficiency cores help (unlike the parse workers, capped at 6).
-    let chunk_count = if threads >= 4 && nb >= 64 { threads } else { 1 };
+    let chunk_count = 1;
 
     // Phase 1: per-block quote parity is independent — count in parallel.
     let mut quote_parity = vec![false; nb];
@@ -1114,7 +1200,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // Decompress (if .gz) and parse from an in-memory slice. This is far
     // faster than streaming serde_json through the gzip decoder: zlib-rs
     // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
-    let mut bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+    let bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
         // Preallocate from the gzip footer ISIZE (last 4 bytes, LE u32):
         // a hint for the uncompressed size. Never fail because of it.
         let hint: Option<usize> = (|| {
@@ -1133,7 +1219,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             }
             Some(isize.min(1 << 30))
         })();
-        let mut out = Vec::with_capacity(hint.unwrap_or(0));
+        let mut out = Vec::with_capacity(hint.map(|h| h + 32).unwrap_or(0));
         flate2::read::GzDecoder::new(file).read_to_end(&mut out)?;
         out
     } else {
@@ -1141,48 +1227,62 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         file.take(u64::MAX).read_to_end(&mut out)?;
         out
     };
+    let bytes: &'static mut [u8] = Box::leak(bytes.into_boxed_slice());
 
-    // Fast path: chunk-parallel parse of the traceEvents array.
+    // Fast path: single-pass zero-copy top-level + traceEvents parse without
+    // pre-scanning 64KB blocks across the buffer.
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let mut trace: Option<TraceFile> = None;
     let mut scan_none = false;
-    let t_scan = std::time::Instant::now();
-    if let Some((layout, blocks)) = scan_layout(&bytes) {
+    let t_fast = std::time::Instant::now();
+    if let Ok(tf) = parse_trace_fast(&bytes) {
         if debug {
             eprintln!(
-                "  [parse] scan {:.1}ms: array {}..{}, metadata={}",
-                t_scan.elapsed().as_secs_f64() * 1000.0,
-                layout.arr_open,
-                layout.arr_close,
-                layout.metadata.is_some()
+                "  [parse] fast single-pass {:.1}ms: {} events",
+                t_fast.elapsed().as_secs_f64() * 1000.0,
+                tf.trace_events.len()
             );
         }
-        let threads = parse_thread_count(&(layout.arr_close - layout.arr_open));
-        let t_par = std::time::Instant::now();
-        if debug {
-            eprintln!("  [parse] threads: {}", threads);
-        }
-        match parse_parallel(&mut bytes, &layout, &blocks, threads) {
-            Ok((trace_events, metadata)) => {
-                if debug {
-                    eprintln!(
-                        "  [parse] parallel {:.1}ms: {} events",
-                        t_par.elapsed().as_secs_f64() * 1000.0,
-                        trace_events.len()
-                    );
-                }
-                trace = Some(TraceFile {
-                    trace_events,
-                    metadata,
-                });
-            }
-            Err(e) if debug => eprintln!("  [parse] parallel failed: {}", e),
-            _ => {}
-        }
+        trace = Some(tf);
     } else {
-        scan_none = true;
-        if debug {
-            eprintln!("  [parse] scan returned None, falling back");
+        let t_scan = std::time::Instant::now();
+        if let Some((layout, blocks)) = scan_layout(&bytes) {
+            if debug {
+                eprintln!(
+                    "  [parse] scan {:.1}ms: array {}..{}, metadata={}",
+                    t_scan.elapsed().as_secs_f64() * 1000.0,
+                    layout.arr_open,
+                    layout.arr_close,
+                    layout.metadata.is_some()
+                );
+            }
+            let threads = parse_thread_count(&(layout.arr_close - layout.arr_open));
+            let t_par = std::time::Instant::now();
+            if debug {
+                eprintln!("  [parse] threads: {}", threads);
+            }
+            match parse_parallel(bytes, &layout, &blocks, threads) {
+                Ok((trace_events, metadata)) => {
+                    if debug {
+                        eprintln!(
+                            "  [parse] parallel {:.1}ms: {} events",
+                            t_par.elapsed().as_secs_f64() * 1000.0,
+                            trace_events.len()
+                        );
+                    }
+                    trace = Some(TraceFile {
+                        trace_events,
+                        metadata,
+                    });
+                }
+                Err(e) if debug => eprintln!("  [parse] parallel failed: {}", e),
+                _ => {}
+            }
+        } else {
+            scan_none = true;
+            if debug {
+                eprintln!("  [parse] scan returned None, falling back");
+            }
         }
     }
     // Fallback: whole-buffer parse (unusual layout, non-object elements, …).
@@ -1380,7 +1480,7 @@ mod tests {
         assert_eq!(first.len(), 2, "first chunk owns tiny + giant");
         assert_eq!(first[0].name, "Tiny");
         assert_eq!(first[1].name, "BigEvent");
-        let args_len = first[1].args.as_ref().map(|s| s.len()).unwrap_or(0);
+        let args_len = first[1].args_raw().map(|s| s.len()).unwrap_or(0);
         assert!(args_len > BLOCK, "giant args preserved, got {args_len}");
         let (second, _) = chunk_work(&mut buf, &blocks, to, layout.arr_close).expect("chunk 2");
         assert_eq!(second.len(), 1, "second chunk owns only the trailing tiny");

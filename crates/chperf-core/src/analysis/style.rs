@@ -23,8 +23,9 @@ pub fn analyze_style_recalc(events: &[TraceEvent], main_tid: u64) -> StyleRecalc
         if e.tid != main_tid || e.name != "UpdateLayoutTree" || e.ph != b'X' {
             continue;
         }
-        let element_count = e
-            .args_value()
+        let args = e.args_value();
+        let element_count = args
+            .as_ref()
             .and_then(|a| a.get("elementCount"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;

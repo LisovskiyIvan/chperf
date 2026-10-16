@@ -187,16 +187,17 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
                 continue;
             }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
+        let args = e.args_value();
         if let Some(ci) = in_cluster[b]
             && let Some(d) = e.dur
-                && let Some(name) = e
-                    .args_value()
-                    .and_then(|a| a.get("data"))
-                    .and_then(|d| d.get("functionName"))
-                    .and_then(|v| v.as_str())
-                    && !name.is_empty() {
-                        *calls[ci].entry(name.to_string()).or_default() += d;
-                    }
+            && let Some(name) = args
+                .as_ref()
+                .and_then(|a| a.get("data"))
+                .and_then(|d| d.get("functionName"))
+                .and_then(|v| v.as_str())
+            && !name.is_empty() {
+                *calls[ci].entry(name.to_string()).or_default() += d;
+            }
     }
 
     let clusters: Vec<JankCluster> = top
@@ -243,7 +244,6 @@ mod tests {
             pid: 1,
             cat: None,
             args: None,
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 

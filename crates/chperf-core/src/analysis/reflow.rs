@@ -157,7 +157,6 @@ mod tests {
             pid: 1,
             cat: None,
             args: args.and_then(crate::trace::test_args),
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 

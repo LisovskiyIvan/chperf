@@ -93,14 +93,16 @@ fn main_name_priority(name: &str) -> u8 {
 ///    for nameless traces.
 pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     // One pass: per-thread name (from `thread_name` metadata) + RunTask count.
-    let mut threads: rustc_hash::FxHashMap<u64, (Option<&str>, usize)> =
+    let mut threads: rustc_hash::FxHashMap<u64, (Option<&'static str>, usize)> =
         rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "thread_name" {
-            let name = e
-                .args_value()
+            let args = e.args_value();
+            let name = args
+                .as_ref()
                 .and_then(|a| a.get("name"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .map(crate::trace::intern_name);
             threads.entry(e.tid).or_default().0 = name;
         } else if e.name == "RunTask" && e.ph == b'X' {
             threads.entry(e.tid).or_default().1 += 1;
@@ -207,8 +209,7 @@ mod tests {
             tid,
             pid: 1,
             cat: None,
-            args: args.map(|s| s.into_boxed_str()),
-            args_cache: std::sync::OnceLock::new(),
+            args: args.map(|s| Box::leak(s.into_boxed_str()) as &'static str),
         }
     }
 

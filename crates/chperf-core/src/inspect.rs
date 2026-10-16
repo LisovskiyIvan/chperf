@@ -190,14 +190,16 @@ impl NameFilter {
         if self.matches(e.name) {
             return true;
         }
-        if e.name == "EventDispatch"
-            && let Some(ty) = e
-                .args_value()
+        if e.name == "EventDispatch" {
+            let args = e.args_value();
+            if let Some(ty) = args
+                .as_ref()
                 .and_then(|a| a.get("data"))
                 .and_then(|d| d.get("type"))
                 .and_then(|v| v.as_str())
-        {
-            return self.matches(ty);
+            {
+                return self.matches(ty);
+            }
         }
         false
     }
@@ -279,7 +281,7 @@ pub fn events_section(
             "name": e.name,
             "tid": e.tid,
             "pid": e.pid,
-            "args": e.args_value().cloned().unwrap_or(Value::Null),
+            "args": e.args_value().unwrap_or(Value::Null),
         }));
     }
     if total > top {
@@ -311,7 +313,8 @@ pub fn stats_section(
             continue;
         }
         let label = if e.name == "EventDispatch" {
-            e.args_value()
+            let args = e.args_value();
+            args.as_ref()
                 .and_then(|a| a.get("data"))
                 .and_then(|d| d.get("type"))
                 .and_then(|v| v.as_str())
@@ -524,14 +527,16 @@ pub fn gaps_section(
 
     // Cadence by event type / label
     let get_label = |e: &TraceEvent| -> String {
-        if e.name == "EventDispatch"
-            && let Some(ty) = e
-                .args_value()
+        if e.name == "EventDispatch" {
+            let args = e.args_value();
+            if let Some(ty) = args
+                .as_ref()
                 .and_then(|a| a.get("data"))
                 .and_then(|d| d.get("type"))
                 .and_then(|v| v.as_str())
-        {
-            return format!("EventDispatch:{}", ty);
+            {
+                return format!("EventDispatch:{}", ty);
+            }
         }
         e.name.to_string()
     };
@@ -909,8 +914,8 @@ pub fn find_section(
         };
         // Walk the JSON tree instead of serializing the whole value to a
         // string per event (numbers/bools are skipped without allocation).
-        if value_matches(args, matcher) {
-            let s = serde_json::to_string(args).unwrap_or_default();
+        if value_matches(&args, matcher) {
+            let s = serde_json::to_string(&args).unwrap_or_default();
             let snippet = if full_args {
                 truncate(&s, 500)
             } else {
@@ -963,7 +968,7 @@ pub fn find_section(
             "dur_us": e.dur.unwrap_or(0.0).round(),
             "name": e.name,
             "tid": e.tid,
-            "args": e.args_value().cloned().unwrap_or(Value::Null),
+            "args": e.args_value().unwrap_or(Value::Null),
         }));
     }
     if total > top {
@@ -1338,8 +1343,9 @@ pub fn task_section(
             g.0 += 1;
             g.1 += d;
             if e.name == "FunctionCall" && top_fc.as_ref().is_none_or(|(_, dd)| d > *dd) {
-                let fn_name = e
-                    .args_value()
+                let args = e.args_value();
+                let fn_name = args
+                    .as_ref()
                     .and_then(|a| a.get("data"))
                     .and_then(|d| d.get("functionName"))
                     .and_then(|v| v.as_str())
@@ -1890,8 +1896,9 @@ pub fn input_section(
             continue;
         }
         let d = e.dur.unwrap_or(0.0);
-        let ty = e
-            .args_value()
+        let args = e.args_value();
+        let ty = args
+            .as_ref()
             .and_then(|a| a.get("data"))
             .and_then(|d| d.get("type"))
             .and_then(|v| v.as_str())
@@ -2356,7 +2363,6 @@ mod tests {
             pid: 1,
             cat: cat.map(crate::trace::intern_name),
             args: None,
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -2372,7 +2378,6 @@ mod tests {
             pid: 1,
             cat: None,
             args: None,
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -2440,7 +2445,6 @@ mod tests {
             pid: 1,
             cat: None,
             args: args.and_then(crate::trace::test_args),
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 

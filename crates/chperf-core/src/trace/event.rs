@@ -12,6 +12,12 @@ use serde::Deserialize;
 /// strings still share one pointer across threads.
 pub(crate) fn intern_name(s: &str) -> &'static str {
     thread_local! {
+        // Direct-mapped 64-slot cache: ~95% of trace event names are RunTask,
+        // UpdateLayoutTree, FunctionCall etc. This hits in 1-2ns without touching
+        // TLS FxHashMap or locks.
+        static CACHE: std::cell::UnsafeCell<[Option<(&'static str, &'static str)>; 64]> = const {
+            std::cell::UnsafeCell::new([None; 64])
+        };
         // Per-thread memo of the global intern table: the vocabulary is tiny
         // (a few hundred entries), so after warmup every lookup is a local
         // hash hit and the global RwLock is never touched on the hot path.
@@ -20,12 +26,24 @@ pub(crate) fn intern_name(s: &str) -> &'static str {
         static LOCAL: std::cell::RefCell<rustc_hash::FxHashMap<&'static str, &'static str>> =
             std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     }
-    LOCAL.with(|m| {
-        if let Some(&v) = m.borrow().get(s) {
-            return v;
+    let bytes = s.as_bytes();
+    let h = (bytes.len() ^ (if bytes.is_empty() { 0 } else { bytes[0] as usize })) & 63;
+    CACHE.with(|cache| {
+        let slot = unsafe { &mut (*cache.get())[h] };
+        if let Some((k, v)) = *slot {
+            if k == s {
+                return v;
+            }
         }
-        let v = intern_global(s);
-        m.borrow_mut().insert(v, v);
+        let v = LOCAL.with(|m| {
+            if let Some(&v) = m.borrow().get(s) {
+                return v;
+            }
+            let v = intern_global(s);
+            m.borrow_mut().insert(v, v);
+            v
+        });
+        *slot = Some((v, v));
         v
     })
 }
@@ -59,6 +77,7 @@ fn intern_global(s: &str) -> &'static str {
 /// A single parsed event. `name` and `cat` are interned (see `intern_name`)
 /// and `ph` is a single byte, so the struct is compact: no per-event
 /// allocation for the name, the category, or the phase.
+#[derive(Clone, Copy)]
 pub struct TraceEvent {
     /// Interned event name (see `intern_name`): a shared `&'static str`
     /// instead of a per-event `String` allocation.
@@ -85,16 +104,8 @@ pub struct TraceEvent {
     /// (a few dozen distinct values), so this is a shared `&'static str`
     /// instead of a per-event allocation.
     pub cat: Option<&'static str>,
-    /// Raw `args` JSON text. The fast tokenizer captures the byte range
-    /// without parsing; serde_json's RawValue would validate (full parse) on
-    /// construction, which is exactly what we're avoiding. Owned as `Box<str>`
-    /// (16 bytes vs 24 for `String`, immutable after parse).
-    pub args: Option<Box<str>>,
-    /// Lazily-parsed `args` JSON, boxed so the inline representation is
-    /// 8 bytes (`OnceLock<Option<Box<Value>>>`) instead of 32 for an inline
-    /// `Value`. The parsed value is only allocated on the first `args_value()`
-    /// call; unparsed events pay just the `OnceLock` header.
-    pub(crate) args_cache: std::sync::OnceLock<Option<Box<serde_json::Value>>>,
+    /// Raw `args` JSON text slice directly into the trace buffer (zero-copy).
+    pub args: Option<&'static str>,
 }
 
 impl<'de> Deserialize<'de> for TraceEvent {
@@ -102,13 +113,8 @@ impl<'de> Deserialize<'de> for TraceEvent {
     where
         D: serde::Deserializer<'de>,
     {
-        // Serde fallback (the fast tokenizer is the primary path): deserialize
-        // into an owned shadow struct, then intern the name and category and
-        // fold the phase to its first byte. A derived impl would treat `name: &'static str`
-        // as a borrowed `&str` field and force `'de: 'static`, which breaks
-        // the streaming `Deserializer::from_slice` borrow.
         #[derive(Deserialize)]
-        struct Owned {
+        struct Owned<'a> {
             #[serde(default)]
             name: String,
             #[serde(default, deserialize_with = "deserialize_id")]
@@ -125,10 +131,14 @@ impl<'de> Deserialize<'de> for TraceEvent {
             pid: u64,
             #[serde(default)]
             cat: Option<Box<str>>,
-            #[serde(default, deserialize_with = "deserialize_args_raw")]
-            args: Option<Box<str>>,
+            #[serde(default, deserialize_with = "deserialize_args_raw", borrow)]
+            args: Option<&'a serde_json::value::RawValue>,
         }
         let h = Owned::deserialize(deserializer)?;
+        let args = h.args.map(|r| {
+            let s: &'static str = Box::leak(r.get().to_string().into_boxed_str());
+            s
+        });
         Ok(TraceEvent {
             name: intern_name(&h.name),
             id: h.id.unwrap_or(0),
@@ -139,8 +149,7 @@ impl<'de> Deserialize<'de> for TraceEvent {
             tid: h.tid,
             pid: h.pid,
             cat: h.cat.as_deref().map(intern_name),
-            args: h.args,
-            args_cache: std::sync::OnceLock::new(),
+            args,
         })
     }
 }
@@ -168,57 +177,36 @@ where
 }
 
 /// Serde fallback: capture the `args` field as raw JSON bytes (zero-copy via
-/// RawValue) and own them as a `Box<str>`. Only used when the fast tokenizer
-/// falls back to serde.
-fn deserialize_args_raw<'de, D>(d: D) -> Result<Option<Box<str>>, D::Error>
+/// RawValue). Only used when the fast tokenizer falls back to serde.
+fn deserialize_args_raw<'de, D>(d: D) -> Result<Option<&'de serde_json::value::RawValue>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<&'de serde_json::value::RawValue>::deserialize(d)?;
-    Ok(raw.map(|r| r.get().into()))
+    Option::<&'de serde_json::value::RawValue>::deserialize(d)
 }
 
 /// Test helper: build an event `args` field from a JSON value (stored raw).
 #[cfg(test)]
-pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<str>> {
-    serde_json::to_string(&v).ok().map(String::into_boxed_str)
-}
-
-impl Clone for TraceEvent {
-    fn clone(&self) -> Self {
-        TraceEvent {
-            name: self.name,
-            id: self.id,
-            has_id: self.has_id,
-            ph: self.ph,
-            ts: self.ts,
-            dur: self.dur,
-            tid: self.tid,
-            pid: self.pid,
-            cat: self.cat,
-            args: self.args.clone(),
-            args_cache: std::sync::OnceLock::new(),
-        }
+pub(crate) fn test_args(v: serde_json::Value) -> Option<&'static str> {
+    if v.is_null() {
+        None
+    } else {
+        Some(Box::leak(serde_json::to_string(&v).unwrap().into_boxed_str()))
     }
 }
 
 impl TraceEvent {
-    /// Parsed `args` JSON, or `None` when the event carries no args. The
-    /// first call per event parses and caches the raw bytes.
-    pub fn args_value(&self) -> Option<&serde_json::Value> {
-        self.args_cache
-            .get_or_init(|| {
-                self.args.as_deref()
-                    .and_then(|r| serde_json::from_str(r).ok())
-                    .map(Box::new)
-            })
-            .as_deref()
+    /// Parsed `args` JSON, or `None` when the event carries no args.
+    /// Parsed on-demand; no heavy JSON DOM trees retained in memory.
+    #[inline]
+    pub fn args_value(&self) -> Option<serde_json::Value> {
+        self.args_raw().and_then(|r| serde_json::from_str(r).ok())
     }
 
     /// Raw `args` JSON text, or `None`.
-    #[allow(dead_code)]
-    pub fn args_raw(&self) -> Option<&str> {
-        self.args.as_deref()
+    #[inline]
+    pub fn args_raw(&self) -> Option<&'static str> {
+        self.args
     }
 }
 
@@ -292,17 +280,17 @@ mod tests {
         assert_ne!(ca, cc);
     }
 
-    /// `args_value()` parses once and caches: two calls return the same
-    /// pointer; missing or invalid raw args give `None`.
+    /// `args_value()` parses on demand without retaining memory;
+    /// missing or invalid raw args give `None`.
     #[test]
-    fn args_value_caches_parsed_result() {
+    fn args_value_parses_on_demand() {
         let with_args = event_from_json(
             r#"{"name":"E","ph":"X","ts":1.0,"args":{"foo":42,"bar":[1,2]}}"#,
         );
         let first = with_args.args_value().expect("args must parse");
         assert_eq!(first.get("foo").and_then(|v| v.as_u64()), Some(42));
         let second = with_args.args_value().expect("args must parse again");
-        assert!(std::ptr::eq(first, second), "second call must hit the cache");
+        assert_eq!(first, second);
 
         let without_args = event_from_json(r#"{"name":"E","ph":"X","ts":1.0}"#);
         assert!(without_args.args_value().is_none());
@@ -317,11 +305,9 @@ mod tests {
             tid: 0,
             pid: 0,
             cat: None,
-            args: Some("{not valid json".into()),
-            args_cache: std::sync::OnceLock::new(),
+            args: Some("{not valid json"),
         };
         assert!(invalid.args_value().is_none());
-        // A failed parse also caches (stays `None`, never panics).
         assert!(invalid.args_value().is_none());
     }
 

@@ -756,7 +756,6 @@ mod tests {
                 pid: 1,
                 cat: None,
                 args: None,
-                args_cache: std::sync::OnceLock::new(),
             }
         }
 

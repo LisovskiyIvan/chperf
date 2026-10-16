@@ -113,11 +113,59 @@ pub fn scan_profile_chunks_windows(
     scan_profile_chunks_core(events, scope, windows, scan_threads(reserve_threads))
 }
 
+#[derive(serde::Deserialize)]
+struct ChunkDeltasOnly {
+    data: Option<DeltasData>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeltasData {
+    #[serde(rename = "timeDeltas")]
+    time_deltas: Option<Vec<f64>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChunkFull<'a> {
+    #[serde(borrow)]
+    data: Option<ChunkDataFull<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChunkDataFull<'a> {
+    #[serde(rename = "cpuProfile", borrow)]
+    cpu_profile: Option<CpuProfileFull<'a>>,
+    #[serde(rename = "timeDeltas")]
+    time_deltas: Option<Vec<f64>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CpuProfileFull<'a> {
+    #[serde(borrow)]
+    nodes: Option<Vec<ProfileNodeRaw<'a>>>,
+    samples: Option<Vec<u64>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProfileNodeRaw<'a> {
+    #[serde(default)]
+    id: u64,
+    #[serde(rename = "callFrame", borrow)]
+    call_frame: Option<CallFrameRaw<'a>>,
+    parent: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct CallFrameRaw<'a> {
+    #[serde(rename = "functionName", borrow)]
+    function_name: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    url: Option<std::borrow::Cow<'a, str>>,
+}
+
 fn scan_threads(reserve_threads: usize) -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(reserve_threads).max(1))
+        .map(|n| n.get().saturating_sub(reserve_threads).clamp(1, 4))
         .unwrap_or(1)
-        .max(1)
 }
 
 /// Shared scan core. `windows` may be empty (attribute nothing) or contain
@@ -204,34 +252,44 @@ fn profile_chunk_bases(
     // the CHPERF_CHECK sanity pass.
     let mut sample_min = f64::INFINITY;
     let mut sample_max = f64::NEG_INFINITY;
+    let do_check = check_enabled();
     for (idx, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
             continue;
         }
-        let Some(td) = e
-            .args_value()
-            .and_then(|a| a.get("data"))
-            .and_then(|d| d.get("timeDeltas"))
-            .and_then(|t| t.as_array())
+        let sess = session_of(e);
+        if !collect_bases && !do_check && prev_last.contains_key(&sess) {
+            continue;
+        }
+        let Some(raw) = e.args_raw() else {
+            continue;
+        };
+        if !raw.contains("\"timeDeltas\"") {
+            continue;
+        }
+        let Some(td) = serde_json::from_str::<ChunkDeltasOnly>(raw)
+            .ok()
+            .and_then(|c| c.data)
+            .and_then(|d| d.time_deltas)
         else {
             continue;
         };
-        let Some(first) = td.first().and_then(|v| v.as_f64()) else {
+        let Some(&first) = td.first() else {
             continue;
         };
         let pl = prev_last
-            .get(&session_of(e))
+            .get(&sess)
             .copied()
-            .unwrap_or_else(|| starts.get(&session_of(e)).copied().unwrap_or(0.0));
-        if !prev_last.contains_key(&session_of(e)) {
+            .unwrap_or_else(|| starts.get(&sess).copied().unwrap_or(0.0));
+        if !prev_last.contains_key(&sess) {
             // First delta-bearing chunk of this session: its deltas[0] reaches
             // back to the Profile event's ts, not to a previous sample.
             first_chunks.insert(idx);
         }
         let base = pl + first;
-        let sum: f64 = td.iter().filter_map(|v| v.as_f64()).sum();
-        prev_last.insert(session_of(e), pl + sum);
-        if check_enabled() {
+        let sum: f64 = td.iter().copied().sum();
+        prev_last.insert(sess, pl + sum);
+        if do_check {
             if base < sample_min {
                 sample_min = base;
             }
@@ -244,7 +302,7 @@ fn profile_chunk_bases(
             bases.insert(idx, base);
         }
     }
-    if check_enabled() {
+    if do_check {
         // Compare sample bounds against the trace's own event bounds (skipping
         // metadata events, which carry process-start timestamps).
         let mut ev_min = f64::INFINITY;
@@ -301,38 +359,38 @@ fn scan_profile_chunk(
         if e.name != "ProfileChunk" {
             continue;
         }
-        let args = match e.args_value() {
-            Some(a) => a,
-            None => continue,
+        let Some(raw) = e.args_raw() else {
+            continue;
         };
-        let data = match args.get("data") {
-            Some(d) => d,
-            None => continue,
+        let Ok(parsed) = serde_json::from_str::<ChunkFull>(raw) else {
+            continue;
         };
-        let cpu_profile = match data.get("cpuProfile") {
-            Some(cp) => cp,
-            None => continue,
+        let Some(data) = parsed.data else {
+            continue;
+        };
+        let Some(cpu_profile) = data.cpu_profile else {
+            continue;
         };
 
-        if let Some(nodes) = cpu_profile.get("nodes").and_then(|n| n.as_array()) {
+        if let Some(nodes) = cpu_profile.nodes {
             let sess = session_of(e);
             for node in nodes {
-                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                let call_frame = node.get("callFrame");
-                let func_name = call_frame
-                    .and_then(|cf| cf.get("functionName"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(anonymous)")
-                    .to_string();
-                let url = call_frame
-                    .and_then(|cf| cf.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let parent = node.get("parent").and_then(|v| v.as_u64());
-                node_map
-                    .entry((sess.0, sess.1, id))
-                    .or_insert((func_name, url, parent));
+                let id = node.id;
+                let parent = node.parent;
+                let call_frame = node.call_frame;
+                node_map.entry((sess.0, sess.1, id)).or_insert_with(|| {
+                    let func_name = call_frame
+                        .as_ref()
+                        .and_then(|cf| cf.function_name.as_deref())
+                        .unwrap_or("(anonymous)")
+                        .to_string();
+                    let url = call_frame
+                        .as_ref()
+                        .and_then(|cf| cf.url.as_deref())
+                        .unwrap_or("")
+                        .to_string();
+                    (func_name, url, parent)
+                });
             }
         }
 
@@ -340,33 +398,19 @@ fn scan_profile_chunk(
             && !scope.allows_chunk(e) {
                 continue;
             }
-        let samples = cpu_profile.get("samples").and_then(|s| s.as_array());
-        let time_deltas = data.get("timeDeltas").and_then(|t| t.as_array());
+        let samples = cpu_profile.samples;
+        let time_deltas = data.time_deltas;
 
-        // Each `timeDeltas[i]` is the interval its sample represents (gap to
-        // the previous sample; the first is the gap from the previous
-        // chunk). Sample i lives at `base + prefix(deltas[0..=i])`. The old
-        // code summed deltas directly (cumulative-sum inflation, ~83x on
-        // long traces) and filtered chunks by the chunk's own ts, not the
-        // samples'. Windowed scopes now attribute per-sample by absolute
-        // sample time. With no window in play, the tight loop skips the
-        // sample-time math entirely.
         if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
             let n = samples.len().min(deltas.len());
             if n == 0 {
                 continue;
             }
-            // First chunk of a pid: deltas[0] spans profiler attach (the
-            // Profile event's ts) to the first sample instead of a previous
-            // sample, so whatever was mid-call at attach inherits the whole
-            // warm-up gap (hundreds of ms on slow starts). Cap that sample's
-            // weight at the chunk's typical sampling interval; with no
-            // interval to reference, count it as free.
             let first_cap: f64 = if first_chunks.contains(&(global_offset + i)) {
                 let mut rest: Vec<f64> = deltas[..n]
                     .iter()
                     .skip(1)
-                    .filter_map(|v| v.as_f64())
+                    .copied()
                     .filter(|d| *d > 0.0)
                     .collect();
                 if rest.is_empty() {
@@ -379,17 +423,16 @@ fn scan_profile_chunk(
                 f64::INFINITY
             };
             let weight_at = |k: usize| {
-                let w = deltas[k].as_f64().unwrap_or(0.0).max(0.0);
+                let w = deltas[k].max(0.0);
                 if k == 0 { w.min(first_cap) } else { w }
             };
             let windowed = windows.iter().any(|w| w.is_some());
             if !windowed {
                 let sess = session_of(e);
                 let t0 = &mut self_times[0];
-                for (k, sample) in samples.iter().take(n).enumerate() {
+                for (k, &node_id) in samples.iter().take(n).enumerate() {
                     let weight = weight_at(k);
                     if weight > 0.0 {
-                        let node_id = sample.as_u64().unwrap_or(0);
                         *t0.entry((sess.0, sess.1, node_id)).or_default() += weight;
                     }
                 }
@@ -403,13 +446,12 @@ fn scan_profile_chunk(
             // deltas are non-uniform (idle gap before the chunk's first
             // sample used to shift every sample of the chunk by deltas[0]).
             let mut sample_ts = base;
-            for (k, sample) in samples.iter().take(n).enumerate() {
+            for (k, &node_id) in samples.iter().take(n).enumerate() {
                 // Weights clamp negative deltas and cap the attach warm-up
                 // (first sample of a session); the time walk uses the raw
                 // deltas so timestamps stay true.
                 let weight = weight_at(k);
                 if weight > 0.0 {
-                    let node_id = sample.as_u64().unwrap_or(0);
                     for (wi, w) in windows.iter().enumerate() {
                         if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts <= hi) {
                             *self_times[wi]
@@ -418,8 +460,8 @@ fn scan_profile_chunk(
                         }
                     }
                 }
-                if let Some(d) = deltas.get(k + 1) {
-                    sample_ts += d.as_f64().unwrap_or(0.0);
+                if let Some(&d) = deltas.get(k + 1) {
+                    sample_ts += d;
                 }
             }
         }
@@ -551,7 +593,6 @@ mod tests {
             pid: 2,
             cat: None,
             args: None,
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -578,7 +619,6 @@ mod tests {
                     "timeDeltas": deltas,
                 }
             })),
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -594,7 +634,6 @@ mod tests {
             pid: 2,
             cat: None,
             args: None,
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 

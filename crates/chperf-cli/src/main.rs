@@ -46,7 +46,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
     );
     // The six analysis passes are independent and read-only, so on large
     // traces they run concurrently (each pass itself parallelizes hot work).
-    const PARALLEL_THRESHOLD: usize = 200_000;
+    const PARALLEL_THRESHOLD: usize = 20_000;
     let (summary, scroll_frames, layout_dirty, style_recalc, forced_reflows, jank, (cpu_profile, cpu_cache)) =
         if events.len() >= PARALLEL_THRESHOLD {
             std::thread::scope(|s| {

@@ -67,8 +67,9 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                 continue;
             }
         }
-        let Some(fn_name) = e
-            .args_value()
+        let args = e.args_value();
+        let Some(fn_name) = args
+            .as_ref()
             .and_then(|a| a.get("data"))
             .and_then(|d| d.get("functionName"))
             .and_then(|v| v.as_str())
@@ -209,7 +210,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                 continue;
             }
         let Some(args) = e.args_value() else { continue };
-        if let Some(text) = value_match_text(args, matcher)
+        if let Some(text) = value_match_text(&args, matcher)
             && args_best.as_ref().is_none_or(|b| e.ts < b.ts) {
                 args_best = Some(Anchor {
                     ts: e.ts,
@@ -1070,7 +1071,6 @@ mod tests {
             pid: 2,
             cat: None,
             args: args.and_then(crate::trace::test_args),
-            args_cache: std::sync::OnceLock::new(),
         }
     }
 
