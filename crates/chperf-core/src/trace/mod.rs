@@ -10,7 +10,6 @@ mod parse;
 mod profiler;
 
 pub use event::TraceEvent;
-pub(crate) use event::intern_name;
 pub use event::normalize_be_pairs;
 #[cfg(test)]
 pub(crate) use event::test_args;

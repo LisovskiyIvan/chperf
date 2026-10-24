@@ -91,7 +91,7 @@ fn is_lcp_candidate(name: &str) -> bool {
 }
 
 fn is_user_timing(e: &TraceEvent) -> bool {
-    e.cat == Some("blink.user_timing")
+    e.cat.as_deref() == Some("blink.user_timing")
         || e.name == "PerformanceMark"
         || e.name == "PerformanceMeasure"
 }
@@ -141,7 +141,7 @@ fn user_timing_dur(e: &TraceEvent, args: &Option<serde_json::Value>) -> Option<f
         })
 }
 
-pub fn analyze_loading(events: &[TraceEvent]) -> LoadingResult {
+pub fn analyze_loading(events: &[&TraceEvent]) -> LoadingResult {
     // Earliest (ts, dur) per milestone name; single pass, O(n).
     let mut first: FxHashMap<&str, (f64, Option<f64>)> = FxHashMap::default();
     let mut raw_candidates: Vec<LcpCandidate> = Vec::new();
@@ -150,16 +150,16 @@ pub fn analyze_loading(events: &[TraceEvent]) -> LoadingResult {
     let mut user_timing: Vec<UserTimingEntry> = Vec::new();
 
     for e in events {
-        if is_milestone(e.name) {
-            match first.get(&e.name) {
+        if is_milestone(&e.name) {
+            match first.get(e.name.as_str()) {
                 Some(&(ts, _)) if ts <= e.ts => {}
                 _ => {
-                    first.insert(e.name, (e.ts, e.dur));
+                    first.insert(e.name.as_str(), (e.ts, e.dur));
                 }
             }
             continue;
         }
-        if is_lcp_candidate(e.name) {
+        if is_lcp_candidate(&e.name) {
             let args = e.args_value();
             let data = args.as_ref().and_then(|a| a.get("data"));
             let size = data.and_then(|d| d.get("size")).and_then(num);
@@ -254,11 +254,11 @@ pub fn analyze_loading(events: &[TraceEvent]) -> LoadingResult {
 /// `PerformanceTracker::LongTask`, `longtask`), main thread only, sorted by
 /// timestamp. Empty when the trace lacks them — that is the expected case
 /// for most traces; nothing is synthesized.
-pub fn analyze_long_tasks_official(events: &[TraceEvent], main_tid: u64) -> Vec<LatencyEntry> {
+pub fn analyze_long_tasks_official(events: &[&TraceEvent], main_tid: u64) -> Vec<LatencyEntry> {
     let mut out: Vec<LatencyEntry> = Vec::new();
     for e in events {
         let known = matches!(
-            e.name,
+            e.name.as_str(),
             "EventTiming"
                 | "InteractionToNextPaint"
                 | "responsiveness::UserInteraction"
@@ -296,11 +296,11 @@ pub fn analyze_long_tasks_official(events: &[TraceEvent], main_tid: u64) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::{TraceEvent, intern_name};
+    use crate::trace::TraceEvent;
 
     fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -321,7 +321,7 @@ mod tests {
         args: serde_json::Value,
     ) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -343,7 +343,7 @@ mod tests {
         args: serde_json::Value,
     ) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -351,14 +351,14 @@ mod tests {
             dur,
             tid: 1,
             pid: 1,
-            cat: Some(intern_name(cat)),
+            cat: Some(cat.to_owned()),
             args: crate::trace::test_args(args),
         }
     }
 
     #[test]
     fn happy_path_milestones_lcp_and_user_timing() {
-        let events = vec![
+        let events = [
             ev("navigationStart", b'I', 1_000_000.0, None),
             ev("firstPaint", b'I', 1_200_000.0, None),
             ev("firstContentfulPaint", b'I', 1_300_000.0, None),
@@ -394,7 +394,7 @@ mod tests {
                 serde_json::json!({"data": {"name": "mark-1"}}),
             ),
         ];
-        let r = analyze_loading(&events);
+        let r = analyze_loading(&events.iter().collect::<Vec<_>>());
         assert_eq!(r.navigation_start_us, Some(1_000_000.0));
         assert_eq!(r.first_contentful_paint_us, Some(300_000.0));
         assert_eq!(r.largest_contentful_paint_us, Some(450_000.0));
@@ -433,7 +433,7 @@ mod tests {
                 .all(|e| e.ts_us.is_none() && e.rel_us.is_none())
         );
         // No navigationStart: absolute times, no rel.
-        let r = analyze_loading(&[ev("firstContentfulPaint", b'R', 500_000.0, None)]);
+        let r = analyze_loading(&[&ev("firstContentfulPaint", b'R', 500_000.0, None)]);
         assert_eq!(r.navigation_start_us, None);
         assert_eq!(r.first_contentful_paint_us, Some(500_000.0));
         let fcp = r
@@ -456,24 +456,24 @@ mod tests {
                 serde_json::json!({"data": {"size": 10.0}}),
             )
         };
-        let events = vec![
+        let events = [
             ev("navigationStart", b'R', 0.0, None),
             cand(100_000.0),
             cand(200_000.0),
             ev("largestContentfulPaint::Invalidate", b'I', 250_000.0, None),
             cand(300_000.0),
         ];
-        let r = analyze_loading(&events);
+        let r = analyze_loading(&events.iter().collect::<Vec<_>>());
         assert_eq!(r.lcp.len(), 1);
         assert_eq!(r.lcp[0].ts_us, 300_000.0);
         assert_eq!(r.largest_contentful_paint_us, Some(300_000.0));
         // Everything invalidated -> empty, never 0.
-        let events = vec![
+        let events = [
             ev("navigationStart", b'R', 0.0, None),
             cand(100_000.0),
             ev("largestContentfulPaint::Invalidate", b'I', 500_000.0, None),
         ];
-        let r = analyze_loading(&events);
+        let r = analyze_loading(&events.iter().collect::<Vec<_>>());
         assert!(r.lcp.is_empty());
         assert_eq!(r.largest_contentful_paint_us, None);
     }
@@ -483,7 +483,8 @@ mod tests {
         assert!(analyze_long_tasks_official(&[], 1).is_empty());
         // Non-matching names and other threads are ignored.
         assert!(
-            analyze_long_tasks_official(&[ev("RunTask", b'X', 10.0, Some(60_000.0))], 1).is_empty()
+            analyze_long_tasks_official(&[&ev("RunTask", b'X', 10.0, Some(60_000.0))], 1)
+                .is_empty()
         );
         let mut other_thread = ev_args(
             "EventTiming",
@@ -493,7 +494,7 @@ mod tests {
             serde_json::json!({"data": {"type": "keydown", "duration": 100.0}}),
         );
         other_thread.tid = 9;
-        let events = vec![
+        let events = [
             other_thread,
             ev_args(
                 "EventTiming",
@@ -506,7 +507,7 @@ mod tests {
             ev("PerformanceTracker::LongTask", b'X', 50.0, Some(75_000.0)),
             ev("longtask", b'X', 60.0, Some(60_000.0)),
         ];
-        let r = analyze_long_tasks_official(&events, 1);
+        let r = analyze_long_tasks_official(&events.iter().collect::<Vec<_>>(), 1);
         assert_eq!(r.len(), 4);
         assert_eq!(r[0].name, "EventTiming");
         assert_eq!(r[0].interaction_type, "pointerdown");

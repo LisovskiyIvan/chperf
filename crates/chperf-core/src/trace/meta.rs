@@ -49,6 +49,11 @@ pub struct TraceFile {
     /// `parse_trace` fills them; deserialized traces default to zeros.
     /// `parsed` counts raw events as read (unpaired `B`/`E` included);
     /// synthetic `X` events appended by `normalize_be_pairs` are not counted.
+    ///
+    /// The file is self-contained: every event owns its strings, so dropping
+    /// the source buffer after parsing frees all input memory — holding a
+    /// `TraceFile` retains only the events, and repeated `parse_trace`
+    /// calls accumulate no leaked buffers.
     #[serde(skip)]
     pub stats: ParseStats,
 }
@@ -59,9 +64,9 @@ pub struct TraceFile {
 /// lands in dead time.
 pub fn is_metadata_event(e: &TraceEvent) -> bool {
     matches!(
-        e.name,
+        e.name.as_str(),
         "thread_name" | "process_name" | "thread_sort_index" | "process_sort_index"
-    ) || e.cat == Some("__metadata")
+    ) || e.cat.as_deref() == Some("__metadata")
 }
 
 /// Threads that carry RunTasks but are never "the main thread" for jank
@@ -113,7 +118,7 @@ fn main_name_priority(name: &str) -> u8 {
 ///    for nameless traces.
 pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     // One pass: per-thread name (from `thread_name` metadata) + RunTask count.
-    let mut threads: rustc_hash::FxHashMap<u64, (Option<&'static str>, usize)> =
+    let mut threads: rustc_hash::FxHashMap<u64, (Option<String>, usize)> =
         rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "thread_name" {
@@ -122,7 +127,7 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
                 .as_ref()
                 .and_then(|a| a.get("name"))
                 .and_then(|v| v.as_str())
-                .map(crate::trace::intern_name);
+                .map(str::to_owned);
             threads.entry(e.tid).or_default().0 = name;
         } else if e.name == "RunTask" && e.ph == b'X' {
             threads.entry(e.tid).or_default().1 += 1;
@@ -132,10 +137,15 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     // 1. Named main thread with RunTask activity.
     if let Some((tid, _)) = threads
         .iter()
-        .filter(|(_, (name, n))| *n > 0 && (*name).is_some_and(|n| main_name_priority(n) > 0))
+        .filter(|(_, (name, n))| {
+            *n > 0
+                && (*name)
+                    .as_deref()
+                    .is_some_and(|n| main_name_priority(n) > 0)
+        })
         .max_by_key(|(tid, (name, n))| {
             (
-                main_name_priority((*name).unwrap()),
+                main_name_priority((*name).as_deref().unwrap()),
                 *n,
                 std::cmp::Reverse(*tid),
             )
@@ -152,7 +162,7 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
             && dur > 500_000.0
             && !threads
                 .get(&e.tid)
-                .and_then(|(name, _)| *name)
+                .and_then(|(name, _)| (*name).as_deref())
                 .is_some_and(is_known_non_main)
         {
             return e.tid;
@@ -164,7 +174,7 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
         if let Some((tid, _)) = threads
             .iter()
             .filter(|(_, (name, n))| {
-                *n > 0 && !(exclude_known && (*name).is_some_and(is_known_non_main))
+                *n > 0 && !(exclude_known && (*name).as_deref().is_some_and(is_known_non_main))
             })
             .max_by_key(|(tid, (_, n))| (*n, std::cmp::Reverse(*tid)))
         {
@@ -219,7 +229,7 @@ pub struct ThreadModel {
 pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
     // Per (pid, tid): pid (first seen), name (latest thread_name wins),
     // RunTask (ph X) count.
-    let mut threads: rustc_hash::FxHashMap<(u64, u64), (u64, Option<&'static str>, usize)> =
+    let mut threads: rustc_hash::FxHashMap<(u64, u64), (u64, Option<String>, usize)> =
         rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "thread_name" {
@@ -228,7 +238,7 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
                 .as_ref()
                 .and_then(|a| a.get("name"))
                 .and_then(|v| v.as_str())
-                .map(crate::trace::intern_name);
+                .map(str::to_owned);
             let slot = threads.entry((e.pid, e.tid)).or_insert((e.pid, None, 0));
             if name.is_some() {
                 slot.1 = name;
@@ -242,7 +252,9 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
     let mut compositor: Vec<u64> = threads
         .iter()
         .filter(|(_, (_, name, _))| {
-            (*name).is_some_and(|n| n.to_ascii_lowercase().contains("compositor"))
+            (*name)
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains("compositor"))
         })
         .map(|((_, tid), _)| *tid)
         .collect();
@@ -252,7 +264,12 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
     // Browser main: the CrBrowserMain/Main thread with the most RunTasks.
     let browser_main: Option<u64> = threads
         .iter()
-        .filter(|(_, (_, name, n))| *n > 0 && (*name).is_some_and(|x| main_name_priority(x) == 1))
+        .filter(|(_, (_, name, n))| {
+            *n > 0
+                && (*name)
+                    .as_deref()
+                    .is_some_and(|x| main_name_priority(x) == 1)
+        })
         .max_by_key(|((_, tid), (_, _, n))| (*n, std::cmp::Reverse(*tid)))
         .map(|((_, tid), _)| *tid);
 
@@ -266,19 +283,23 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
     pids.dedup();
     let mut renderers: Vec<RendererThread> = Vec::new();
     for pid in pids {
-        let in_pid: Vec<((u64, u64), Option<&'static str>, usize)> = threads
+        let in_pid: Vec<((u64, u64), Option<String>, usize)> = threads
             .iter()
             .filter(|((p, _), (_, _, n))| *p == pid && *n > 0)
-            .map(|(k, (_, name, n))| (*k, *name, *n))
+            .map(|(k, (_, name, n))| (*k, name.clone(), *n))
             .collect();
         if in_pid.is_empty() {
             continue;
         }
         // (a) Named renderer main in this pid.
-        let mut winner: Option<((u64, u64), &'static str, usize)> = in_pid
+        let mut winner: Option<((u64, u64), String, usize)> = in_pid
             .iter()
-            .filter(|(_, name, _)| (*name).is_some_and(|x| main_name_priority(x) > 1))
-            .map(|(k, name, n)| (*k, (*name).unwrap(), *n))
+            .filter(|(_, name, _)| {
+                (*name)
+                    .as_deref()
+                    .is_some_and(|x| main_name_priority(x) > 1)
+            })
+            .map(|(k, name, n)| (*k, name.clone().unwrap_or_default(), *n))
             .max_by_key(|(k, name, n)| (main_name_priority(name), *n, std::cmp::Reverse(k.1)));
         // (b) Most RunTasks, known non-main lanes excluded; (c) unrestricted.
         if winner.is_none() {
@@ -286,12 +307,12 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
                 if let Some((k, name, n)) = in_pid
                     .iter()
                     .filter(|(_, name, _)| {
-                        !(exclude_known && (*name).is_some_and(is_known_non_main))
+                        !(exclude_known && (*name).as_deref().is_some_and(is_known_non_main))
                     })
-                    .map(|(k, name, n)| (*k, *name, *n))
+                    .map(|(k, name, n)| (*k, name.clone().unwrap_or_default(), *n))
                     .max_by_key(|(k, _, n)| (*n, std::cmp::Reverse(k.1)))
                 {
-                    winner = Some((k, name.unwrap_or(""), n));
+                    winner = Some((k, name, n));
                     break;
                 }
             }
@@ -301,13 +322,13 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
         };
         // A browser-main or known-non-main winner means this pid is not a
         // renderer process (browser / GPU / IO / …).
-        if main_name_priority(wname) == 1 || is_known_non_main(wname) {
+        if main_name_priority(&wname) == 1 || is_known_non_main(&wname) {
             continue;
         }
         renderers.push(RendererThread {
             pid: wpid,
             tid: wtid,
-            name: wname.to_string(),
+            name: wname,
         });
     }
 
@@ -319,15 +340,15 @@ pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
         name: String::new(),
     };
     if primary_tid != 0 {
-        let mut cands: Vec<((u64, u64), Option<&'static str>)> = threads
+        let mut cands: Vec<((u64, u64), Option<String>)> = threads
             .iter()
             .filter(|((_, tid), _)| *tid == primary_tid)
-            .map(|(k, (pid, name, _))| ((*pid, k.1), *name))
+            .map(|(k, (pid, name, _))| ((*pid, k.1), name.clone()))
             .collect();
         cands.sort();
         if let Some(((pid, _), name)) = cands.into_iter().next() {
             primary.pid = pid;
-            primary.name = name.unwrap_or("").to_string();
+            primary.name = name.unwrap_or_default();
         }
         if !renderers.iter().any(|r| r.tid == primary_tid) {
             renderers.push(primary.clone());
@@ -588,11 +609,11 @@ fn glob_match(pat: &str, s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::detect_main_thread;
-    use crate::trace::{TraceEvent, intern_name};
+    use crate::trace::TraceEvent;
 
     fn ev(name: &str, ph: u8, tid: u64, dur: Option<f64>, args: Option<String>) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -601,7 +622,7 @@ mod tests {
             tid,
             pid: 1,
             cat: None,
-            args: args.map(|s| Box::leak(s.into_boxed_str()) as &'static str),
+            args: args.map(|s| s.into_boxed_str()),
         }
     }
 
@@ -769,7 +790,7 @@ mod tests {
 
     fn be(name: &str, ph: u8, tid: u64, pid: u64, dur: Option<f64>) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -784,7 +805,7 @@ mod tests {
 
     fn tn(pid: u64, tid: u64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: intern_name("thread_name"),
+            name: "thread_name".to_owned(),
             id: 0,
             has_id: false,
             ph: b'M',
@@ -793,9 +814,7 @@ mod tests {
             tid,
             pid,
             cat: None,
-            args: Some(
-                Box::leak(format!(r#"{{"name":"{name}"}}"#).into_boxed_str()) as &'static str,
-            ),
+            args: Some(format!(r#"{{"name":"{name}"}}"#).into_boxed_str()),
         }
     }
 

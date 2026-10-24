@@ -1,33 +1,60 @@
 //! CPU profile: parallel ProfileChunk scan, self-time attribution by sample,
-//! and the reusable full-trace cache used by REPL queries.
+//! and the reusable full-trace cache used by windowed queries.
 
 use crate::inspect::Scope;
 use crate::trace::{TraceEvent, is_metadata_event};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// (pid, session, node id) -> (function name, source URL, parent node id,
-/// first-wins). Node ids are only unique within one profiler session: a web
-/// worker or a second renderer process restarts its counter at 1, so keys
-/// must be session-scoped or cross-session collisions merge unrelated
-/// functions under one row.
-///
-/// Session = (pid, profiler session): chunks carry the Profile head's `id`
-/// when present, otherwise the sampled tid stands in.
+/// (pid, session-subkey, generation): V8 restarts its node-id counter per
+/// session, so sample walks and node ids must be scoped per session, not
+/// per (pid, tid). The subkey is the Profile/ProfileChunk head's `id` when
+/// present, else the sampled `tid`; the generation bumps every time a fresh
+/// `Profile` (ph `P`) event reuses an already-seen key, so two isolates
+/// sharing pid+tid never merge into one session.
 ///
 /// FxHash: tuple keys on hot scan paths; SipHash costs ~2-4x on millions of
 /// per-sample lookups.
-pub type SessionKey = (u64, u64);
-/// (pid, session, node id): node ids are only unique within one session.
-pub type NodeKey = (u64, u64, u64);
+pub type SessionKey = (u64, u64, u32);
+/// (pid, session-subkey, generation, node id): node ids are only unique
+/// within one session.
+pub type NodeKey = (u64, u64, u32, u64);
 /// Node table: key -> (functionName, url, per-session parent node id).
 pub type ProfileNodes = rustc_hash::FxHashMap<NodeKey, (String, String, Option<u64>)>;
 /// CPU-profile node -> sampled self-time (µs).
 pub type ProfileSelfTimes = rustc_hash::FxHashMap<NodeKey, f64>;
 
-/// Session a Profile/ProfileChunk event belongs to.
-fn session_of(e: &TraceEvent) -> SessionKey {
-    (e.pid, if e.has_id { e.id } else { e.tid })
+/// Session assignment for a whole event list: one [`SessionKey`] per event,
+/// in order.
+///
+/// The session key is `(pid, id)` when the event carries the
+/// Profile/ProfileChunk head's `id`, else `(pid, tid)` — and a fresh
+/// `Profile` (ph `P`) event on an already-seen key starts a NEW generation
+/// instead of extending the old session. Without the generation split, two
+/// isolates sharing pid+tid whose chunks lack a head `id` merge into one
+/// session: node ids collide and sample walks continue each other.
+///
+/// Id-less chunks attach to the latest `Profile` on their tid (a head with
+/// an `id` still anchors its tid's chunks).
+pub(crate) fn assign_sessions(events: &[TraceEvent]) -> Vec<SessionKey> {
+    let mut generation: rustc_hash::FxHashMap<(u64, u64), u32> = rustc_hash::FxHashMap::default();
+    let mut cur: rustc_hash::FxHashMap<(u64, u64), SessionKey> = rustc_hash::FxHashMap::default();
+    events
+        .iter()
+        .map(|e| {
+            let base = (e.pid, if e.has_id { e.id } else { e.tid });
+            if e.name == "Profile" && e.ph == b'P' {
+                let g = generation.entry(base).or_insert(0);
+                *g += 1;
+                let s = (base.0, base.1, *g);
+                cur.insert(base, s);
+                cur.insert((e.pid, e.tid), s);
+                s
+            } else {
+                *cur.get(&base).unwrap_or(&(base.0, base.1, 0))
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -113,7 +140,8 @@ pub fn scan_profile_chunks(
 ) -> (ProfileNodes, ProfileSelfTimes) {
     let windows = [scope.and_then(|s| s.window)];
     let threads = scan_threads(reserve_threads);
-    let (nodes, mut times) = scan_profile_chunks_core(events, scope, &windows, threads);
+    let sessions = assign_sessions(events);
+    let (nodes, mut times) = scan_profile_chunks_core(events, scope, &windows, &sessions, threads);
     (nodes, times.remove(0))
 }
 
@@ -126,7 +154,14 @@ pub fn scan_profile_chunks_windows(
     windows: &[Option<(f64, f64)>],
     reserve_threads: usize,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
-    scan_profile_chunks_core(events, scope, windows, scan_threads(reserve_threads))
+    let sessions = assign_sessions(events);
+    scan_profile_chunks_core(
+        events,
+        scope,
+        windows,
+        &sessions,
+        scan_threads(reserve_threads),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -193,15 +228,17 @@ fn scan_profile_chunks_core(
     events: &[TraceEvent],
     scope: Option<&Scope>,
     windows: &[Option<(f64, f64)>],
+    sessions: &[SessionKey],
     threads: usize,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     const MIN_CHUNK_WORK: usize = 64_000;
     let any_window = windows.iter().any(|w| w.is_some());
-    let (bases, first_chunks) = profile_chunk_bases(events, any_window);
+    let (bases, first_chunks) = profile_chunk_bases(events, sessions, any_window);
     let bases = &bases;
     let first_chunks = &first_chunks;
+    let sessions = &sessions;
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
-        return scan_profile_chunk(events, 0, scope, bases, first_chunks, windows);
+        return scan_profile_chunk(events, 0, scope, bases, first_chunks, sessions, windows);
     }
     let chunk = events.len().div_ceil(threads);
     std::thread::scope(|s| {
@@ -210,7 +247,7 @@ fn scan_profile_chunks_core(
             .enumerate()
             .map(|(ci, c)| {
                 s.spawn(move || {
-                    scan_profile_chunk(c, ci * chunk, scope, bases, first_chunks, windows)
+                    scan_profile_chunk(c, ci * chunk, scope, bases, first_chunks, sessions, windows)
                 })
             })
             .collect();
@@ -220,8 +257,12 @@ fn scan_profile_chunks_core(
             .collect();
         for h in handles {
             let (n, t) = h.join().unwrap();
+            // Latest definition wins, in chunk order: V8 reuses node ids
+            // within a session, so the last chunk's names/parents describe
+            // the live frames. (Joining in chunk order keeps this
+            // deterministic across thread schedules.)
             for (id, v) in n {
-                nodes.entry(id).or_insert(v);
+                nodes.insert(id, v);
             }
             for (wi, m) in t.into_iter().enumerate() {
                 for (id, dt) in m {
@@ -239,27 +280,28 @@ fn scan_profile_chunks_core(
 /// start), delta[i] = gap between sample i−1 and sample i. Each delta is
 /// therefore the weight of its sample, and the absolute time of sample i is
 /// `base + sum(deltas[0..=i])`, where `base` = time of the previous chunk's
-/// last sample + this chunk's first delta. The walk is anchored per process
-/// on the `Profile` (ph=P) event's ts. Returns the base per event index plus
-/// the event indices of each pid's first chunk — the only chunks whose
-/// deltas[0] spans profiler attach instead of a previous sample (needed to
-/// cap the attach warm-up out of self-time, even without windows).
+/// last sample + this chunk's first delta. The walk is anchored per profiler
+/// session (see `assign_sessions`) on the `Profile` (ph=P) event's ts.
+/// Returns the base per event index plus the event indices of each session's
+/// first chunk — the only chunks whose deltas[0] spans profiler attach
+/// instead of a previous sample (needed to cap the attach warm-up out of
+/// self-time, even without windows).
 ///
 /// With `CHPERF_CHECK` set, also verifies that reconstructed sample times
 /// stay inside the trace bounds — if Chrome ever changes `timeDeltas`
 /// semantics, the drift shows up here instead of silently skewing windows.
 fn profile_chunk_bases(
     events: &[TraceEvent],
+    sessions: &[SessionKey],
     collect_bases: bool,
 ) -> (HashMap<usize, f64>, rustc_hash::FxHashSet<usize>) {
-    // Profile heads register their anchor under both the session key and
-    // (pid, tid): chunks of a session may lack the head's `id`, and the tid
-    // fallback must then still find the right anchor.
+    // Profile heads register their anchor under their assigned session; the
+    // per-event session assignment already resolved id-less chunks to the
+    // latest Profile on their tid, so no (pid, tid) aliasing is needed here.
     let mut starts: rustc_hash::FxHashMap<SessionKey, f64> = rustc_hash::FxHashMap::default();
-    for e in events {
+    for (e, s) in events.iter().zip(sessions.iter()) {
         if e.name == "Profile" && e.ph == b'P' {
-            starts.entry(session_of(e)).or_insert(e.ts);
-            starts.entry((e.pid, e.tid)).or_insert(e.ts);
+            starts.entry(*s).or_insert(e.ts);
         }
     }
     let mut bases: HashMap<usize, f64> = HashMap::new();
@@ -276,7 +318,7 @@ fn profile_chunk_bases(
         if e.name != "ProfileChunk" {
             continue;
         }
-        let sess = session_of(e);
+        let sess = sessions[idx];
         if !collect_bases && !do_check && prev_last.contains_key(&sess) {
             continue;
         }
@@ -361,13 +403,14 @@ fn check_enabled() -> bool {
 
 /// Single-threaded scan of one events slice, shared by the parallel helper.
 /// `global_offset` maps slice-local indices back to event indices for the
-/// chunk bases lookup.
+/// chunk bases and session lookups.
 fn scan_profile_chunk(
     events: &[TraceEvent],
     global_offset: usize,
     scope: Option<&Scope>,
     bases: &HashMap<usize, f64>,
     first_chunks: &rustc_hash::FxHashSet<usize>,
+    sessions: &[SessionKey],
     windows: &[Option<(f64, f64)>],
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     let mut node_map: ProfileNodes = ProfileNodes::default();
@@ -379,6 +422,7 @@ fn scan_profile_chunk(
         if e.name != "ProfileChunk" {
             continue;
         }
+        let sess = sessions[global_offset + i];
         let Some(raw) = e.args_raw() else {
             continue;
         };
@@ -393,24 +437,30 @@ fn scan_profile_chunk(
         };
 
         if let Some(nodes) = cpu_profile.nodes {
-            let sess = session_of(e);
             for node in nodes {
                 let id = node.id;
                 let parent = node.parent;
                 let call_frame = node.call_frame;
-                node_map.entry((sess.0, sess.1, id)).or_insert_with(|| {
-                    let func_name = call_frame
-                        .as_ref()
-                        .and_then(|cf| cf.function_name.as_deref())
-                        .unwrap_or("(anonymous)")
-                        .to_string();
-                    let url = call_frame
-                        .as_ref()
-                        .and_then(|cf| cf.url.as_deref())
-                        .unwrap_or("")
-                        .to_string();
-                    (func_name, url, parent)
-                });
+                // Latest definition wins: V8 reuses node ids within a
+                // session (later chunks redefine id 1..N for new frames),
+                // so an `or_insert` would keep a stale name and attribute
+                // later samples to the old function.
+                node_map.insert(
+                    (sess.0, sess.1, sess.2, id),
+                    (
+                        call_frame
+                            .as_ref()
+                            .and_then(|cf| cf.function_name.as_deref())
+                            .unwrap_or("(anonymous)")
+                            .to_string(),
+                        call_frame
+                            .as_ref()
+                            .and_then(|cf| cf.url.as_deref())
+                            .unwrap_or("")
+                            .to_string(),
+                        parent,
+                    ),
+                );
             }
         }
 
@@ -449,18 +499,16 @@ fn scan_profile_chunk(
             };
             let windowed = windows.iter().any(|w| w.is_some());
             if !windowed {
-                let sess = session_of(e);
                 let t0 = &mut self_times[0];
                 for (k, &node_id) in samples.iter().take(n).enumerate() {
                     let weight = weight_at(k);
                     if weight > 0.0 {
-                        *t0.entry((sess.0, sess.1, node_id)).or_default() += weight;
+                        *t0.entry((sess.0, sess.1, sess.2, node_id)).or_default() += weight;
                     }
                 }
                 continue;
             }
             let base = bases.get(&(global_offset + i)).copied().unwrap_or(0.0);
-            let sess = session_of(e);
             // Sample i lives at `base + sum(deltas[1..=i])` (base already
             // includes deltas[0]); advancing by deltas[k+1] keeps the walk in
             // step with Chrome's own advance-first sample times even when
@@ -474,8 +522,14 @@ fn scan_profile_chunk(
                 let weight = weight_at(k);
                 if weight > 0.0 {
                     for (wi, w) in windows.iter().enumerate() {
-                        if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts <= hi) {
-                            *self_times[wi].entry((sess.0, sess.1, node_id)).or_default() += weight;
+                        // Left-closed, right-open: a sample exactly on a
+                        // window edge belongs to the window starting there,
+                        // so adjacent PRE/SHOOT/POST windows never share a
+                        // sample.
+                        if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts < hi) {
+                            *self_times[wi]
+                                .entry((sess.0, sess.1, sess.2, node_id))
+                                .or_default() += weight;
                         }
                     }
                 }
@@ -489,7 +543,7 @@ fn scan_profile_chunk(
 }
 
 /// Test-only convenience wrapper; production code uses `analyze_cpu_profile_full`
-/// so the raw node table + self-times can be kept for the REPL cache.
+/// so the raw node table + self-times can be kept in the cache for later queries.
 #[cfg(test)]
 pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
     analyze_cpu_profile_full(events).0
@@ -611,7 +665,7 @@ mod tests {
 
     fn profile_event(ts: f64) -> TraceEvent {
         TraceEvent {
-            name: "Profile",
+            name: "Profile".to_owned(),
             id: 0,
             has_id: false,
             ph: b'P',
@@ -637,7 +691,7 @@ mod tests {
             })
             .collect();
         TraceEvent {
-            name: "ProfileChunk",
+            name: "ProfileChunk".to_owned(),
             id: 0,
             has_id: false,
             ph: b'P',
@@ -657,7 +711,7 @@ mod tests {
 
     fn plain_event(ts: f64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -703,9 +757,10 @@ mod tests {
         times.values().sum()
     }
 
-    /// Node key in the fixture's single session: pid 2, session = tid 65.
+    /// Node key in the fixture's single session: pid 2, subkey tid 65,
+    /// first (and only) generation.
     fn nk(n: u64) -> crate::analysis::NodeKey {
-        (2, 65, n)
+        (2, 65, 1, n)
     }
 
     #[test]
@@ -720,6 +775,122 @@ mod tests {
         assert_eq!(*times.get(&nk(3)).unwrap_or(&0.0), 15_000.0);
         // Node 4: 4000 + 3000 + clamp(-1000 → 0) + 4000.
         assert_eq!(*times.get(&nk(4)).unwrap_or(&0.0), 11_000.0);
+    }
+
+    /// Node-id reuse takes the latest definition; a fresh Profile on the
+    /// same pid+tid starts a new session; window bounds are [lo, hi).
+    #[test]
+    fn node_id_reuse_takes_latest_definition() {
+        // V8 reuses node ids within a session: a later chunk redefines id 2
+        // under a new name. Latest wins — the old code's `or_insert` kept
+        // the stale name and attributed the new samples to the old function.
+        let events = vec![
+            profile_event(0.0),
+            chunk_event(
+                0.0,
+                &[(1, "(root)", None), (2, "oldFunc", Some(1))],
+                &[2],
+                &[1_000.0],
+            ),
+            chunk_event(
+                10_000.0,
+                &[(1, "(root)", None), (2, "newFunc", Some(1))],
+                &[2],
+                &[1_000.0],
+            ),
+        ];
+        let (nodes, times) = scan_profile_chunks(&events, None, 0);
+        assert_eq!(nodes.get(&nk(2)).map(|n| n.0.as_str()), Some("newFunc"));
+        // Chunk 1's lone sample is attach warm-up (capped to 0 with no
+        // sibling deltas); only chunk 2's sample weighs in.
+        assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 1_000.0);
+        let result = build_cpu_profile_result(&nodes, &times);
+        assert!(
+            result
+                .functions
+                .iter()
+                .all(|f| f.function_name != "oldFunc")
+        );
+        assert_eq!(
+            result
+                .functions
+                .iter()
+                .find(|f| f.function_name == "newFunc")
+                .map(|f| f.self_time_us),
+            Some(1_000.0)
+        );
+    }
+
+    #[test]
+    fn fresh_profile_starts_new_session_on_same_pid_tid() {
+        // Two isolates sharing pid+tid, chunks without a head `id`: the
+        // second `Profile` (ph P) starts a new session instead of extending
+        // the old one — same node id, separate names and self-times.
+        let events = vec![
+            profile_event(0.0),
+            chunk_event(
+                0.0,
+                &[(1, "(root)", None), (2, "isoA", Some(1))],
+                &[2, 2],
+                &[500.0, 500.0],
+            ),
+            profile_event(1_000_000.0),
+            chunk_event(
+                1_000_000.0,
+                &[(1, "(root)", None), (2, "isoB", Some(1))],
+                &[2, 2],
+                &[700.0, 700.0],
+            ),
+        ];
+        let sessions = assign_sessions(&events);
+        // Profile, chunk, Profile, chunk: generations 1, 1, 2, 2.
+        assert_eq!(
+            sessions,
+            vec![(2, 65, 1), (2, 65, 1), (2, 65, 2), (2, 65, 2)]
+        );
+        let (nodes, times) = scan_profile_chunks(&events, None, 0);
+        assert_eq!(
+            nodes.get(&(2, 65, 1, 2)).map(|n| n.0.as_str()),
+            Some("isoA")
+        );
+        assert_eq!(
+            nodes.get(&(2, 65, 2, 2)).map(|n| n.0.as_str()),
+            Some("isoB")
+        );
+        // Each session's first chunk has its attach warm-up capped at the
+        // median of its sibling deltas: 500 + 500 and 700 + 700.
+        assert_eq!(*times.get(&(2, 65, 1, 2)).unwrap_or(&0.0), 1_000.0);
+        assert_eq!(*times.get(&(2, 65, 2, 2)).unwrap_or(&0.0), 1_400.0);
+        // The second session's samples must not continue the first walk:
+        // its windowed base restarts at its own Profile ts.
+        let windows = [Some((1_000_000.0, 2_000_000.0))];
+        let (_, wtimes) = scan_profile_chunks_windows(&events, None, &windows, 0);
+        assert_eq!(*wtimes[0].get(&(2, 65, 2, 2)).unwrap_or(&0.0), 1_400.0);
+        assert!(!wtimes[0].contains_key(&(2, 65, 1, 2)));
+    }
+
+    #[test]
+    fn windowed_sample_window_is_left_closed_right_open() {
+        // Samples at 1_005_000 and 1_010_000. A window ending exactly on a
+        // sample excludes it; a window starting on it includes it — adjacent
+        // windows never share a sample.
+        let events = vec![
+            profile_event(1_000_000.0),
+            chunk_event(
+                1_000_000.0,
+                &[(1, "(root)", None), (2, "f", Some(1))],
+                &[2, 2],
+                &[5_000.0, 5_000.0],
+            ),
+        ];
+        let windows = [
+            Some((1_005_000.0, 1_010_000.0)),
+            Some((1_010_000.0, 1_015_000.0)),
+        ];
+        let (_, times) = scan_profile_chunks_windows(&events, None, &windows, 0);
+        assert_eq!(times.len(), 2);
+        assert_eq!(*times[0].get(&nk(2)).unwrap_or(&0.0), 5_000.0);
+        assert_eq!(*times[1].get(&nk(2)).unwrap_or(&0.0), 5_000.0);
     }
 
     #[test]
@@ -814,9 +985,12 @@ mod tests {
         // Same node id 2, different sessions: both names survive; each keeps
         // its own self-time (A capped at 1ms interval; B at its own 500µs).
         assert_eq!(nodes.get(&nk(2)).map(|n| n.0.as_str()), Some("funcA"));
-        assert_eq!(nodes.get(&(3, 65, 2)).map(|n| n.0.as_str()), Some("funcB"));
+        assert_eq!(
+            nodes.get(&(3, 65, 1, 2)).map(|n| n.0.as_str()),
+            Some("funcB")
+        );
         assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 3_000.0);
-        assert_eq!(*times.get(&(3, 65, 2)).unwrap_or(&0.0), 1_000.0);
+        assert_eq!(*times.get(&(3, 65, 1, 2)).unwrap_or(&0.0), 1_000.0);
         // Aggregated per (name, url): funcB is not folded into funcA.
         let result = build_cpu_profile_result(&nodes, &times);
         let f = |name: &str| {
@@ -857,7 +1031,9 @@ mod tests {
             cat: None,
         };
         let (_, times) = scan_profile_chunks(&events, Some(&scope), 0);
-        assert_eq!(total(&times), 30_000.0); // 6 × 5ms samples ending at 1_030_000
+        // 5 × 5ms: the sample exactly at 1_030_000 belongs to the next
+        // [lo, hi) window, not this one.
+        assert_eq!(total(&times), 25_000.0);
 
         let scope2 = Scope {
             window: Some((1_040_000.0, 1_050_000.0)),
@@ -881,7 +1057,7 @@ mod tests {
         ];
         let (_, times) = scan_profile_chunks_windows(&events, None, &windows, 0);
         assert_eq!(times.len(), 2);
-        assert_eq!(total(&times[0]), 30_000.0);
+        assert_eq!(total(&times[0]), 25_000.0);
         assert_eq!(total(&times[1]), 7_000.0);
         // A None window matches everything (tid-filter-only scopes).
         let (_, times) = scan_profile_chunks_windows(&events, None, &[None], 0);
@@ -923,8 +1099,10 @@ mod tests {
         }
         assert!(events.len() >= 64_000);
 
-        let (nodes_serial, times_serial) = scan_profile_chunks_core(&events, None, &[None], 1);
-        let (nodes_par, times_par) = scan_profile_chunks_core(&events, None, &[None], 8);
+        let sessions = assign_sessions(&events);
+        let (nodes_serial, times_serial) =
+            scan_profile_chunks_core(&events, None, &[None], &sessions, 1);
+        let (nodes_par, times_par) = scan_profile_chunks_core(&events, None, &[None], &sessions, 8);
         assert_eq!(nodes_serial.len(), nodes_par.len());
         for (id, v) in &nodes_serial {
             assert_eq!(nodes_par.get(id), Some(v));

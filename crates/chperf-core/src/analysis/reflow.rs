@@ -152,7 +152,7 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
                     let s = c.ts.max(rt_ts);
                     let e = (c.ts + c_dur).min(rt_end);
                     if e > s {
-                        match c.name {
+                        match c.name.as_str() {
                             "FunctionCall" | "EvaluateScript" | "v8.run" | "v8.compile" => {
                                 js_spans.push((s, e));
                             }
@@ -254,7 +254,7 @@ mod tests {
 
     fn ev_x(ts: f64, dur: f64, name: &str, args: Option<serde_json::Value>) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',

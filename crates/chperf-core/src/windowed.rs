@@ -23,20 +23,20 @@ pub struct Anchor {
     pub label: String,
 }
 
-fn value_match_text<'a>(v: &'a Value, matcher: &Matcher) -> Option<&'a str> {
+fn value_match_text(v: &Value, matcher: &Matcher) -> Option<String> {
     match v {
-        Value::String(s) => matcher.matches(s).then_some(s.as_str()),
+        Value::String(s) => matcher.matches(s).then(|| s.clone()),
         Value::Array(a) => a.iter().find_map(|v| value_match_text(v, matcher)),
         Value::Object(m) => m.iter().find_map(|(k, v)| {
             if matcher.matches(k) {
-                Some(k.as_str())
+                Some(k.clone())
             } else {
                 value_match_text(v, matcher)
             }
         }),
         Value::Number(n) => {
             let s = n.to_string();
-            matcher.matches(&s).then_some(Box::leak(s.into_boxed_str()))
+            matcher.matches(&s).then_some(s)
         }
         _ => None,
     }
@@ -89,21 +89,27 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // Pass 2: CPU profile node names / URLs, by earliest sample time.
     // Sample times walk each session's chunk sequence anchored on the
     // session's `Profile` (ph=P) event; timeDeltas are inter-sample gaps.
-    // Sessions (workers, multiple processes) have independent node id
-    // spaces and walks, so both are keyed by (pid, session).
-    let mut starts: rustc_hash::FxHashMap<(u64, u64), f64> = rustc_hash::FxHashMap::default();
-    for e in events {
+    // Sessions (workers, multiple processes, reused pid+tid) have
+    // independent node id spaces and walks, keyed by `assign_sessions` exactly
+    // like the CPU scan, so anchor times agree with `scan_profile_chunks`.
+    let sessions = crate::analysis::assign_sessions(events);
+    // Profile-head anchor per session (same resolution as
+    // `profile_chunk_bases`): id-less chunks attach to the latest Profile
+    // on their tid via the session assignment.
+    let mut starts: rustc_hash::FxHashMap<crate::analysis::SessionKey, f64> =
+        rustc_hash::FxHashMap::default();
+    for (e, s) in events.iter().zip(sessions.iter()) {
         if e.name == "Profile" && e.ph == b'P' {
-            starts
-                .entry((e.pid, if e.has_id { e.id } else { e.tid }))
-                .or_insert(e.ts);
-            starts.entry((e.pid, e.tid)).or_insert(e.ts);
+            starts.entry(*s).or_insert(e.ts);
         }
     }
-    let mut node_first: rustc_hash::FxHashMap<(u64, u64, u64), (f64, String, String)> =
+    let mut node_first: rustc_hash::FxHashMap<
+        (crate::analysis::SessionKey, u64),
+        (f64, String, String),
+    > = rustc_hash::FxHashMap::default();
+    let mut prev_last: rustc_hash::FxHashMap<crate::analysis::SessionKey, f64> =
         rustc_hash::FxHashMap::default();
-    let mut prev_last: rustc_hash::FxHashMap<(u64, u64), f64> = rustc_hash::FxHashMap::default();
-    for e in events {
+    for (idx, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
             continue;
         }
@@ -119,7 +125,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             Some(cp) => cp,
             None => continue,
         };
-        let sess = (e.pid, if e.has_id { e.id } else { e.tid });
+        let sess = sessions[idx];
         for node in cpu_profile
             .get("nodes")
             .and_then(|n| n.as_array())
@@ -127,7 +133,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             .flatten()
         {
             let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-            let key = (sess.0, sess.1, id);
+            let key = (sess, id);
             if id == 0 || node_first.contains_key(&key) {
                 continue;
             }
@@ -159,7 +165,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                 sample_ts += deltas[i].as_f64().unwrap_or(0.0);
                 let id = s.as_u64().unwrap_or(0);
                 if id != 0
-                    && let Some(entry) = node_first.get_mut(&(sess.0, sess.1, id))
+                    && let Some(entry) = node_first.get_mut(&(sess, id))
                     && sample_ts < entry.0
                 {
                     entry.0 = sample_ts;
@@ -218,7 +224,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             args_best = Some(Anchor {
                 ts: e.ts,
                 kind: "args",
-                label: text.to_string(),
+                label: text,
             });
         }
     }
@@ -298,17 +304,21 @@ pub fn dropped_frames(events: &[TraceEvent], scope: Option<&Scope>) -> usize {
 
 /// Pair `b`/`e` events with the given name into durations (µs). Chrome frame
 /// pipeline events are traced as `b`/`e` pairs without `dur`; same-thread
-/// pairing via a stack. Events outside `window` are skipped by their `b` ts.
+/// pairing via a stack.
+///
+/// Window rule: pairing runs globally per tid stack, then pairs are filtered
+/// by their **begin** (`b`) timestamp — an `e` outside the window still
+/// closes a pair whose `b` is inside (and vice versa: a `b` outside is
+/// ignored even when its `e` lands inside). Concretely the window keeps
+/// pairs with `lo <= b.ts < hi`, so frames are attributed to their submit
+/// time. Windows are left-closed, right-open, matching the CPU sample
+/// attribution and the PRE/SHOOT/POST event sweep: adjacent windows never
+/// share a pair.
 fn paired_durations(events: &[TraceEvent], name: &str, window: Option<(f64, f64)>) -> Vec<f64> {
     let mut stacks: HashMap<u64, Vec<f64>> = HashMap::new();
-    let mut durs = Vec::new();
+    let mut pairs: Vec<(f64, f64)> = Vec::new(); // (b_ts, dur)
     for e in events {
         if e.name != name {
-            continue;
-        }
-        if let Some((lo, hi)) = window
-            && (e.ts < lo || e.ts > hi)
-        {
             continue;
         }
         match e.ph {
@@ -318,13 +328,20 @@ fn paired_durations(events: &[TraceEvent], name: &str, window: Option<(f64, f64)
                     && let Some(t) = st.pop()
                     && e.ts > t
                 {
-                    durs.push(e.ts - t);
+                    pairs.push((t, e.ts - t));
                 }
             }
             _ => {}
         }
     }
-    durs
+    match window {
+        None => pairs.into_iter().map(|(_, d)| d).collect(),
+        Some((lo, hi)) => pairs
+            .into_iter()
+            .filter(|(b, _)| *b >= lo && *b < hi)
+            .map(|(_, d)| d)
+            .collect(),
+    }
 }
 
 /// Linear-interpolated percentiles over ascending-sorted samples:
@@ -347,6 +364,10 @@ fn percentiles(sorted_asc: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 /// Per-frame duration stats + dropped frames within a window.
+///
+/// Frames are attributed to their submit time: `paired_durations` pairs by
+/// the `b` (begin) event, so a frame whose `e` falls outside the window
+/// still counts when its `b` is inside (and vice versa).
 pub fn frames_section(
     events: &[TraceEvent],
     scope: &Scope,
@@ -462,7 +483,7 @@ pub fn gc_section(
             continue;
         }
         let d = e.dur.unwrap_or(0.0);
-        let gi = match e.name {
+        let gi = match e.name.as_str() {
             "MajorGC" => Some(0),
             "MinorGC" | "V8.GCScavenger" => Some(1),
             n if n.starts_with("V8.GC") || n.starts_with("CppGC") => Some(2),
@@ -575,7 +596,7 @@ pub fn calltree_section(
     for (key, (_, _, parent)) in nodes.iter() {
         match parent {
             Some(p) => {
-                let pk = (key.0, key.1, *p);
+                let pk = (key.0, key.1, key.2, *p);
                 if nodes.contains_key(&pk) {
                     children.entry(pk).or_default().push(*key);
                 } else {
@@ -612,7 +633,7 @@ pub fn calltree_section(
         let Some(Some(p)) = nodes.get(&id).map(|n| n.2) else {
             continue;
         };
-        let pk = (id.0, id.1, p);
+        let pk = (id.0, id.1, id.2, p);
         if nodes.contains_key(&pk) {
             let inc = *inclusive.get(&id).unwrap_or(&0.0);
             *inclusive.entry(pk).or_default() += inc;
@@ -758,7 +779,8 @@ pub fn calltree_section(
 }
 
 fn fmt_ms(us: f64) -> String {
-    format!("{:.2}", us / 1000.0)
+    // `+ 0.0` collapses -0.0 to +0.0 (see inspect.rs `fmt_ms`).
+    format!("{:.2}", us / 1000.0 + 0.0)
 }
 
 // ── Delta: PRE / SHOOT / POST (--delta) ──
@@ -861,11 +883,14 @@ fn delta_windows_stats(
     for e in events {
         let ts = e.ts;
         for (wi, (lo, hi)) in wins.iter().enumerate() {
-            if ts < *lo || ts > *hi {
+            // Left-closed, right-open (same as `paired_durations` and the
+            // CPU sample attribution): adjacent PRE/SHOOT/POST windows never
+            // share an event; frames are attributed to their submit time.
+            if ts < *lo || ts >= *hi {
                 continue;
             }
             if e.ph == b'X' && e.tid == main_tid {
-                match e.name {
+                match e.name.as_str() {
                     "RunTask" => {
                         if e.dur.is_some() {
                             let eff = effective_runtask_dur(e, &overheads);
@@ -883,7 +908,7 @@ fn delta_windows_stats(
             // Same minor-GC family `gc_section` counts (MinorGC / V8.GCScavenger);
             // omitting the scavenger name made --delta report 0 GC where --gc
             // showed scavenges.
-            match e.name {
+            match e.name.as_str() {
                 "MajorGC" | "MinorGC" | "V8.GCScavenger" if e.ph == b'X' => {
                     accs[wi].gc += e.dur.unwrap_or(0.0);
                     accs[wi].gc_count += 1;
@@ -1110,6 +1135,9 @@ pub fn delta_data_with_budget(
 /// Compare PRE / SHOOT / POST windows around an anchor: frame stats, dropped
 /// frames, GC, long tasks, main-thread busy/JS and CPU sample totals, plus
 /// SHOOT−PRE and POST−SHOOT deltas.
+///
+/// Frames are attributed to their submit time (window holds the `b` event);
+/// see `paired_durations`.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_section(
     events: &[TraceEvent],
@@ -1129,8 +1157,8 @@ pub fn delta_section(
 /// callers that also need the raw rows (e.g. the two-trace compare) compute
 /// `delta_data` exactly once per trace.
 pub fn delta_section_from_data(data: &DeltaData, min_ts: f64) -> (String, Value) {
-    let ms = |v: f64| format!("{:.1}", v / 1000.0);
-    let dms = |a: f64, b: f64| format!("{:+.1}", (b - a) / 1000.0);
+    let ms = |v: f64| format!("{:.1}", v / 1000.0 + 0.0);
+    let dms = |a: f64, b: f64| format!("{:+.1}", (b - a) / 1000.0 + 0.0);
     let dcount = |a: f64, b: f64| format!("{:+}", b as i64 - a as i64);
     let num = |v: f64| (v / 1000.0 * 10.0).round() / 10.0; // ms, 1 decimal
 
@@ -1309,7 +1337,7 @@ mod tests {
         args: Option<serde_json::Value>,
     ) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: ph.as_bytes().first().copied().unwrap_or(0),
@@ -1415,6 +1443,26 @@ mod tests {
         let a4 = find_anchor(&events, &m4).expect("anchor");
         assert_eq!(a4.kind, "args");
         assert_eq!(a4.ts, 1_000_100.0);
+    }
+
+    /// Window rule for frame pairs: a pair belongs to the window holding
+    /// its `b`. An `e` outside the window still closes an inside `b`
+    /// (counted); a `b` outside is ignored even when its `e` lands inside.
+    #[test]
+    fn paired_durations_filter_by_begin_only() {
+        let events = vec![
+            ev("DrawFrame", "b", 1_000_000.0, None, None),
+            ev("DrawFrame", "e", 1_020_000.0, None, None), // e outside
+            ev("DrawFrame", "b", 2_000_000.0, None, None), // b outside
+            ev("DrawFrame", "e", 2_005_000.0, None, None),
+        ];
+        let durs = paired_durations(&events, "DrawFrame", Some((0.0, 1_010_000.0)));
+        assert_eq!(durs, vec![20_000.0]);
+        let durs = paired_durations(&events, "DrawFrame", Some((1_990_000.0, 3_000_000.0)));
+        assert_eq!(durs, vec![5_000.0]);
+        // Unwindowed pairing is unaffected.
+        let durs = paired_durations(&events, "DrawFrame", None);
+        assert_eq!(durs, vec![20_000.0, 5_000.0]);
     }
 
     /// Frame b/e pairing golden: durations 16ms and 20ms, 2 dropped frames.
@@ -1662,8 +1710,10 @@ mod tests {
             .find(|m| m["metric"] == "CPU samples")
             .unwrap();
         assert_eq!(cpu["pre"], 0.0);
-        assert_eq!(cpu["shoot"], 30.0); // ms in the delta table
-        assert_eq!(cpu["delta_pre"], 30.0); // 30ms
+        // 5 × 5ms samples: the one exactly at 1_030_000 is the next
+        // window's ([lo, hi)), not SHOOT's.
+        assert_eq!(cpu["shoot"], 25.0); // ms in the delta table
+        assert_eq!(cpu["delta_pre"], 25.0); // 25ms
     }
 
     /// CSV escaping: commas, quotes and newlines inside fields.

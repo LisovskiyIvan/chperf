@@ -1,4 +1,10 @@
-//! The parsed trace event and its name interner.
+//! The parsed trace event model (fully owned, no borrowed buffers).
+//!
+//! Every `TraceEvent` owns its strings (`name`, `cat`, `args`). Parsing
+//! copies the small slices it needs out of the file buffer and drops the
+//! buffer afterwards, so a parsed `TraceFile` is self-contained: no
+//! `Box::leak`, no `mem::forget`, no `'static` transmutes anywhere on the
+//! parse path, and repeated `parse_trace` calls retain no memory.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -93,93 +99,17 @@ pub(crate) fn parse_tid_pid_str(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Intern an event name or category into a `&'static str`. Chrome traces reuse
-/// a small set of names and categories across millions of events, so
-/// interning turns one heap allocation per event into a shared reference —
-/// a large memory win and better cache locality. Distinct strings are leaked
-/// (bounded by the trace's vocabulary, a few hundred entries at most).
-/// Lookups are cached in a per-thread memo, so the hot path never touches
-/// the global lock; every cached value comes from the global table, so equal
-/// strings still share one pointer across threads.
-pub(crate) fn intern_name(s: &str) -> &'static str {
-    thread_local! {
-        // Direct-mapped 64-slot cache: ~95% of trace event names are RunTask,
-        // UpdateLayoutTree, FunctionCall etc. This hits in 1-2ns without touching
-        // TLS FxHashMap or locks.
-        static CACHE: std::cell::UnsafeCell<[Option<(&'static str, &'static str)>; 64]> = const {
-            std::cell::UnsafeCell::new([None; 64])
-        };
-        // Per-thread memo of the global intern table: the vocabulary is tiny
-        // (a few hundred entries), so after warmup every lookup is a local
-        // hash hit and the global RwLock is never touched on the hot path.
-        // Values always come from the global table, so equal strings still
-        // share one pointer across threads.
-        static LOCAL: std::cell::RefCell<rustc_hash::FxHashMap<&'static str, &'static str>> =
-            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-    }
-    let bytes = s.as_bytes();
-    let h = (bytes.len()
-        ^ (if bytes.is_empty() {
-            0
-        } else {
-            bytes[0] as usize
-        }))
-        & 63;
-    CACHE.with(|cache| {
-        let slot = unsafe { &mut (*cache.get())[h] };
-        if let Some((k, v)) = *slot
-            && k == s
-        {
-            return v;
-        }
-        let v = LOCAL.with(|m| {
-            if let Some(&v) = m.borrow().get(s) {
-                return v;
-            }
-            let v = intern_global(s);
-            m.borrow_mut().insert(v, v);
-            v
-        });
-        *slot = Some((v, v));
-        v
-    })
-}
-
-/// Global intern table backing `intern_name`: the source of truth for
-/// pointer identity. The thread-local memo only ever stores values returned
-/// from here.
-fn intern_global(s: &str) -> &'static str {
-    use std::sync::{OnceLock, RwLock};
-    static TABLE: OnceLock<RwLock<rustc_hash::FxHashSet<&'static str>>> = OnceLock::new();
-    let table = TABLE.get_or_init(|| RwLock::new(rustc_hash::FxHashSet::default()));
-    // Fast path: concurrent readers. The name vocabulary is tiny (a few
-    // hundred entries), so once warm virtually every lookup hits and runs
-    // under a shared read lock with no cross-thread serialization — the
-    // parallel tokenizer was contending on a single Mutex here before.
-    if let Ok(guard) = table.read()
-        && let Some(&existing) = guard.get(s)
-    {
-        return existing;
-    }
-    // Slow path: a genuinely new name. Re-check under the write lock (two
-    // threads can both miss and race here), then leak the interned copy.
-    let mut guard = table.write().unwrap_or_else(|p| p.into_inner());
-    if let Some(&existing) = guard.get(s) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    guard.insert(leaked);
-    leaked
-}
-
-/// A single parsed event. `name` and `cat` are interned (see `intern_name`)
-/// and `ph` is a single byte, so the struct is compact: no per-event
-/// allocation for the name, the category, or the phase.
-#[derive(Clone, Copy)]
+/// A single parsed event. All strings are owned (`String` / `Box<str>`):
+/// parsing copies each event's slices out of the file buffer, so the buffer
+/// is freed when parsing finishes and a `TraceFile` never borrows from it.
+/// `name`/`cat` values repeat heavily across a trace; the per-event cost is
+/// one small allocation each (see the parse-throughput test in `parse.rs`).
+/// `ph` is a single byte, so the struct stays compact.
+#[derive(Clone, Debug)]
 pub struct TraceEvent {
-    /// Interned event name (see `intern_name`): a shared `&'static str`
-    /// instead of a per-event `String` allocation.
-    pub name: &'static str,
+    /// Event name (owned per event; Chrome traces reuse a small vocabulary,
+    /// so these compress well but are not shared between events).
+    pub name: String,
     /// Async id: pairs `s` (start) / `f` (finish) events with the same
     /// `(pid, id)`. `0` unless `has_id` is set — `0` is a valid Chrome id
     /// (GC jobs use it), so it cannot serve as an absence sentinel. Placed
@@ -198,12 +128,12 @@ pub struct TraceEvent {
     #[allow(dead_code)]
     pub pid: u64,
     #[allow(dead_code)]
-    /// Interned category (see `intern_name`): categories repeat heavily
-    /// (a few dozen distinct values), so this is a shared `&'static str`
-    /// instead of a per-event allocation.
-    pub cat: Option<&'static str>,
-    /// Raw `args` JSON text slice directly into the trace buffer (zero-copy).
-    pub args: Option<&'static str>,
+    /// Event category (owned; a few dozen distinct values repeat across the
+    /// trace, so this compresses well but is not shared between events).
+    pub cat: Option<String>,
+    /// Raw `args` JSON text (owned copy of the event's `args` slice).
+    /// Parsed on demand via `args_value`; no JSON DOM is retained.
+    pub args: Option<Box<str>>,
 }
 
 impl<'de> Deserialize<'de> for TraceEvent {
@@ -230,7 +160,7 @@ impl<'de> Deserialize<'de> for TraceEvent {
             #[serde(default, deserialize_with = "deserialize_tid_pid")]
             pid: u64,
             #[serde(default)]
-            cat: Option<Box<str>>,
+            cat: Option<String>,
             #[serde(default, deserialize_with = "deserialize_args_raw", borrow)]
             args: Option<&'a serde_json::value::RawValue>,
         }
@@ -245,12 +175,11 @@ impl<'de> Deserialize<'de> for TraceEvent {
             h.id.as_ref()
                 .and_then(id_from_value)
                 .or_else(|| h.id2.as_ref().and_then(id2_from_value));
-        let args = h.args.map(|r| {
-            let s: &'static str = Box::leak(r.get().to_string().into_boxed_str());
-            s
-        });
+        // Owned copy of the raw `args` slice: the source buffer is freed
+        // after parsing, so events must not borrow from it.
+        let args = h.args.map(|r| Box::<str>::from(r.get()));
         Ok(TraceEvent {
-            name: intern_name(&h.name),
+            name: h.name,
             id: id_opt.unwrap_or(0),
             has_id: id_opt.is_some(),
             ph: h.ph.as_bytes().first().copied().unwrap_or(0),
@@ -258,7 +187,7 @@ impl<'de> Deserialize<'de> for TraceEvent {
             dur: h.dur,
             tid: h.tid,
             pid: h.pid,
-            cat: h.cat.as_deref().map(intern_name),
+            cat: h.cat,
             args,
         })
     }
@@ -361,15 +290,13 @@ where
     Option::<&'de serde_json::value::RawValue>::deserialize(d)
 }
 
-/// Test helper: build an event `args` field from a JSON value (stored raw).
+/// Test helper: build an event `args` field from a JSON value (owned copy).
 #[cfg(test)]
-pub(crate) fn test_args(v: serde_json::Value) -> Option<&'static str> {
+pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<str>> {
     if v.is_null() {
         None
     } else {
-        Some(Box::leak(
-            serde_json::to_string(&v).unwrap().into_boxed_str(),
-        ))
+        Some(serde_json::to_string(&v).unwrap().into_boxed_str())
     }
 }
 
@@ -409,22 +336,27 @@ pub(crate) fn test_args(v: serde_json::Value) -> Option<&'static str> {
 /// exactly one synthetic `X`. No double counting, uniform weighting.
 pub fn normalize_be_pairs(events: &mut Vec<TraceEvent>) -> usize {
     let orig_len = events.len();
-    // Per-(thread, name) stack of unmatched begins (event copies).
-    let mut stacks: rustc_hash::FxHashMap<(u64, u64, &'static str), Vec<TraceEvent>> =
+    // Per-(thread, name) stack of unmatched begins (owned event copies).
+    let mut stacks: rustc_hash::FxHashMap<(u64, u64, String), Vec<TraceEvent>> =
         rustc_hash::FxHashMap::default();
     let mut made = 0usize;
     for i in 0..orig_len {
-        let e = events[i];
+        // Clone the begin/end event: the stacks own their entries and the
+        // synthetic `X` clones the begin's strings.
+        let e = events[i].clone();
         match e.ph {
             b'B' => {
-                stacks.entry((e.pid, e.tid, e.name)).or_default().push(e);
+                stacks
+                    .entry((e.pid, e.tid, e.name.clone()))
+                    .or_default()
+                    .push(e);
             }
             b'E' => {
-                if let Some(st) = stacks.get_mut(&(e.pid, e.tid, e.name))
+                if let Some(st) = stacks.get_mut(&(e.pid, e.tid, e.name.clone()))
                     && let Some(b) = st.pop()
                 {
                     events.push(TraceEvent {
-                        name: b.name,
+                        name: b.name.clone(),
                         id: 0,
                         has_id: false,
                         ph: b'X',
@@ -432,8 +364,8 @@ pub fn normalize_be_pairs(events: &mut Vec<TraceEvent>) -> usize {
                         dur: Some((e.ts - b.ts).max(0.0)),
                         tid: b.tid,
                         pid: b.pid,
-                        cat: b.cat,
-                        args: b.args,
+                        cat: b.cat.clone(),
+                        args: b.args.clone(),
                     });
                     made += 1;
                 }
@@ -454,8 +386,8 @@ impl TraceEvent {
 
     /// Raw `args` JSON text, or `None`.
     #[inline]
-    pub fn args_raw(&self) -> Option<&'static str> {
-        self.args
+    pub fn args_raw(&self) -> Option<&str> {
+        self.args.as_deref()
     }
 }
 
@@ -469,11 +401,11 @@ mod tests {
         ts: f64,
         pid: u64,
         tid: u64,
-        cat: Option<&'static str>,
-        args: Option<&'static str>,
+        cat: Option<&str>,
+        args: Option<&str>,
     ) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -481,18 +413,18 @@ mod tests {
             dur: None,
             tid,
             pid,
-            cat,
-            args,
+            cat: cat.map(str::to_owned),
+            args: args.map(Box::<str>::from),
         }
     }
 
     /// Nested same-thread pairs synthesize one X each; originals stay.
     #[test]
     fn be_pairs_synthesize_x_without_removing_originals() {
-        let cat: &'static str = intern_name("devtools.timeline");
-        let args: &'static str = Box::leak(r#"{"x":1}"#.to_string().into_boxed_str());
+        let cat = "devtools.timeline".to_owned();
+        let args: Box<str> = r#"{"x":1}"#.into();
         let mut events = vec![
-            be("RunTask", b'B', 0.0, 1, 1, Some(cat), Some(args)),
+            be("RunTask", b'B', 0.0, 1, 1, Some(&cat), Some(&args)),
             be("FunctionCall", b'B', 10_000.0, 1, 1, None, None),
             be("FunctionCall", b'E', 30_000.0, 1, 1, None, None),
             be("RunTask", b'E', 100_000.0, 1, 1, None, None),
@@ -508,10 +440,9 @@ mod tests {
         let rt = xs.iter().find(|e| e.name == "RunTask").unwrap();
         assert_eq!(rt.ts, 0.0);
         assert_eq!(rt.dur, Some(100_000.0));
-        assert_eq!(
-            (rt.pid, rt.tid, rt.cat, rt.args),
-            (1, 1, Some(cat), Some(args))
-        );
+        assert_eq!((rt.pid, rt.tid), (1, 1));
+        assert_eq!(rt.cat.as_deref(), Some(cat.as_str()));
+        assert_eq!(rt.args.as_deref(), Some(args.as_ref() as &str));
         let fc = xs.iter().find(|e| e.name == "FunctionCall").unwrap();
         assert_eq!((fc.ts, fc.dur), (10_000.0, Some(20_000.0)));
     }
@@ -561,7 +492,7 @@ mod tests {
         let n = 20_000usize;
         let mut events = Vec::with_capacity(2 * n);
         for i in 0..n {
-            let name = intern_name(&format!("Fn{i}"));
+            let name = format!("Fn{i}");
             events.push(TraceEvent {
                 name,
                 id: 0,
@@ -576,7 +507,7 @@ mod tests {
             });
         }
         for i in 0..n {
-            let name = intern_name(&format!("Fn{i}"));
+            let name = format!("Fn{i}");
             events.push(TraceEvent {
                 name,
                 id: 0,
@@ -647,29 +578,24 @@ mod tests {
         );
     }
 
-    /// The thread-local memo must not break global pointer identity: the
-    /// same string interned on two different threads yields one pointer.
+    /// Owned names compare equal by value across threads: each parse owns
+    /// its strings, so two threads parsing the same name get equal (but
+    /// independent) allocations.
     #[test]
-    fn intern_name_shares_pointer_across_threads() {
-        let a = intern_name("chperf-test-cross-thread-cat");
-        let b = std::thread::spawn(|| intern_name("chperf-test-cross-thread-cat"))
+    fn owned_names_compare_equal_across_threads() {
+        let a = event_from_json(r#"{"name":"RunTask","ph":"X","ts":1.0}"#);
+        let b = std::thread::spawn(|| event_from_json(r#"{"name":"RunTask","ph":"X","ts":2.0}"#))
             .join()
             .expect("worker must not panic");
-        assert!(
-            std::ptr::eq(a, b),
-            "interned pointers must match across threads"
-        );
-        // And the main thread's memo serves the same pointer on repeat.
-        assert!(std::ptr::eq(a, intern_name("chperf-test-cross-thread-cat")));
+        assert_eq!(a.name, b.name);
+        // ... but they are independent allocations, not shared pointers.
+        assert!(!std::ptr::eq(a.name.as_str(), b.name.as_str()));
     }
 
-    /// Equal `cat` values intern to the same pointer (serde fallback path),
+    /// Equal `cat` values compare equal by value on the serde fallback path,
     /// and a different category compares unequal.
     #[test]
-    fn cat_interning_shares_pointer_for_equal_values() {
-        // Individually-built JSON strings so each `cat` starts as its own
-        // allocation before interning (serde always allocates fresh Strings
-        // while deserializing, whatever the source literal).
+    fn cat_values_compare_equal_by_value() {
         let a =
             event_from_json(r#"{"name":"RunTask","cat":"devtools.timeline","ph":"X","ts":1.0}"#);
         let b =
@@ -679,22 +605,17 @@ mod tests {
             panic!("cats must survive the serde fallback path");
         };
         assert_eq!(ca, "devtools.timeline");
-        assert!(
-            std::ptr::eq(ca, cb),
-            "same cat must share one interned pointer"
-        );
         assert_eq!(ca, cb);
         assert_ne!(ca, cc);
-        assert!(!std::ptr::eq(ca, cc));
         // Missing `cat` stays `None`.
         let n = event_from_json(r#"{"name":"RunTask","ph":"X","ts":4.0}"#);
         assert!(n.cat.is_none());
     }
 
-    /// The fast tokenizer path interns `cat` too: same-cat events from a
-    /// real `parse_trace` share one pointer.
+    /// The fast tokenizer path keeps `cat` values: equal cats from a real
+    /// `parse_trace` compare equal by value.
     #[test]
-    fn cat_interned_on_fast_path() {
+    fn cat_kept_on_fast_path() {
         let json = serde_json::json!({
             "traceEvents": [
                 {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1.0, "pid": 1, "tid": 1},
@@ -709,13 +630,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let evs = &trace.trace_events;
         assert_eq!(evs.len(), 3);
-        let (Some(ca), Some(cb), Some(cc)) = (evs[0].cat, evs[1].cat, evs[2].cat) else {
+        let (Some(ca), Some(cb), Some(cc)) =
+            (evs[0].cat.clone(), evs[1].cat.clone(), evs[2].cat.clone())
+        else {
             panic!("cats must survive the fast tokenizer path");
         };
-        assert!(
-            std::ptr::eq(ca, cb),
-            "same cat must share one interned pointer"
-        );
         assert_eq!(ca, cb);
         assert_ne!(ca, cc);
     }
@@ -735,7 +654,7 @@ mod tests {
         assert!(without_args.args_value().is_none());
 
         let invalid = TraceEvent {
-            name: intern_name("E"),
+            name: "E".to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -744,7 +663,7 @@ mod tests {
             tid: 0,
             pid: 0,
             cat: None,
-            args: Some("{not valid json"),
+            args: Some("{not valid json".into()),
         };
         assert!(invalid.args_value().is_none());
         assert!(invalid.args_value().is_none());
@@ -760,9 +679,9 @@ mod tests {
         let b =
             event_from_json(r#"{"name":"RunTask","cat":"DevTools.Timeline","ph":"X","ts":2.0}"#);
         assert_eq!(a.cat, b.cat);
-        assert_eq!(a.cat, Some("DevTools.Timeline"));
+        assert_eq!(a.cat.as_deref(), Some("DevTools.Timeline"));
         assert!(crate::inspect::contains_ignore_case(
-            a.cat.unwrap(),
+            a.cat.as_deref().unwrap(),
             "devtools.timeline"
         ));
     }

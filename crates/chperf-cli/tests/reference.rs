@@ -28,8 +28,8 @@
 //! - anchor (cpu-profile pass): earliest sample time per node id, function
 //!   name match preferred over URL match, case-insensitive substring
 //! - frames: same-tid b/e pairs via a stack (e.ts - b.ts when positive);
-//!   the window filter applies to BOTH b and e events (verified against the
-//!   binary: an e outside the window leaves its b unpaired)
+//!   pairing runs globally, then pairs are filtered by their b.ts ([lo, hi)):
+//!   an e outside the window still closes a pair whose b is inside
 //! - dropped frames: events named DroppedFrame with ts in window
 //! - GC groups (ph X only, dur.unwrap_or(0.0)): major = MajorGC,
 //!   minor = MinorGC | V8.GCScavenger, other = V8.GC*/CppGC* prefixes
@@ -502,18 +502,14 @@ fn value_match_text(v: &Value, pattern: &str) -> Option<String> {
 // ── Frames ──
 
 /// Pair same-tid `b`/`e` events into durations (µs) via a per-tid stack.
-/// The window filter is applied to BOTH `b` and `e` events, so an `e`
-/// outside the window leaves its `b` unpaired (verified against the binary).
+/// Pairing runs globally; the window then keeps only pairs whose `b`
+/// timestamp falls in `[lo, hi)` — an `e` outside the window still closes a
+/// pair whose `b` is inside (verified against the binary).
 fn paired_durations(events: &[Event], name: &str, window: Option<(f64, f64)>) -> Vec<f64> {
     let mut stacks: HashMap<u64, Vec<f64>> = HashMap::new();
-    let mut durs = Vec::new();
+    let mut pairs: Vec<(f64, f64)> = Vec::new();
     for e in events {
         if e.name != name {
-            continue;
-        }
-        if let Some((lo, hi)) = window
-            && (e.ts < lo || e.ts > hi)
-        {
             continue;
         }
         match e.ph.as_str() {
@@ -523,13 +519,20 @@ fn paired_durations(events: &[Event], name: &str, window: Option<(f64, f64)>) ->
                     && let Some(t) = st.pop()
                     && e.ts > t
                 {
-                    durs.push(e.ts - t);
+                    pairs.push((t, e.ts - t));
                 }
             }
             _ => {}
         }
     }
-    durs
+    match window {
+        None => pairs.into_iter().map(|(_, d)| d).collect(),
+        Some((lo, hi)) => pairs
+            .into_iter()
+            .filter(|(b, _)| *b >= lo && *b < hi)
+            .map(|(_, d)| d)
+            .collect(),
+    }
 }
 
 /// Linear-interpolated percentiles on a sorted-ascending slice: (p50, p90, p99, max).
@@ -1012,7 +1015,9 @@ fn reference_medium_fixture() {
 
     let s = &v.shoot_stats;
     check_eq("fixture SHOOT CPU samples (ms)", s.cpu_us / 1000.0, 46.0);
-    check_eq("fixture SHOOT frames count", s.frame_durs.len() as f64, 3.0);
+    // 4 under the pair-globally/filter-by-b rule: one pair's `b` sits
+    // inside SHOOT while its `e` falls outside (previously unpaired).
+    check_eq("fixture SHOOT frames count", s.frame_durs.len() as f64, 4.0);
     check_eq("fixture SHOOT dropped frames", s.dropped as f64, 2.0);
     check_eq("fixture SHOOT long tasks count", s.lt_count as f64, 2.0);
     check_eq("fixture SHOOT main busy (ms)", s.runtask_us / 1000.0, 680.0);

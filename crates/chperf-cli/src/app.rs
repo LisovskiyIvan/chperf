@@ -1,4 +1,4 @@
-//! Report model: bundles a trace's analyses and metadata for export / REPL.
+//! Report model: bundles a trace's analyses and metadata for export.
 //! This is the presentation aggregate the CLI builds over `chperf_core`.
 
 use chperf_core::analysis::*;

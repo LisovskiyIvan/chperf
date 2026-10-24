@@ -60,7 +60,7 @@ fn is_flow_ph(ph: u8) -> bool {
 
 /// Group async events by `(pid, id)` into chains (see module docs).
 /// Events without an id or with a non-flow phase are ignored.
-pub fn flow_chains(events: &[TraceEvent]) -> Vec<FlowChain> {
+pub fn flow_chains(events: &[&TraceEvent]) -> Vec<FlowChain> {
     let mut groups: HashMap<(u64, u64), Vec<&TraceEvent>> = HashMap::default();
     for e in events {
         if !e.has_id || !is_flow_ph(e.ph) {
@@ -72,13 +72,13 @@ pub fn flow_chains(events: &[TraceEvent]) -> Vec<FlowChain> {
         .into_iter()
         .map(|((pid, id), mut steps)| {
             steps.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
-            let open_name = steps.iter().find(|e| is_open(e.ph)).map(|e| e.name);
+            let open_name = steps.iter().find(|e| is_open(e.ph)).map(|e| e.name.clone());
             let name = match open_name {
-                Some(n) => n.to_string(),
+                Some(n) => n,
                 None => {
                     let mut counts: HashMap<&str, usize> = HashMap::new();
                     for e in &steps {
-                        *counts.entry(e.name).or_default() += 1;
+                        *counts.entry(e.name.as_str()).or_default() += 1;
                     }
                     counts
                         .into_iter()
@@ -120,7 +120,7 @@ pub fn flow_chains(events: &[TraceEvent]) -> Vec<FlowChain> {
 /// Aggregate [`flow_chains`] output: chain count, unpaired (no `f`/`e`)
 /// count, and per-name `(name, count, avg duration µs)` sorted by count.
 /// Average duration uses the same clamped chain duration as the chains.
-pub fn flow_stats(events: &[TraceEvent]) -> FlowStats {
+pub fn flow_stats(events: &[&TraceEvent]) -> FlowStats {
     let chains = flow_chains(events);
     let unpaired = chains.iter().filter(|c| c.end_us.is_none()).count();
     let mut by_name: HashMap<String, (usize, f64)> = HashMap::new();
@@ -150,7 +150,7 @@ mod tests {
 
     fn ev(name: &str, ph: u8, id: u64, has_id: bool, ts: f64, pid: u64, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name(name),
+            name: name.to_owned(),
             id,
             has_id,
             ph,
@@ -165,49 +165,49 @@ mod tests {
 
     #[test]
     fn paired_start_finish() {
-        let events = vec![
+        let events = [
             ev("Animation", b's', 7, true, 1_000.0, 1, 1),
             ev("Animation", b'f', 7, true, 5_000.0, 1, 1),
         ];
-        let chains = flow_chains(&events);
+        let chains = flow_chains(&events.iter().collect::<Vec<_>>());
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].name, "Animation");
         assert_eq!(chains[0].id, "7");
         assert_eq!(chains[0].steps.len(), 2);
         assert_eq!(chains[0].end_us, Some(5_000.0));
-        let st = flow_stats(&events);
+        let st = flow_stats(&events.iter().collect::<Vec<_>>());
         assert_eq!((st.chains, st.unpaired), (1, 0));
         assert_eq!(st.by_name[0], ("Animation".to_string(), 1, 4_000.0));
     }
 
     #[test]
     fn steps_in_order_and_duration_uses_last_dur() {
-        let mut e = vec![
+        let mut e = [
             ev("Load", b'f', 3, true, 9_000.0, 1, 2),
             ev("Load", b't', 3, true, 5_000.0, 1, 1),
             ev("Load", b's', 3, true, 1_000.0, 1, 1),
         ];
         e[0].dur = Some(1_000.0);
-        let chains = flow_chains(&e);
+        let chains = flow_chains(&e.iter().collect::<Vec<_>>());
         assert_eq!(chains.len(), 1);
         let phases: Vec<char> = chains[0].steps.iter().map(|s| s.phase).collect();
         assert_eq!(phases, vec!['s', 't', 'f']);
         assert_eq!(chains[0].end_us, Some(10_000.0));
-        let st = flow_stats(&e);
+        let st = flow_stats(&e.iter().collect::<Vec<_>>());
         assert_eq!(st.by_name[0].2, 9_000.0);
     }
 
     #[test]
     fn unpaired_and_idless_ignored() {
-        let events = vec![
+        let events = [
             ev("A", b's', 1, true, 1_000.0, 1, 1),
             ev("B", b'X', 0, false, 2_000.0, 1, 1),
             ev("A", b'f', 0, false, 3_000.0, 1, 1),
         ];
-        let chains = flow_chains(&events);
+        let chains = flow_chains(&events.iter().collect::<Vec<_>>());
         assert_eq!(chains.len(), 1);
         assert!(chains[0].end_us.is_none());
-        assert_eq!(flow_stats(&events).unpaired, 1);
+        assert_eq!(flow_stats(&events.iter().collect::<Vec<_>>()).unpaired, 1);
     }
 
     #[test]
@@ -222,7 +222,7 @@ mod tests {
         std::fs::write(&path, raw).unwrap();
         let trace = crate::trace::parse_trace(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let chains = flow_chains(&trace.trace_events);
+        let chains = flow_chains(&trace.trace_events.iter().collect::<Vec<_>>());
         assert_eq!(chains.len(), 1, "all id spellings must pair");
         assert_eq!(chains[0].steps.len(), 3);
         assert_eq!(chains[0].end_us, Some(3_000.0));
@@ -230,12 +230,12 @@ mod tests {
 
     #[test]
     fn cross_thread_steps_stay_in_one_chain() {
-        let events = vec![
+        let events = [
             ev("Pipe", b's', 9, true, 1_000.0, 1, 1),
             ev("Pipe", b'n', 9, true, 2_000.0, 1, 5),
             ev("Pipe", b'f', 9, true, 3_000.0, 1, 9),
         ];
-        let chains = flow_chains(&events);
+        let chains = flow_chains(&events.iter().collect::<Vec<_>>());
         assert_eq!(chains.len(), 1);
         let tids: Vec<u64> = chains[0].steps.iter().map(|s| s.tid).collect();
         assert_eq!(tids, vec![1, 5, 9]);
@@ -243,11 +243,11 @@ mod tests {
 
     #[test]
     fn legacy_nesting_phases_pair() {
-        let events = vec![
+        let events = [
             ev("Nest", b'b', 4, true, 1_000.0, 2, 1),
             ev("Nest", b'e', 4, true, 4_000.0, 2, 1),
         ];
-        let chains = flow_chains(&events);
+        let chains = flow_chains(&events.iter().collect::<Vec<_>>());
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].name, "Nest");
         assert_eq!(chains[0].end_us, Some(4_000.0));
@@ -257,13 +257,13 @@ mod tests {
     fn skewed_timestamps_stay_non_negative() {
         // Finish stamped before its start: sorting still yields a
         // non-negative duration (clamped, never a negative avg).
-        let events = vec![
+        let events = [
             ev("S", b's', 5, true, 2_000.0, 1, 1),
             ev("S", b'f', 5, true, 1_000.0, 1, 1),
         ];
-        let chains = flow_chains(&events);
+        let chains = flow_chains(&events.iter().collect::<Vec<_>>());
         assert_eq!(chains[0].end_us, Some(2_000.0));
-        let st = flow_stats(&events);
+        let st = flow_stats(&events.iter().collect::<Vec<_>>());
         assert!(st.by_name[0].2 >= 0.0);
     }
 }

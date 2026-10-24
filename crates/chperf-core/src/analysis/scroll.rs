@@ -95,8 +95,7 @@ pub struct ScrollFrameResult {
 /// (`"scroll"`, `"GestureScrollUpdate"`, `"GestureScrollBegin/End"`,
 /// `"MouseWheel"`, all matched case-insensitively).
 fn is_scroll_input(e: &TraceEvent) -> bool {
-    let name = e.name;
-    let lower = name.to_lowercase();
+    let lower = e.name.to_lowercase();
     if lower.contains("gesturescrollupdate")
         || lower.contains("gesturescrollbegin")
         || lower.contains("gesturescrollend")
@@ -104,7 +103,7 @@ fn is_scroll_input(e: &TraceEvent) -> bool {
     {
         return true;
     }
-    let is_dispatch = name == "EventDispatch" || name == "InputLatency";
+    let is_dispatch = e.name == "EventDispatch" || e.name == "InputLatency";
     let has_scroll_name = lower.contains("scroll");
     if is_dispatch || has_scroll_name {
         if let Some(raw) = e.args_raw() {
@@ -228,7 +227,7 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
             if is_scroll_input(e) {
                 has_input = true;
             }
-            if bucket_of(e.name).is_some() {
+            if bucket_of(&e.name).is_some() {
                 let d = dur_of[i];
                 if d > FRAME_BUDGET_US {
                     has_budget_child = true;
@@ -272,7 +271,7 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
                 })
         });
         for (k, &i) in kids.iter().enumerate() {
-            let slot = match bucket_of(events[i].name) {
+            let slot = match bucket_of(&events[i].name) {
                 Some(s) => s,
                 None => continue,
             };
@@ -289,7 +288,7 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
                     continue;
                 }
                 let md = events[m].dur.unwrap_or(0.0);
-                if md <= 0.0 || bucket_of(events[m].name).is_none() {
+                if md <= 0.0 || bucket_of(&events[m].name).is_none() {
                     continue;
                 }
                 let ms = events[m].ts;
@@ -419,11 +418,10 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::intern_name;
 
     fn ev(name: &str, ts: f64, dur: f64) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -438,7 +436,7 @@ mod tests {
 
     fn ev_args(name: &str, ts: f64, dur: f64, args: serde_json::Value) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -544,7 +542,7 @@ mod tests {
 
     fn ev_tid(name: &str, ts: f64, dur: f64, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',

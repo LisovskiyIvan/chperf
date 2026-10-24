@@ -34,7 +34,9 @@ fn in_window(ts: f64, window: Option<(f64, f64)>) -> bool {
 }
 
 fn fmt_ms(us: f64) -> String {
-    format!("{:.2}", us / 1000.0)
+    // `+ 0.0` collapses a -0.0 (e.g. from `-(a - b)` roundings) to +0.0 so
+    // tables never show "-0.00".
+    format!("{:.2}", us / 1000.0 + 0.0)
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -120,10 +122,11 @@ impl Scope {
         in_window(e.ts, self.window)
             && self.tid.is_none_or(|t| e.tid == t)
             && self.pid.is_none_or(|p| e.pid == p)
-            && self
-                .cat
-                .as_deref()
-                .is_none_or(|c| e.cat.is_some_and(|ec| contains_ignore_case(ec, c)))
+            && self.cat.as_deref().is_none_or(|c| {
+                e.cat
+                    .as_deref()
+                    .is_some_and(|ec| contains_ignore_case(ec, c))
+            })
     }
 
     /// Thread/process/category filter without the window check — for CPU
@@ -131,10 +134,11 @@ impl Scope {
     pub fn allows_chunk(&self, e: &TraceEvent) -> bool {
         self.tid.is_none_or(|t| e.tid == t)
             && self.pid.is_none_or(|p| e.pid == p)
-            && self
-                .cat
-                .as_deref()
-                .is_none_or(|c| e.cat.is_some_and(|ec| contains_ignore_case(ec, c)))
+            && self.cat.as_deref().is_none_or(|c| {
+                e.cat
+                    .as_deref()
+                    .is_some_and(|ec| contains_ignore_case(ec, c))
+            })
     }
 
     pub(crate) fn window_line(&self, min_ts: f64) -> Option<String> {
@@ -220,7 +224,7 @@ impl NameFilter {
 
     /// Matches the event name or (if the event is an EventDispatch) its type in args.
     pub fn matches_event(&self, e: &TraceEvent) -> bool {
-        if self.matches(e.name) {
+        if self.matches(&e.name) {
             return true;
         }
         if e.name == "EventDispatch" {
@@ -277,7 +281,7 @@ pub fn events_section(
                 .unwrap()
         }),
         Sort::Name => {
-            rows.sort_by(|a, b| a.name.cmp(b.name).then(a.ts.partial_cmp(&b.ts).unwrap()))
+            rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.ts.partial_cmp(&b.ts).unwrap()))
         }
         Sort::Count => {}
     }
@@ -876,7 +880,10 @@ fn node_chain_names(
     let mut cur = Some(leaf);
     while let Some(key) = cur {
         keys.push(key);
-        cur = nodes.get(&key).and_then(|n| n.2).map(|p| (key.0, key.1, p));
+        cur = nodes
+            .get(&key)
+            .and_then(|n| n.2)
+            .map(|p| (key.0, key.1, key.2, p));
     }
     keys.reverse();
     keys.iter()
@@ -1215,7 +1222,7 @@ pub fn names_section(
         if !scope.allows_event(e) {
             continue;
         }
-        let entry = stats.entry(e.name).or_default();
+        let entry = stats.entry(e.name.as_str()).or_default();
         entry.0 += 1;
         entry.1 += e.dur.unwrap_or(0.0);
     }
@@ -1296,7 +1303,7 @@ pub fn threads_section(
         if e.name == "RunTask" {
             entry.1 += effective_runtask_dur(e, &overheads);
         }
-        *entry.2.entry(e.name).or_default() += 1;
+        *entry.2.entry(e.name.as_str()).or_default() += 1;
     }
 
     let mut rows: Vec<(u64, usize, f64, String)> = tids
@@ -1767,11 +1774,7 @@ pub fn counters_section(
     min_ts: f64,
     name: Option<&str>,
 ) -> (String, Value) {
-    let scoped: Vec<TraceEvent> = events
-        .iter()
-        .filter(|e| scope.allows_event(e))
-        .copied()
-        .collect();
+    let scoped: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
     match name {
         None => {
             let names = crate::analysis::counter_names(&scoped);
@@ -1851,7 +1854,7 @@ pub fn counters_section(
 
 /// One `## Counter:` block (markdown + JSON) for a single counter name.
 fn counter_block(
-    scoped: &[TraceEvent],
+    scoped: &[&TraceEvent],
     scope: &Scope,
     n: &str,
     top: usize,
@@ -2747,31 +2750,30 @@ pub fn async_section(
     // (pid, id), `f` consumes it. Chrome recycles flow ids, so entries must
     // not survive their finish — a two-pass or_insert kept the FIRST start
     // and reused ids measured against a stale begin.
-    let mut starts: rustc_hash::FxHashMap<(u64, u64), (&'static str, f64)> =
+    let mut starts: rustc_hash::FxHashMap<(u64, u64), (String, f64)> =
         rustc_hash::FxHashMap::default();
-    let mut by_name: rustc_hash::FxHashMap<&'static str, Vec<f64>> =
-        rustc_hash::FxHashMap::default();
-    let mut longest: Vec<(&'static str, f64, f64)> = Vec::new(); // (name, start ts, dur)
+    let mut by_name: rustc_hash::FxHashMap<String, Vec<f64>> = rustc_hash::FxHashMap::default();
+    let mut longest: Vec<(String, f64, f64)> = Vec::new(); // (name, start ts, dur)
     for e in events {
         if !e.has_id {
             continue;
         }
         if e.ph == b's' {
             if scope.allows_event(e) {
-                starts.insert((e.pid, e.id), (e.name, e.ts));
+                starts.insert((e.pid, e.id), (e.name.clone(), e.ts));
             }
         } else if e.ph == b'f'
             && let Some((name, start_ts)) = starts.remove(&(e.pid, e.id))
         {
             let dur = (e.ts - start_ts).max(0.0);
-            by_name.entry(name).or_default().push(dur);
+            by_name.entry(name.clone()).or_default().push(dur);
             longest.push((name, start_ts, dur));
         }
     }
     longest.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     let total_tasks = longest.len();
 
-    let mut rows: Vec<(&'static str, usize, f64, f64, f64, f64, f64)> = by_name
+    let mut rows: Vec<(String, usize, f64, f64, f64, f64, f64)> = by_name
         .into_iter()
         .map(|(name, mut durs)| {
             durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -2868,11 +2870,7 @@ pub fn flows_section(
     min_ts: f64,
     name: Option<&str>,
 ) -> (String, Value) {
-    let scoped: Vec<TraceEvent> = events
-        .iter()
-        .filter(|e| scope.allows_event(e))
-        .copied()
-        .collect();
+    let scoped: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
     let mut chains = crate::analysis::flow_chains(&scoped);
     if let Some(n) = name
         && !n.is_empty()
@@ -3030,11 +3028,7 @@ pub fn loading_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let kept: Vec<TraceEvent> = events
-        .iter()
-        .filter(|e| scope.allows_event(e))
-        .cloned()
-        .collect();
+    let kept: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
     let main_tid = crate::trace::detect_main_thread(events);
     let r = crate::analysis::analyze_loading(&kept);
     let official = crate::analysis::analyze_long_tasks_official(&kept, main_tid);
@@ -3184,11 +3178,7 @@ pub fn network_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let kept: Vec<TraceEvent> = events
-        .iter()
-        .filter(|e| scope.allows_event(e))
-        .cloned()
-        .collect();
+    let kept: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
     let main_tid = crate::trace::detect_main_thread(events);
     let r = crate::analysis::analyze_network(&kept, main_tid);
 
@@ -3270,11 +3260,7 @@ pub fn raster_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let kept: Vec<TraceEvent> = events
-        .iter()
-        .filter(|e| scope.allows_event(e))
-        .cloned()
-        .collect();
+    let kept: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
     let main_tid = crate::trace::detect_main_thread(events);
     let r = crate::analysis::analyze_raster(&kept, main_tid);
 
@@ -3464,8 +3450,8 @@ pub fn coverage_section(
             continue;
         }
         total += 1;
-        *counts.entry(e.name).or_default() += 1;
-        if is_recognized(e.name) {
+        *counts.entry(e.name.as_str()).or_default() += 1;
+        if is_recognized(&e.name) {
             recognized += 1;
         }
     }
@@ -3667,7 +3653,7 @@ mod tests {
 
     fn ev(ts: f64, name: &str, cat: Option<&str>) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -3675,14 +3661,14 @@ mod tests {
             dur: None,
             tid: 1,
             pid: 1,
-            cat: cat.map(crate::trace::intern_name),
+            cat: cat.map(str::to_owned),
             args: None,
         }
     }
 
     fn flow(ph: u8, id: u64, ts: f64) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name("AnimationFrame"),
+            name: "AnimationFrame".to_owned(),
             id,
             has_id: true,
             ph,
@@ -3754,7 +3740,7 @@ mod tests {
         args: Option<serde_json::Value>,
     ) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name(name),
+            name: name.to_owned(),
             id,
             has_id,
             ph,
@@ -4173,7 +4159,7 @@ mod tests {
 
     fn ev_rt(ts: f64, dur: f64, tid: u64, pid: u64) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name("RunTask"),
+            name: "RunTask".to_owned(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -4188,7 +4174,7 @@ mod tests {
 
     fn ev_tn(pid: u64, tid: u64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: crate::trace::intern_name("thread_name"),
+            name: "thread_name".to_owned(),
             id: 0,
             has_id: false,
             ph: b'M',
@@ -4196,7 +4182,7 @@ mod tests {
             dur: None,
             tid,
             pid,
-            cat: Some(crate::trace::intern_name("__metadata")),
+            cat: Some("__metadata".to_owned()),
             args: crate::trace::test_args(json!({"name": name})),
         }
     }

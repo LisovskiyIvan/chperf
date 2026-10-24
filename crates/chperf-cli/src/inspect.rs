@@ -1,9 +1,9 @@
 //! CLI-side inspect dispatch: turn `Cli` flags + parsed events into the
 //! requested `chperf_core` sections, then render them as Markdown / JSON /
-//! CSV. Shared by the single-trace CLI path, the REPL, and `--compare`.
+//! CSV. Shared by the single-trace CLI path and `--compare`.
 
 use crate::cli::Cli;
-use chperf_core::{analysis, inspect, trace, windowed};
+use chperf_core::{inspect, trace, windowed};
 use serde_json::Value;
 
 /// Windowed comparison of two traces: run every requested section on both,
@@ -93,7 +93,6 @@ pub(crate) fn inspect_compare_output(
         &ws_a,
         cli,
         compare.as_ref().map(|(da, _)| da),
-        None,
         stats_a,
     )?;
     let mut sections_b = build_sections(
@@ -102,7 +101,6 @@ pub(crate) fn inspect_compare_output(
         &ws_b,
         cli,
         compare.as_ref().map(|(_, db)| db),
-        None,
         stats_b,
     )?;
 
@@ -273,14 +271,13 @@ pub(crate) fn compare_json(compare: &Option<(windowed::DeltaData, windowed::Delt
 }
 
 /// Shared inspect dispatch: computes sections from already-parsed events.
-/// Used by the CLI (`chperf trace --events ...`), the REPL, and (with
+/// Used by the CLI (`chperf trace --events ...`) and (with
 /// `--compare`) the windowed two-trace comparison.
 pub(crate) fn inspect_output(
     events: &[trace::TraceEvent],
     min_ts: f64,
     trace_name: &str,
     cli: &Cli,
-    cpu_cache: Option<&analysis::CpuProfileCache>,
     stats: &trace::ParseStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_inspect_query(cli)?;
@@ -295,12 +292,12 @@ pub(crate) fn inspect_output(
             .transpose()?;
         print!(
             "{}",
-            inspect::stacks_folded(events, matcher.as_ref(), &ws.scope, cpu_cache)
+            inspect::stacks_folded(events, matcher.as_ref(), &ws.scope, None)
         );
         return Ok(());
     }
 
-    let mut sections = build_sections(events, min_ts, &ws, cli, None, cpu_cache, stats)?;
+    let mut sections = build_sections(events, min_ts, &ws, cli, None, stats)?;
     cap_memory_json(&mut sections, cli.top);
     dispatch_output(&sections, trace_name, min_ts, &ws, cli)
 }
@@ -463,7 +460,6 @@ fn build_sections(
     ws: &WindowState,
     cli: &Cli,
     delta: Option<&windowed::DeltaData>,
-    cpu_cache: Option<&analysis::CpuProfileCache>,
     stats: &trace::ParseStats,
 ) -> Result<Vec<Section>, Box<dyn std::error::Error>> {
     let scope = &ws.scope;
@@ -623,18 +619,12 @@ fn build_sections(
         None
     };
     if let Some(m) = &func_matcher {
-        let (md, j) = inspect::functions_section(events, m, scope, cli.top, min_ts, cpu_cache);
+        let (md, j) = inspect::functions_section(events, m, scope, cli.top, min_ts, None);
         sections.push(("functions", md, j));
     }
     if cli.stacks {
-        let (md, j) = inspect::stacks_section(
-            events,
-            func_matcher.as_ref(),
-            scope,
-            cli.top,
-            min_ts,
-            cpu_cache,
-        );
+        let (md, j) =
+            inspect::stacks_section(events, func_matcher.as_ref(), scope, cli.top, min_ts, None);
         sections.push(("stacks", md, j));
     }
     if cli.calltree {
@@ -650,7 +640,7 @@ fn build_sections(
             url_matcher.as_ref(),
             cli.top,
             min_ts,
-            cpu_cache,
+            None,
         );
         sections.push(("calltree", md, j));
     }
@@ -682,7 +672,7 @@ fn build_sections(
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
         let (md, j) =
-            inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts, cpu_cache);
+            inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts, None);
         sections.push(("find", md, j));
     }
 

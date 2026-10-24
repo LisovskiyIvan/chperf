@@ -67,43 +67,10 @@ chperf traces/ --html --json --out-dir out/
 
 # The positional trace also accepts a glob pattern (expanded like a directory)
 chperf 'traces/*.json' --export --out-dir out/
+
+# Glob matching is non-recursive: `**` matches within a single directory,
+# exactly like `*` (a directory listing filtered by file name).
 ```
-
-## REPL (interactive)
-
-Load and analyze a trace **once**, then query it live — every command is a
-single pass over the in-memory data, no re-parse:
-
-```sh
-chperf --repl trace.json.gz
-```
-
-```sh
-> names --top 5
-> events RunTask --sort dur --top 10 --around 42555600 --window 1000
-> function render --top 10
-> find setPlayerRespawned --regex
-> worst --task
-> jank 2                       # window around jank cluster #2
-> next | prev                  # walk to the next/previous jank cluster
-> zoom | out                   # halve / double the current window
-> reset                        # clear the window/anchor (full trace again)
-> counters fps                 # generic Counter (ph C) time series
-> flows [name]                 # async/causality chains (pid+id groups)
-> junit out.xml                # JUnit XML: gates, or findings when compared
-> compare after.json.gz        # load second trace, rebuild compare
-> export report.md             # full markdown export of current app
-> html report.html             # paired A-vs-B HTML when a compare is loaded
-> summary                      # compare summary (after `compare`)
-> throttle 6 | status | clear | help | quit
-```
-
-Commands mirror the CLI flags (bare words map to flags: `events X` ≡
-`--events X`, `export=file` ≡ `--export=file`); `--around/--window` anchor
-subsequent time-windowed queries. Commands are saved to
-`~/.chperf_history` (last 500 lines, loaded on start). Data is loaded once —
-a 1.3M-event trace loads in ~1.5s and every query answers in tens of
-milliseconds.
 
 ## Inspect
 

@@ -71,6 +71,7 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
                 "total_us": s.total_time_us.round(), "total_ms": ms(s.total_time_us),
                 "self_us": s.self_time_us.round(), "self_ms": ms(s.self_time_us),
                 "count": s.count, "avg_us": s.avg_time_us.round(),
+                "avg_self_us": s.avg_self_us.round(),
                 "pct_of_trace": s.pct_of_trace, "self_pct_of_trace": s.self_pct_of_trace,
             })).collect::<Vec<_>>(),
         }),

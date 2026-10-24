@@ -58,7 +58,7 @@ fn is_decode_hotspot(name: &str) -> bool {
     matches!(name, "Decode Image" | "DecodeImage" | "PaintImage")
 }
 
-pub fn analyze_raster(events: &[TraceEvent], main_tid: u64) -> RasterResult {
+pub fn analyze_raster(events: &[&TraceEvent], main_tid: u64) -> RasterResult {
     let _ = main_tid;
     // Thread names from `thread_name` metadata (single pre-pass; metadata
     // events are cheap to match by interned name).
@@ -83,7 +83,7 @@ pub fn analyze_raster(events: &[TraceEvent], main_tid: u64) -> RasterResult {
 
     // Single pass; `args_value` is parsed only for decode-hotspot names.
     for e in events {
-        let cat = match category_of(e.name) {
+        let cat = match category_of(&e.name) {
             Some(c) => c,
             None => continue,
         };
@@ -94,7 +94,7 @@ pub fn analyze_raster(events: &[TraceEvent], main_tid: u64) -> RasterResult {
         };
         totals[cat as usize] += dur;
 
-        let idx = match lane_idx.get(&(e.tid, e.name)) {
+        let idx = match lane_idx.get(&(e.tid, e.name.as_str())) {
             Some(&i) => i,
             None => {
                 let i = lanes.len();
@@ -106,7 +106,7 @@ pub fn analyze_raster(events: &[TraceEvent], main_tid: u64) -> RasterResult {
                     total_us: 0.0,
                     max_us: 0.0,
                 });
-                lane_idx.insert((e.tid, e.name), i);
+                lane_idx.insert((e.tid, e.name.as_str()), i);
                 i
             }
         };
@@ -117,7 +117,7 @@ pub fn analyze_raster(events: &[TraceEvent], main_tid: u64) -> RasterResult {
             lane.max_us = dur;
         }
 
-        if is_decode_hotspot(e.name) {
+        if is_decode_hotspot(&e.name) {
             if dur > max_decode_us {
                 max_decode_us = dur;
             }
@@ -163,11 +163,11 @@ pub fn analyze_raster(events: &[TraceEvent], main_tid: u64) -> RasterResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::{TraceEvent, intern_name};
+    use crate::trace::TraceEvent;
 
     fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -189,7 +189,7 @@ mod tests {
         args: serde_json::Value,
     ) -> TraceEvent {
         TraceEvent {
-            name: intern_name(name),
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn multi_thread_lanes_with_names_and_totals() {
-        let events = vec![
+        let events = [
             thread_name(2, "CompositorTileWorker"),
             thread_name(3, "CrGpuMain"),
             ev("RasterTask", b'X', 100.0, Some(500.0), 2),
@@ -226,7 +226,7 @@ mod tests {
             ev("RunTask", b'X', 600.0, Some(999.0), 1), // untracked
         ];
         // Same events without args carry no hotspot source; add one with args.
-        let mut events = events;
+        let mut events = Vec::from(events);
         events.push(ev_args(
             "PaintImage",
             b'X',
@@ -235,7 +235,7 @@ mod tests {
             2,
             serde_json::json!({"data": {"url": "https://x/img.png"}}),
         ));
-        let r = analyze_raster(&events, 1);
+        let r = analyze_raster(&events.iter().collect::<Vec<_>>(), 1);
         assert_eq!(r.total_raster_us, 800.0);
         assert_eq!(r.total_decode_us, 1_400.0);
         assert_eq!(r.total_composite_us, 100.0);
@@ -264,11 +264,11 @@ mod tests {
         assert_eq!(r.total_raster_us, 0.0);
         assert_eq!(r.max_decode_us, 0.0);
         // BeginFrame as B/E pairs: counted, zero duration.
-        let events = vec![
+        let events = [
             ev("BeginFrame", b'B', 100.0, None, 2),
             ev("BeginFrame", b'E', 150.0, None, 2),
         ];
-        let r = analyze_raster(&events, 1);
+        let r = analyze_raster(&events.iter().collect::<Vec<_>>(), 1);
         assert_eq!(r.lanes.len(), 1);
         assert_eq!(r.lanes[0].count, 2);
         assert_eq!(r.lanes[0].total_us, 0.0);
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn decode_hotspot_node_fallbacks() {
-        let events = vec![
+        let events = [
             ev_args(
                 "DecodeImage",
                 b'X',
@@ -295,7 +295,7 @@ mod tests {
                 serde_json::json!({"data": {"nodeName": "IMG"}}),
             ),
         ];
-        let r = analyze_raster(&events, 1);
+        let r = analyze_raster(&events.iter().collect::<Vec<_>>(), 1);
         assert_eq!(r.decode_hotspots.len(), 2);
         assert_eq!(r.decode_hotspots[0].url_or_node, "IMG");
         assert_eq!(r.decode_hotspots[1].url_or_node, "77");

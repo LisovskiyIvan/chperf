@@ -1,7 +1,7 @@
 //! The hand-rolled, block-parallel `traceEvents` tokenizer and `parse_trace`.
 
 use super::event::{normalize_id_bytes, parse_tid_pid_str, take_serde_malformed};
-use super::{FrameInfo, TraceEvent, TraceFile, TraceMetadata, intern_name};
+use super::{FrameInfo, TraceEvent, TraceFile, TraceMetadata};
 use std::io::Read;
 use std::path::Path;
 
@@ -162,7 +162,7 @@ fn parse_event_fast(
         return Err(());
     }
     let mut ev = TraceEvent {
-        name: "",
+        name: String::new(),
         id: 0,
         has_id: false,
         ph: 0,
@@ -198,7 +198,7 @@ fn parse_event_fast(
         }
         match key {
             b"name" => {
-                let (v, a) = parse_string_intern(bytes, i)?;
+                let (v, a) = parse_string_owned(bytes, i)?;
                 ev.name = v;
                 i = a;
             }
@@ -354,7 +354,7 @@ fn parse_event_fast(
                     i = skip_value(bytes, i)?;
                     ev.cat = None;
                 } else {
-                    let (v, a) = parse_string_intern(bytes, i)?;
+                    let (v, a) = parse_string_owned(bytes, i)?;
                     ev.cat = Some(v);
                     i = a;
                 }
@@ -369,8 +369,9 @@ fn parse_event_fast(
                 } else {
                     let end = skip_value(bytes, i)?;
                     let s = std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?;
-                    let s_static: &'static str = unsafe { std::mem::transmute(s) };
-                    ev.args = Some(s_static);
+                    // Owned copy: the file buffer is freed after parsing,
+                    // so events must not borrow from it.
+                    ev.args = Some(Box::<str>::from(s));
                     i = end;
                 }
             }
@@ -417,11 +418,10 @@ fn parse_key(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
     }
 }
 
-/// Unescaped JSON string value (bytes between quotes), interned instead of
-/// allocating a new `String` per event (event names and categories repeat
-/// heavily across a trace). Escaped strings are handled by the serde
-/// fallback. Returns (interned str, pos after closing quote).
-fn parse_string_intern(bytes: &[u8], p: usize) -> Result<(&'static str, usize), ()> {
+/// Unescaped JSON string value (bytes between quotes), owned per event.
+/// Escaped strings are handled by the serde fallback. Returns (owned string,
+/// pos after closing quote).
+fn parse_string_owned(bytes: &[u8], p: usize) -> Result<(String, usize), ()> {
     let len = bytes.len();
     if p >= len || bytes[p] != b'"' {
         return Err(());
@@ -433,7 +433,7 @@ fn parse_string_intern(bytes: &[u8], p: usize) -> Result<(&'static str, usize), 
                 return Err(());
             }
             let s = std::str::from_utf8(&bytes[p + 1..q]).map_err(|_| ())?;
-            Ok((intern_name(s), q + 1))
+            Ok((s.to_owned(), q + 1))
         }
         None => Err(()),
     }
@@ -530,7 +530,8 @@ fn parse_tid_pid_fast(bytes: &[u8], p: usize, stats: &mut ParseStats) -> Result<
 
 /// Tolerant per-element parse of a slice known to hold `{…}` elements
 /// (separator commas optional). Each element is parsed from its own
-/// zero-copy slice: successes count `parsed` (plus any serde-fallback field
+/// borrowed slice (events copy out the owned strings they need):
+/// successes count `parsed` (plus any serde-fallback field
 /// coercions drained into `malformed`), structural failures count
 /// `skipped`/`malformed` and the walk continues — one bad event never fails
 /// the file.
@@ -1209,13 +1210,15 @@ type ParallelResult =
 
 /// Parse the `traceEvents` array in parallel. Each thread walks its own byte
 /// range (starting from a block boundary with known exact state), finds the
-/// element ranges, then parses its slice directly from the buffer —
-/// zero-copy. Chunks never mutate the buffer: the fast tokenizer runs on the
-/// pristine bytes, and any slice it bails on goes through a tolerant
-/// per-element serde parse that skips structurally broken events (counted in
-/// `ParseStats`) instead of failing the chunk.
+/// element ranges, then parses its slice directly from the buffer,
+/// copying the small owned strings each event needs. Chunks never mutate
+/// the buffer: the fast tokenizer runs on the pristine bytes, and any slice
+/// it bails on goes through a tolerant per-element serde parse that skips
+/// structurally broken events (counted in `ParseStats`) instead of failing
+/// the chunk. The buffer is freed when `parse_trace` returns; events own
+/// their data.
 fn parse_parallel(
-    bytes: &mut [u8],
+    bytes: &[u8],
     layout: &Layout,
     blocks: &Blocks,
     threads: usize,
@@ -1533,40 +1536,29 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         bytes.drain(..3);
     }
-    // LIFETIME NOTE — `Box::leak` here is intentional and must stay until the
-    // public API changes (rationale and measured alternatives documented
-    // in this comment).
+    // LIFETIME NOTE — no leaks on this path by design.
     //
-    // Why: `TraceEvent.args` is `Option<&'static str>` borrowed zero-copy
-    // from this buffer (the fast tokenizer transmutes the `args` slice; the
-    // serde fallback leaks a per-event owned copy instead). `TraceFile`
-    // carries no backing buffer — adding one would change the public struct
-    // that other crates construct/match against — so the buffer is leaked to
-    // give those borrows a valid referent for the `TraceFile`'s lifetime.
+    // Every `TraceEvent` owns its strings: the fast tokenizer copies each
+    // event's `name`/`cat`/`args` slices into owned `String`/`Box<str>`
+    // values, and the serde fallback does the same from its owned `Value`s.
+    // Nothing borrows from the file buffer, so the buffer below is an
+    // ordinary local and is freed when this function returns. Repeated
+    // `parse_trace` calls retain no memory.
     //
-    // Cost: exactly one whole-file buffer per `parse_trace` call (the
-    // current file's bytes, not cumulative within a call). Fine for one-shot
-    // CLI use. A long-lived process that re-parses (REPL `load` in a loop,
-    // watch mode) leaks one buffer per load while the process lives; the
-    // previous `TraceFile`'s events keep pointing at the old buffer so it
-    // can never be freed while they are alive. Companion bounded leaks:
-    // the name/category interner (bounded by trace vocabulary, a few
-    // hundred entries) and one small leak per serde-fallback `args` value.
-    //
-    // Removal would require a public API change: owned `String` args, or a
-    // `TraceFile`-owned arena with self-referential lifetimes. The
-    // copy-out alternative (leak per-event owned `args`, free the buffer)
-    // was rejected: it trades one bounded leak for N small leaks plus a
-    // per-event allocation on the hot path, and still leaks on REPL re-runs.
-    let bytes: &'static mut [u8] = Box::leak(bytes.into_boxed_slice());
+    // (History: `args` used to be `Option<&'static str>` borrowed zero-copy
+    // from a `Box::leak`ed whole-file buffer, plus a leaked name/category
+    // interner and per-event leaks on the serde path — one file-sized leak
+    // per call. The owned model costs one small copy per event string;
+    // see the throughput test below for the measured budget.)
 
-    // Fast path: single-pass zero-copy top-level + traceEvents parse without
-    // pre-scanning 64KB blocks across the buffer.
+    // Fast path: single-pass top-level + traceEvents parse without
+    // pre-scanning 64KB blocks across the buffer. Events own their
+    // strings, so the buffer below is freed when parsing finishes.
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let mut trace: Option<TraceFile> = None;
     let mut scan_none = false;
     let t_fast = std::time::Instant::now();
-    if let Ok(tf) = parse_trace_fast(bytes) {
+    if let Ok(tf) = parse_trace_fast(&bytes) {
         #[cfg(test)]
         FAST_SINGLE_PASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if debug {
@@ -1579,7 +1571,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         trace = Some(tf);
     } else {
         let t_scan = std::time::Instant::now();
-        if let Some((layout, blocks)) = scan_layout(bytes) {
+        if let Some((layout, blocks)) = scan_layout(&bytes) {
             if debug {
                 eprintln!(
                     "  [parse] scan {:.1}ms: array {}..{}, metadata={}",
@@ -1594,7 +1586,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             if debug {
                 eprintln!("  [parse] threads: {}", threads);
             }
-            match parse_parallel(bytes, &layout, &blocks, threads) {
+            match parse_parallel(&bytes, &layout, &blocks, threads) {
                 Ok((trace_events, metadata, stats)) => {
                     if debug {
                         eprintln!(
@@ -1626,20 +1618,20 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     let mut trace = match trace {
         Some(t) => t,
         None => {
-            if scan_none && memchr::memmem::find(bytes, b"traceEvents").is_none() {
+            if scan_none && memchr::memmem::find(&bytes, b"traceEvents").is_none() {
                 return Err(format!(
                     "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
                     path.display()
                 )
                 .into());
             }
-            match serde_json::from_slice::<TraceFile>(bytes) {
+            match serde_json::from_slice::<TraceFile>(&bytes) {
                 Ok(mut t) => {
                     t.stats.parsed = t.trace_events.len();
                     t.stats.malformed += take_serde_malformed();
                     t
                 }
-                Err(_) => parse_trace_tolerant(bytes, path)?,
+                Err(_) => parse_trace_tolerant(&bytes, path)?,
             }
         }
     };
@@ -2066,7 +2058,7 @@ mod tests {
     fn histogram(evs: &[super::super::TraceEvent]) -> std::collections::HashMap<&str, usize> {
         let mut m = std::collections::HashMap::new();
         for e in evs {
-            *m.entry(e.name).or_insert(0) += 1;
+            *m.entry(e.name.as_str()).or_insert(0) += 1;
         }
         m
     }
@@ -2133,9 +2125,8 @@ mod tests {
         let (layout, blocks) = scan_layout(&bytes).expect("layout");
         let mut all: Vec<Vec<super::super::TraceEvent>> = Vec::new();
         for threads in [1usize, 3, 4] {
-            let mut buf = bytes.clone();
-            let (evs, _, _) =
-                parse_parallel(&mut buf, &layout, &blocks, threads).expect("parallel");
+            let buf = bytes.clone();
+            let (evs, _, _) = parse_parallel(&buf, &layout, &blocks, threads).expect("parallel");
             assert_eq!(evs.len(), 1000, "threads={threads}");
             all.push(evs);
         }
@@ -2271,7 +2262,7 @@ mod tests {
         let path = write_trace("badevent", body);
         let trace = parse_trace(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let names: Vec<&str> = trace.trace_events.iter().map(|e| e.name).collect();
+        let names: Vec<&str> = trace.trace_events.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["A", "B", "C"]);
         assert_eq!(trace.stats.parsed, 3);
         assert_eq!(trace.stats.skipped, 2);
@@ -2440,7 +2431,7 @@ mod tests {
         let path = write_trace("truncated", body);
         let trace = parse_trace(&path).expect("truncated prefix must salvage");
         let _ = std::fs::remove_file(&path);
-        let names: Vec<&str> = trace.trace_events.iter().map(|e| e.name).collect();
+        let names: Vec<&str> = trace.trace_events.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["A", "B"]);
         assert_eq!(trace.stats.parsed, 2);
         assert_eq!(trace.stats.parsed + trace.stats.skipped, 2);
@@ -2666,6 +2657,9 @@ mod tests {
     }
 
     /// A UTF-8 BOM at the file start is stripped: clean stats, fast path.
+    /// Parsing twice yields two independent, fully-owned traces: dropping
+    /// the first must not affect the second (no borrowed file buffer, no
+    /// leaked interner — memory is freed with each `TraceFile`).
     #[test]
     fn bom_at_start_stripped() {
         let mut body = vec![0xEF, 0xBB, 0xBF];
@@ -2683,6 +2677,35 @@ mod tests {
         assert_eq!(trace.stats.parsed, 2);
         assert_eq!(trace.stats.skipped, 0);
         assert_eq!(trace.stats.malformed, 0);
+    }
+
+    /// Parsing the same file twice yields two independent, fully-owned
+    /// traces: dropping the first (freeing all its memory) leaves the
+    /// second intact. Guards the no-leak model — events borrow nothing, so
+    /// there is no shared buffer whose lifetime could couple parses.
+    #[test]
+    fn double_parse_yields_independent_traces() {
+        let body = r#"{"traceEvents":[
+            {"name":"RunTask","cat":"devtools.timeline","ph":"X","ts":1,"pid":1,"tid":1,"dur":5,"args":{"x":1}},
+            {"name":"Paint","ph":"X","ts":2,"pid":1,"tid":1}
+        ]}"#;
+        let path = write_trace("twice", body);
+        let first = parse_trace(&path).expect("first parse must succeed");
+        let second = parse_trace(&path).expect("second parse must succeed");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(first.trace_events.len(), 2);
+        assert_eq!(second.trace_events.len(), 2);
+        for (a, b) in first.trace_events.iter().zip(second.trace_events.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.cat, b.cat);
+            assert_eq!(a.args_raw(), b.args_raw());
+        }
+        drop(first);
+        assert_eq!(second.trace_events[0].name, "RunTask");
+        assert_eq!(
+            second.trace_events[0].args_value().unwrap()["x"],
+            serde_json::json!(1)
+        );
     }
 
     /// Throughput sanity: 200k clean events parse fast on the fast

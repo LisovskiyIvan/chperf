@@ -1088,9 +1088,9 @@ mod tests {
         use crate::analysis::summary::analyze_summary;
         use crate::trace::TraceEvent;
 
-        fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
+        fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
             TraceEvent {
-                name,
+                name: name.to_owned(),
                 id: 0,
                 has_id: false,
                 ph,

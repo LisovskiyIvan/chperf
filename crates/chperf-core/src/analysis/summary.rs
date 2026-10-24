@@ -179,7 +179,15 @@ pub struct EventTypeStat {
     /// from this column do sum sanely against the trace window.
     pub self_time_us: f64,
     pub count: usize,
-    pub avg_time_us: f64, // mean of inclusive durations
+    /// Mean of the same overhead-corrected inclusive durations summed in
+    /// `total_time_us` (`total / count`): for `RunTask` this is the mean
+    /// *effective* (profiler-corrected) duration, for every other event it
+    /// is the mean raw duration corrected the same way. Use `avg_self_us`
+    /// for the mean exclusive time.
+    pub avg_time_us: f64,
+    /// Mean of the same overhead-corrected exclusive durations summed in
+    /// `self_time_us` (`self_total / count`).
+    pub avg_self_us: f64,
     /// Inclusive share of the trace window (`total_time_us` based); may
     /// exceed 100% when summed across categories — see `total_time_us`.
     /// For an overlap-safe share use `self_pct_of_trace`.
@@ -282,7 +290,7 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
                 long_tasks_total_us += eff;
             }
         }
-        if let Some(key) = target_key(e.name)
+        if let Some(key) = target_key(&e.name)
             && e.dur.is_some()
         {
             let entry = stats_map.entry(key).or_default();
@@ -329,6 +337,11 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
             self_time_us: self_total,
             count,
             avg_time_us: if count > 0 { total / count as f64 } else { 0.0 },
+            avg_self_us: if count > 0 {
+                self_total / count as f64
+            } else {
+                0.0
+            },
             pct_of_trace: if total_trace_duration_us > 0.0 {
                 total / total_trace_duration_us * 100.0
             } else {
@@ -379,9 +392,9 @@ pub fn analyze_summary_per_renderer(
 mod tests {
     use super::*;
 
-    fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
+    fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
         TraceEvent {
-            name,
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
@@ -438,6 +451,15 @@ mod tests {
         assert_eq!(by_name("UpdateLayoutTree").self_time_us, 10_000.0);
         assert_eq!(by_name("Layout").total_time_us, 50_000.0);
         assert_eq!(by_name("Layout").self_time_us, 50_000.0);
+        // avg_time_us is the mean of the same corrected inclusive durations
+        // as total_time_us (not raw), and avg_self_us the mean of self.
+        for n in ["RunTask", "UpdateLayoutTree", "Layout"] {
+            let s = by_name(n);
+            assert_eq!(s.avg_time_us, s.total_time_us / s.count as f64);
+            assert_eq!(s.avg_self_us, s.self_time_us / s.count as f64);
+        }
+        assert_eq!(by_name("RunTask").avg_time_us, 100_000.0);
+        assert_eq!(by_name("RunTask").avg_self_us, 40_000.0);
         // Self shares sum sanely against the trace window; inclusive shares
         // document that they may exceed 100%.
         assert!(by_name("RunTask").pct_of_trace > 0.0);

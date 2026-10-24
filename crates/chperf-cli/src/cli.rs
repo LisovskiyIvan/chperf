@@ -5,12 +5,10 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "chperf", about = "Chrome DevTools Trace JSON analyzer (CLI)")]
 pub(crate) struct Cli {
-    /// Path to trace JSON file (.json or .json.gz) or a directory of traces
+    /// Path to a trace JSON file (.json or .json.gz), a glob pattern
+    /// (non-recursive — `**` matches within one directory, like `*`),
+    /// or a directory of traces
     pub(crate) trace: Option<String>,
-
-    /// Interactive REPL: load and analyze once, then query live
-    #[arg(long)]
-    pub(crate) repl: bool,
 
     /// Optional second trace file for comparison
     #[arg(short, long)]

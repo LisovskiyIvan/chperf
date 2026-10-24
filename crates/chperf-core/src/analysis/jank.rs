@@ -167,7 +167,7 @@ pub fn analyze_jank_with_budget_and_bucket(
             continue;
         }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
-        match e.name {
+        match e.name.as_str() {
             "RunTask" if e.ph == b'X' && e.tid == main_tid => {
                 if e.dur.is_some() {
                     let eff = effective_runtask_dur(e, &overheads);
@@ -358,9 +358,9 @@ pub fn analyze_jank_per_renderer(
 mod tests {
     use super::*;
 
-    fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
+    fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
         TraceEvent {
-            name,
+            name: name.to_owned(),
             id: 0,
             has_id: false,
             ph,
