@@ -223,6 +223,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) coverage: bool,
 
+    /// Inspect: per-renderer overview (pid/tid, RunTask totals, long tasks,
+    /// primary marker) for multi-process traces
+    #[arg(long)]
+    pub(crate) renderers: bool,
+
     /// Inspect: when --anchor/--worst finds no match, warn and use the full
     /// trace instead of exiting 2
     #[arg(long = "full-on-miss")]
@@ -276,5 +281,6 @@ impl Cli {
             || self.network
             || self.raster
             || self.coverage
+            || self.renderers
     }
 }

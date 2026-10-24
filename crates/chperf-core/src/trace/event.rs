@@ -378,11 +378,22 @@ pub(crate) fn test_args(v: serde_json::Value) -> Option<&'static str> {
 /// of `X` (every duration analysis filters `ph == b'X'` and would otherwise
 /// see zero durations).
 ///
-/// Stack-based pairing per `(pid, tid)`: `B` pushes, `E` pops the most recent
-/// unmatched `B` with the same name on the same thread (nesting-safe).
+/// Pairing is per `(pid, tid, name)`: each `B` pushes, each `E` pops the most
+/// recent unmatched `B` with the same name on the same thread. This is
+/// exactly the old single-per-thread-stack `rposition`-by-name rule (the
+/// most recent same-name `B` is this name-stack's top), but O(1) per event
+/// instead of O(stack) scan + O(stack) `remove` shift — the old form was
+/// O(n²) when many distinct names piled up unmatched.
+///
 /// Each pair appends one synthetic `X` event (`ts = b.ts`,
 /// `dur = (e.ts - b.ts).max(0.0)`, same name/pid/tid/cat/args as the `B`
 /// event). Returns the number of synthesized pairs.
+///
+/// NOT idempotent — call exactly once per event vec (`parse_trace` does).
+/// Originals are kept by design (see below), so a second call re-pairs the
+/// same `B`/`E`s and appends duplicates. This function cannot touch
+/// `ParseStats` (it only sees the vec): `stats.parsed` still counts raw
+/// events only, never the appended synthetics.
 ///
 /// INVARIANT — no double counting: the original `B`/`E` events are left in
 /// place (not removed or rewritten) because `paired_durations`
@@ -392,23 +403,26 @@ pub(crate) fn test_args(v: serde_json::Value) -> Option<&'static str> {
 /// lowercase `b`/`e` frame ticks, a different phase) never sees the
 /// synthetic `X`. Unpaired `B`/`E` stay as-is and are ignored by `X`-only
 /// passes. `dur` on the synthetic clamps clock-skew (`e.ts < b.ts`) to 0.
+///
+/// `detect_main_thread` interplay: it counts `RunTask` with `ph == b'X'`
+/// only, so unpaired `B`/`E` originals never vote — each pair contributes
+/// exactly one synthetic `X`. No double counting, uniform weighting.
 pub fn normalize_be_pairs(events: &mut Vec<TraceEvent>) -> usize {
     let orig_len = events.len();
-    // Per-thread stack of unmatched begins: (name, event copy).
-    let mut stacks: rustc_hash::FxHashMap<(u64, u64), Vec<TraceEvent>> =
+    // Per-(thread, name) stack of unmatched begins (event copies).
+    let mut stacks: rustc_hash::FxHashMap<(u64, u64, &'static str), Vec<TraceEvent>> =
         rustc_hash::FxHashMap::default();
     let mut made = 0usize;
     for i in 0..orig_len {
         let e = events[i];
         match e.ph {
             b'B' => {
-                stacks.entry((e.pid, e.tid)).or_default().push(e);
+                stacks.entry((e.pid, e.tid, e.name)).or_default().push(e);
             }
             b'E' => {
-                if let Some(st) = stacks.get_mut(&(e.pid, e.tid))
-                    && let Some(pos) = st.iter().rposition(|b| b.name == e.name)
+                if let Some(st) = stacks.get_mut(&(e.pid, e.tid, e.name))
+                    && let Some(b) = st.pop()
                 {
-                    let b = st.remove(pos);
                     events.push(TraceEvent {
                         name: b.name,
                         id: 0,
@@ -537,6 +551,60 @@ mod tests {
         ];
         assert_eq!(normalize_be_pairs(&mut events), 0);
         assert_eq!(events.len(), 2);
+    }
+
+    /// Many distinct names paired FIFO: per-(thread,name) stacks keep this
+    /// linear (the old single-stack `rposition` + `remove` was quadratic
+    /// here). Bounds the regression with a generous wall-clock cap.
+    #[test]
+    fn be_many_distinct_names_scales_linearly() {
+        let n = 20_000usize;
+        let mut events = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            let name = intern_name(&format!("Fn{i}"));
+            events.push(TraceEvent {
+                name,
+                id: 0,
+                has_id: false,
+                ph: b'B',
+                ts: i as f64,
+                dur: None,
+                tid: 1,
+                pid: 1,
+                cat: None,
+                args: None,
+            });
+        }
+        for i in 0..n {
+            let name = intern_name(&format!("Fn{i}"));
+            events.push(TraceEvent {
+                name,
+                id: 0,
+                has_id: false,
+                ph: b'E',
+                ts: i as f64 + 5.0,
+                dur: None,
+                tid: 1,
+                pid: 1,
+                cat: None,
+                args: None,
+            });
+        }
+        let t0 = std::time::Instant::now();
+        let made = normalize_be_pairs(&mut events);
+        let dt = t0.elapsed();
+        assert_eq!(made, n);
+        assert_eq!(events.len(), 3 * n);
+        assert_eq!(
+            events.iter().filter(|e| e.ph == b'X').count(),
+            n,
+            "one synthetic X per pair"
+        );
+        assert!(
+            dt.as_secs_f64() < 5.0,
+            "20k pairs took {:.2}s, expected linear (< 5s)",
+            dt.as_secs_f64()
+        );
     }
 
     fn event_from_json(s: &str) -> TraceEvent {

@@ -330,8 +330,43 @@ pub fn export_html(
 fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], min_ts_a: f64) {
     // ── Trace health (always first) ──
     section(o, "Trace health");
+    let renderers_line = {
+        let mut rs = app.thread_model.renderers.clone();
+        rs.sort_by_key(|r| (r.pid, r.tid));
+        if rs.is_empty() {
+            "0 pids".to_string()
+        } else {
+            format!(
+                "{} pid{} ({})",
+                rs.len(),
+                if rs.len() == 1 { "" } else { "s" },
+                rs.iter()
+                    .map(|r| format!("{}:tid {}", r.pid, r.tid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+    let browser_main = app
+        .thread_model
+        .browser_main
+        .map(|t| format!("tid {}", t))
+        .unwrap_or_else(|| "none".to_string());
+    let compositor = if app.thread_model.compositor.is_empty() {
+        "none".to_string()
+    } else {
+        format!(
+            "tids {}",
+            app.thread_model
+                .compositor
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     o.push_str(&format!(
-        "<p class=\"muted\">Events: {} parsed / {} skipped / {} malformed · main tid {} · {} threads · span {} · frame budget {} · CPU throttle {} · network {}</p>",
+        "<p class=\"muted\">Events: {} parsed / {} skipped / {} malformed · main tid {} · {} threads · span {} · frame budget {} · CPU throttle {} · network {} · renderers {} · browser main {} · compositor {}</p>",
         app.trace_stats.parsed,
         app.trace_stats.skipped,
         app.trace_stats.malformed,
@@ -346,8 +381,86 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
         },
         app.metadata.as_ref().and_then(|m| m.cpu_throttling).map(|v| format!("{:.0}x", v)).unwrap_or_else(|| "1x".to_string()),
         app.metadata.as_ref().and_then(|m| m.network_throttling.clone()).unwrap_or_else(|| "—".to_string()),
+        esc(&renderers_line),
+        esc(&browser_main),
+        esc(&compositor),
     ));
     o.push_str("</section>");
+
+    // ── Renderers (multi-process / OOPIF) ──
+    {
+        let mut rs = app.thread_model.renderers.clone();
+        rs.sort_by_key(|r| (r.pid, r.tid));
+        section(o, "Renderers");
+        if rs.len() <= 1 {
+            let who = rs
+                .first()
+                .map(|r| format!(" (pid {} tid {})", r.pid, r.tid))
+                .unwrap_or_default();
+            o.push_str(&format!(
+                "<p class=\"muted\">Renderers: 1 (single-process trace){}.</p>",
+                esc(&who)
+            ));
+            o.push_str("</section>");
+        } else {
+            o.push_str(&format!(
+                "<p class=\"muted\">Primary renderer (tid {}) feeds the main report; other renderers' numbers are secondary (OOPIF/iframe/workers).</p>",
+                app.thread_model.primary.tid
+            ));
+            let rows = rs
+                .iter()
+                .map(|r| {
+                    let sum = app
+                        .renderer_summaries
+                        .iter()
+                        .find(|(x, _)| x.tid == r.tid)
+                        .map(|(_, s)| s);
+                    let jk = app
+                        .renderer_janks
+                        .iter()
+                        .find(|(x, _)| x.tid == r.tid)
+                        .map(|(_, j)| j);
+                    let name = if r.name.is_empty() { "—" } else { &r.name };
+                    vec![
+                        format!("{}", r.pid),
+                        format!("{}", r.tid),
+                        esc(name),
+                        sum.map(|s| dur(s.main_thread_busy_us))
+                            .unwrap_or_else(|| "—".to_string()),
+                        sum.map(|s| dur(s.runtask_total_us))
+                            .unwrap_or_else(|| "—".to_string()),
+                        sum.map(|s| format!("{}", s.long_task_count))
+                            .unwrap_or_else(|| "—".to_string()),
+                        jk.map(|j| format!("{}", j.total_dropped))
+                            .unwrap_or_else(|| "—".to_string()),
+                        jk.map(|j| format!("{}", j.clusters.len()))
+                            .unwrap_or_else(|| "—".to_string()),
+                        if r.tid == app.thread_model.primary.tid {
+                            "yes".to_string()
+                        } else {
+                            "no".to_string()
+                        },
+                    ]
+                })
+                .collect();
+            table(
+                o,
+                &[
+                    "pid",
+                    "tid",
+                    "thread",
+                    "main busy",
+                    "RunTask total",
+                    "long tasks",
+                    "dropped",
+                    "clusters",
+                    "primary",
+                ],
+                rows,
+            );
+            o.push_str("</section>");
+        }
+    }
 
     // ── Overview cards ──
     o.push_str("<div class=\"metrics\">");

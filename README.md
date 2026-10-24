@@ -186,6 +186,11 @@ chperf trace.json --counters fps --json | jq '.sections.counters'
 chperf trace.json --async
 chperf trace.json --async --top 20 --json | jq '.sections.async.longest'
 
+# Per-renderer overview for multi-process traces (OOPIF/iframes/workers):
+# full reports already carry a Renderers section + `renderers` JSON key.
+chperf trace.json --renderers
+chperf trace.json --renderers --json | jq '.sections.renderers'
+
 # ── Windowed analysis around a semantic anchor (shoot/pre/post) ──
 # --anchor finds the first match in FunctionCall functionName → CPU profile
 # function/URL → event args; the SHOOT window = anchor ± --window (default
@@ -250,6 +255,7 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--loading` | Loading milestones: FCP/LCP candidates, navigation timings, user timing |
 | `--network` | Request lifecycle (Resource*/XHR): counts, cache hits, render-blocking, slowest |
 | `--raster` | Compositor/raster/GPU lanes + decode hotspots (`Decode Image`, `PaintImage`) |
+| `--renderers` | Per-renderer overview (pid/tid, RunTask totals, long tasks, primary marker) for multi-process traces |
 | `--counters [name]` | Generic Counter (`ph C`) series: list (samples per counter) or named series table + min/max/last |
 | `--coverage` | Trust diagnostics: parsed/skipped/malformed, recognized vs unrecognized events |
 | `--frame-budget <ms>` | Frame budget override (0/auto = detect refresh rate from frame cadence) |

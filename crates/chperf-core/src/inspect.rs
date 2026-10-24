@@ -1699,7 +1699,59 @@ pub fn jank_section_with_budget(
         }));
     }
     out.push('\n');
+    append_secondary_jank(&mut out, events, main_tid, budget);
     (out, Value::Array(json_rows))
+}
+
+/// Secondary-renderer jank block for multi-renderer traces (OOPIF/iframes/
+/// workers). Markdown-only: the JSON stays the primary-tid cluster array so
+/// single-renderer consumers are unaffected. Single-renderer traces and empty
+/// models render nothing.
+fn append_secondary_jank(out: &mut String, events: &[TraceEvent], main_tid: u64, budget_us: f64) {
+    let model = crate::trace::detect_thread_model(events);
+    if model.renderers.len() <= 1 {
+        return;
+    }
+    let per = crate::analysis::analyze_jank_per_renderer(events, &model, Some(budget_us));
+    let mut rows: Vec<(&crate::trace::RendererThread, &crate::analysis::JankResult)> = per
+        .iter()
+        .map(|(r, j)| (r, j))
+        .filter(|(r, _)| r.tid != main_tid)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|(r, _)| (r.pid, r.tid));
+    out.push_str("### Secondary renderers (OOPIF/iframe/workers)\n\n");
+    out.push_str("_Primary renderer above; other renderers' numbers are secondary._\n\n");
+    out.push_str("| pid | tid | thread | dropped | clusters | worst cluster |\n");
+    out.push_str("|-----|-----|--------|---------|----------|----------------|\n");
+    for (r, j) in rows {
+        let worst = j
+            .clusters
+            .iter()
+            .max_by_key(|c| (c.dropped_frames, c.busy_us as u64))
+            .map(|c| {
+                format!(
+                    "{} dropped, {} busy, max RunTask {}",
+                    c.dropped_frames,
+                    fmt_ms(c.busy_us),
+                    fmt_ms(c.max_run_us),
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let name = if r.name.is_empty() { "—" } else { &r.name };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            r.pid,
+            r.tid,
+            name,
+            j.total_dropped,
+            j.clusters.len(),
+            worst,
+        ));
+    }
+    out.push('\n');
 }
 
 /// Chrome `ph:"C"` counter series. With `name: None` lists the available
@@ -3256,6 +3308,8 @@ pub fn coverage_section(
     let mut rows: Vec<(&str, usize)> = counts.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
 
+    let model = crate::trace::detect_thread_model(events);
+
     let unrecognized = total.saturating_sub(recognized);
     let pct = if total > 0 {
         recognized as f64 / total as f64 * 100.0
@@ -3276,6 +3330,27 @@ pub fn coverage_section(
     out.push_str(&format!("- **Events skipped**: {}\n", stats.skipped));
     out.push_str(&format!("- **Events malformed**: {}\n", stats.malformed));
     out.push_str(&format!("- **Events in scope**: {}\n", total));
+    out.push_str(&format!(
+        "- **Renderers**: {} · **Browser main**: {} · **Compositor**: {}\n",
+        renderers_line(&model),
+        model
+            .browser_main
+            .map(|t| format!("tid {}", t))
+            .unwrap_or_else(|| "none".to_string()),
+        if model.compositor.is_empty() {
+            "none".to_string()
+        } else {
+            format!(
+                "tids {}",
+                model
+                    .compositor
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    ));
     out.push_str(&format!(
         "- **Recognized**: {} ({:.1}% of scoped events)\n",
         recognized, pct
@@ -3303,9 +3378,122 @@ pub fn coverage_section(
         "parsed": stats.parsed, "skipped": stats.skipped, "malformed": stats.malformed,
         "scoped_events": total, "recognized": recognized, "unrecognized": unrecognized,
         "recognized_pct": (pct * 10.0).round() / 10.0,
+        "renderers": model.renderers.iter().map(|r| json!({
+            "pid": r.pid, "tid": r.tid, "name": r.name,
+        })).collect::<Vec<_>>(),
+        "browser_main_tid": model.browser_main,
+        "compositor_tids": model.compositor,
         "top_names": json_rows,
     });
     (out, j)
+}
+
+/// Compact renderer summary for health blocks: `2 pids (1:tid 11, 2:tid 21)`.
+fn renderers_line(model: &crate::trace::ThreadModel) -> String {
+    if model.renderers.is_empty() {
+        return "0 pids".to_string();
+    }
+    let mut rs = model.renderers.clone();
+    rs.sort_by_key(|r| (r.pid, r.tid));
+    let parts: Vec<String> = rs
+        .iter()
+        .map(|r| format!("{}:tid {}", r.pid, r.tid))
+        .collect();
+    format!(
+        "{} pid{} ({})",
+        rs.len(),
+        if rs.len() == 1 { "" } else { "s" },
+        parts.join(", ")
+    )
+}
+
+/// Per-renderer overview: one row per renderer process (OOPIF/iframe/workers
+/// included) with scoped event/RunTask counts plus the global per-renderer
+/// summary (main-thread busy union, RunTask total, long tasks) and the
+/// primary marker. JSON is the row array (CSV renders one `# renderers`
+/// block); Markdown adds the primary/secondary note when multi-renderer.
+pub fn renderers_section(events: &[TraceEvent], scope: &Scope, min_ts: f64) -> (String, Value) {
+    let model = crate::trace::detect_thread_model(events);
+    let mut rs = model.renderers.clone();
+    rs.sort_by_key(|r| (r.pid, r.tid));
+    let summaries = crate::analysis::analyze_summary_per_renderer(events, &model);
+    let busy_of = |tid: u64| summaries.iter().find(|(r, _)| r.tid == tid).map(|(_, s)| s);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Renderers ({} renderer{}, {})\n\n",
+        rs.len(),
+        if rs.len() == 1 { "" } else { "s" },
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    let mut json_rows: Vec<Value> = Vec::new();
+    if rs.is_empty() {
+        out.push_str("No renderer threads found.\n\n");
+        return (out, Value::Array(json_rows));
+    }
+    if rs.len() > 1 {
+        out.push_str(&format!(
+            "_Primary renderer (tid {}) feeds the main report; other renderers' numbers are secondary (OOPIF/iframe/workers)._ \n\n",
+            model.primary.tid,
+        ));
+    }
+
+    out.push_str("| pid | tid | thread | events | RunTask (n) | RunTask total | long tasks | main busy | primary |\n");
+    out.push_str("|-----|-----|--------|--------|-------------|---------------|------------|-----------|---------|\n");
+    let overheads = crate::trace::find_profiler_overhead(events);
+    for r in &rs {
+        let mut n_events = 0usize;
+        let mut n_run = 0usize;
+        let mut run_total = 0.0f64;
+        let mut long = 0usize;
+        for e in events {
+            if e.tid != r.tid || !scope.allows_event(e) {
+                continue;
+            }
+            n_events += 1;
+            if e.name == "RunTask" && e.ph == b'X' && e.dur.is_some() {
+                let eff = crate::trace::effective_runtask_dur(e, &overheads);
+                n_run += 1;
+                run_total += eff;
+                if eff > 50_000.0 {
+                    long += 1;
+                }
+            }
+        }
+        let busy = busy_of(r.tid).map(|s| s.main_thread_busy_us).unwrap_or(0.0);
+        let is_primary = r.tid == model.primary.tid;
+        let name = if r.name.is_empty() { "—" } else { &r.name };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.pid,
+            r.tid,
+            name,
+            n_events,
+            n_run,
+            fmt_ms(run_total),
+            long,
+            fmt_ms(busy),
+            if is_primary { "yes" } else { "no" },
+        ));
+        json_rows.push(json!({
+            "pid": r.pid,
+            "tid": r.tid,
+            "name": r.name,
+            "events": n_events,
+            "runtask_count": n_run,
+            "runtask_total_us": run_total.round(),
+            "long_task_count": long,
+            "main_busy_us": busy.round(),
+            "is_primary": is_primary,
+        }));
+    }
+    out.push('\n');
+    (out, Value::Array(json_rows))
 }
 
 #[cfg(test)]
@@ -3817,5 +4005,153 @@ mod tests {
         };
         let (md, _) = counters_section(&events, &win_scope, 10, 0.0, None);
         assert!(md.contains("No counters found."), "{}", md);
+    }
+
+    fn ev_rt(ts: f64, dur: f64, tid: u64, pid: u64) -> TraceEvent {
+        TraceEvent {
+            name: crate::trace::intern_name("RunTask"),
+            id: 0,
+            has_id: false,
+            ph: b'X',
+            ts,
+            dur: Some(dur),
+            tid,
+            pid,
+            cat: None,
+            args: None,
+        }
+    }
+
+    fn ev_tn(pid: u64, tid: u64, name: &str) -> TraceEvent {
+        TraceEvent {
+            name: crate::trace::intern_name("thread_name"),
+            id: 0,
+            has_id: false,
+            ph: b'M',
+            ts: 0.0,
+            dur: None,
+            tid,
+            pid,
+            cat: Some(crate::trace::intern_name("__metadata")),
+            args: crate::trace::test_args(json!({"name": name})),
+        }
+    }
+
+    /// Two renderer pids + browser main + compositor lane.
+    /// tid 11 (pid 1) is the busiest → primary; tid 21 (pid 2) owns a 60ms
+    /// long task.
+    fn multi_renderer_events() -> Vec<TraceEvent> {
+        let mut events = vec![
+            ev_tn(1, 11, "CrRendererMain"),
+            ev_tn(2, 21, "CrRendererMain"),
+            ev_tn(3, 31, "CrBrowserMain"),
+            ev_tn(1, 12, "VizCompositorThread"),
+        ];
+        for i in 0..4 {
+            events.push(ev_rt(1_000_000.0 + i as f64 * 30_000.0, 20_000.0, 11, 1));
+        }
+        for i in 0..2 {
+            events.push(ev_rt(1_000_000.0 + i as f64 * 30_000.0, 20_000.0, 21, 2));
+        }
+        events.push(ev_rt(1_200_000.0, 60_000.0, 21, 2));
+        events.push(ev_rt(1_000_000.0, 10_000.0, 31, 3));
+        events
+    }
+
+    fn parse_stats() -> crate::trace::ParseStats {
+        crate::trace::ParseStats {
+            parsed: 12,
+            skipped: 0,
+            malformed: 0,
+        }
+    }
+
+    #[test]
+    fn renderers_section_lists_both_pids_with_primary_marker() {
+        let events = multi_renderer_events();
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, j) = renderers_section(&events, &scope, 1_000_000.0);
+        assert!(md.contains("## Renderers (2 renderers"), "{}", md);
+        assert!(md.contains("Primary renderer"), "{}", md);
+        let rows = j.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["pid"], 1);
+        assert_eq!(rows[0]["tid"], 11);
+        assert_eq!(rows[0]["name"], "CrRendererMain");
+        assert_eq!(rows[0]["is_primary"], true);
+        assert_eq!(rows[1]["pid"], 2);
+        assert_eq!(rows[1]["is_primary"], false);
+        // pid 2 owns the only >50ms task.
+        assert_eq!(rows[1]["long_task_count"], 1);
+        assert_eq!(rows[0]["long_task_count"], 0);
+        assert_eq!(rows[0]["runtask_count"], 4);
+    }
+
+    #[test]
+    fn coverage_section_carries_thread_model() {
+        let events = multi_renderer_events();
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, j) = coverage_section(&events, &scope, &parse_stats(), 1_000_000.0);
+        assert!(md.contains("Renderers"), "{}", md);
+        assert!(md.contains("Browser main"), "{}", md);
+        assert!(md.contains("Compositor"), "{}", md);
+        assert_eq!(j["renderers"].as_array().unwrap().len(), 2);
+        assert_eq!(j["renderers"][0]["pid"], 1);
+        assert_eq!(j["renderers"][0]["name"], "CrRendererMain");
+        assert_eq!(j["browser_main_tid"], 31);
+        assert_eq!(j["compositor_tids"], json!([12]));
+    }
+
+    #[test]
+    fn jank_section_appends_secondary_block_only_when_multi_renderer() {
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md_multi, _) = jank_section_with_budget(
+            &multi_renderer_events(),
+            &scope,
+            10,
+            1_000_000.0,
+            None,
+            None,
+        );
+        assert!(md_multi.contains("Secondary renderers"), "{}", md_multi);
+        assert!(md_multi.contains("OOPIF"), "{}", md_multi);
+
+        // Single renderer: no secondary block, legacy shape untouched.
+        let single = vec![
+            ev_tn(1, 11, "CrRendererMain"),
+            ev_rt(1_000_000.0, 60_000.0, 11, 1),
+            ev_rt(3_000_000.0, 5_000.0, 11, 1),
+        ];
+        let (md_single, j) = jank_section_with_budget(&single, &scope, 10, 1_000_000.0, None, None);
+        assert!(!md_single.contains("Secondary"), "{}", md_single);
+        assert!(j.is_array());
+    }
+
+    #[test]
+    fn renderers_section_empty_trace_has_no_rows() {
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, j) = renderers_section(&[], &scope, 0.0);
+        assert!(md.contains("No renderer threads found."), "{}", md);
+        assert_eq!(j.as_array().unwrap().len(), 0);
     }
 }

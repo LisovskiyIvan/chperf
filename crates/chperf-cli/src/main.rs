@@ -138,6 +138,10 @@ fn build_app(a: &Analyzed, b: Option<(&Analyzed, String)>, name_a: String) -> ap
         tids.insert(e.tid);
     }
     let frame_budget_us = chperf_core::windowed::detect_frame_budget_us(events);
+    let thread_model = trace::detect_thread_model(events);
+    let renderer_summaries = analysis::analyze_summary_per_renderer(events, &thread_model);
+    let renderer_janks =
+        analysis::analyze_jank_per_renderer(events, &thread_model, Some(frame_budget_us));
 
     let metadata = a.trace.metadata.clone();
     app::App::new(
@@ -152,6 +156,9 @@ fn build_app(a: &Analyzed, b: Option<(&Analyzed, String)>, name_a: String) -> ap
         network,
         raster,
         official_long_tasks,
+        thread_model,
+        renderer_summaries,
+        renderer_janks,
         a.trace.stats.clone(),
         tids.len(),
         a.summary.total_trace_duration_us,

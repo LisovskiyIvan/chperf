@@ -2,7 +2,7 @@
 //! This is the presentation aggregate the CLI builds over `chperf_core`.
 
 use chperf_core::analysis::*;
-use chperf_core::trace::{ParseStats, TraceMetadata};
+use chperf_core::trace::{ParseStats, ThreadModel, TraceMetadata};
 
 pub struct App {
     /// CPU throttle factor (reference note only: shown in the report header,
@@ -19,6 +19,9 @@ pub struct App {
     pub network: NetworkResult,
     pub raster: RasterResult,
     pub official_long_tasks: Vec<LatencyEntry>,
+    pub thread_model: ThreadModel,
+    pub renderer_summaries: Vec<(chperf_core::trace::RendererThread, SummaryResult)>,
+    pub renderer_janks: Vec<(chperf_core::trace::RendererThread, JankResult)>,
     pub trace_stats: ParseStats,
     pub thread_count: usize,
     pub trace_span_us: f64,
@@ -44,6 +47,9 @@ impl App {
         network: NetworkResult,
         raster: RasterResult,
         official_long_tasks: Vec<LatencyEntry>,
+        thread_model: ThreadModel,
+        renderer_summaries: Vec<(chperf_core::trace::RendererThread, SummaryResult)>,
+        renderer_janks: Vec<(chperf_core::trace::RendererThread, JankResult)>,
         trace_stats: ParseStats,
         thread_count: usize,
         trace_span_us: f64,
@@ -67,6 +73,9 @@ impl App {
             network,
             raster,
             official_long_tasks,
+            thread_model,
+            renderer_summaries,
+            renderer_janks,
             trace_stats,
             thread_count,
             trace_span_us,

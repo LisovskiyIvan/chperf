@@ -1074,7 +1074,14 @@ fn find_top_level_open(bytes: &[u8], blocks: &Blocks, needle: &[u8]) -> Option<(
 fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let blocks = build_blocks(bytes);
-    let (arr_open, _opener) = find_top_level_open(bytes, &blocks, b"traceEvents")?;
+    let (arr_open, opener) = find_top_level_open(bytes, &blocks, b"traceEvents")?;
+    // `traceEvents` must open an array. A non-array value (object, null,
+    // number, …) is genuinely non-trace input: fall through to the tolerant
+    // path, which errors with a clear "missing top-level traceEvents array"
+    // message instead of mis-parsing a member object as events.
+    if opener != b'[' {
+        return None;
+    }
     if debug {
         eprintln!("  [scan] arr_open at {}", arr_open);
     }
@@ -1474,6 +1481,13 @@ fn chunk_work(
     Ok(parse_slice_tolerant(bytes, s, e))
 }
 
+/// Test-only counter for how many `parse_trace` calls were served by the
+/// fast single-pass tokenizer (no block scan, no serde). Lets throughput /
+/// fast-path tests assert the hot path was taken without parsing logs.
+#[cfg(test)]
+pub(crate) static FAST_SINGLE_PASS_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
     // Drop any stale serde-fallback counts (unit tests deserialize events
     // directly without draining).
@@ -1482,7 +1496,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // Decompress (if .gz) and parse from an in-memory slice. This is far
     // faster than streaming serde_json through the gzip decoder: zlib-rs
     // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
-    let bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+    let mut bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
         // Preallocate from the gzip footer ISIZE (last 4 bytes, LE u32):
         // a hint for the uncompressed size. Never fail because of it.
         let hint: Option<usize> = (|| {
@@ -1513,6 +1527,37 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             .map_err(|e| format!("{}: {}", path.display(), e))?;
         out
     };
+    // Strip a UTF-8 BOM so every downstream path (fast single-pass, block
+    // scan, serde) sees the same `{`-first buffer. Without this the fast
+    // path bails (first byte isn't `{`) and relies on the slower fallbacks.
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    // LIFETIME NOTE — `Box::leak` here is intentional and must stay until the
+    // public API changes (rationale and measured alternatives documented
+    // in this comment).
+    //
+    // Why: `TraceEvent.args` is `Option<&'static str>` borrowed zero-copy
+    // from this buffer (the fast tokenizer transmutes the `args` slice; the
+    // serde fallback leaks a per-event owned copy instead). `TraceFile`
+    // carries no backing buffer — adding one would change the public struct
+    // that other crates construct/match against — so the buffer is leaked to
+    // give those borrows a valid referent for the `TraceFile`'s lifetime.
+    //
+    // Cost: exactly one whole-file buffer per `parse_trace` call (the
+    // current file's bytes, not cumulative within a call). Fine for one-shot
+    // CLI use. A long-lived process that re-parses (REPL `load` in a loop,
+    // watch mode) leaks one buffer per load while the process lives; the
+    // previous `TraceFile`'s events keep pointing at the old buffer so it
+    // can never be freed while they are alive. Companion bounded leaks:
+    // the name/category interner (bounded by trace vocabulary, a few
+    // hundred entries) and one small leak per serde-fallback `args` value.
+    //
+    // Removal would require a public API change: owned `String` args, or a
+    // `TraceFile`-owned arena with self-referential lifetimes. The
+    // copy-out alternative (leak per-event owned `args`, free the buffer)
+    // was rejected: it trades one bounded leak for N small leaks plus a
+    // per-event allocation on the hot path, and still leaks on REPL re-runs.
     let bytes: &'static mut [u8] = Box::leak(bytes.into_boxed_slice());
 
     // Fast path: single-pass zero-copy top-level + traceEvents parse without
@@ -1522,6 +1567,8 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     let mut scan_none = false;
     let t_fast = std::time::Instant::now();
     if let Ok(tf) = parse_trace_fast(bytes) {
+        #[cfg(test)]
+        FAST_SINGLE_PASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if debug {
             eprintln!(
                 "  [parse] fast single-pass {:.1}ms: {} events",
@@ -1742,26 +1789,39 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
 /// `traceEvents` element by element. Good events are kept, broken ones are
 /// skipped and counted (`skipped`/`malformed`) — only a missing/non-array
 /// `traceEvents` still fails the file (with path context).
+///
+/// When the root value itself won't decode (truncated write, trailing
+/// garbage), fall back to `parse_trace_truncated`, which salvages the
+/// complete-event prefix instead of failing the whole file.
 fn parse_trace_tolerant(
     bytes: &[u8],
     path: &Path,
 ) -> Result<TraceFile, Box<dyn std::error::Error>> {
     take_serde_malformed();
-    let root: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| format!("{}: failed to parse trace: {}", path.display(), e))?;
-    let arr = root
-        .get("traceEvents")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            Box::<dyn std::error::Error>::from(format!(
-                "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
-                path.display()
-            ))
-        })?;
+    let root: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return parse_trace_truncated(bytes, path),
+    };
+    let not_trace = || {
+        Box::<dyn std::error::Error>::from(format!(
+            "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
+            path.display()
+        ))
+    };
+    // Take ownership of the array (no per-element `Value::clone`): each item
+    // is moved into the per-event deserializer exactly once.
+    let mut map = match root {
+        serde_json::Value::Object(m) => m,
+        _ => return Err(not_trace()),
+    };
+    let arr = match map.remove("traceEvents") {
+        Some(serde_json::Value::Array(a)) => a,
+        _ => return Err(not_trace()),
+    };
     let mut trace_events = Vec::with_capacity(arr.len());
     let mut stats = ParseStats::default();
     for item in arr {
-        match serde_json::from_value::<TraceEvent>(item.clone()) {
+        match serde_json::from_value::<TraceEvent>(item) {
             Ok(ev) => {
                 stats.parsed += 1;
                 stats.malformed += take_serde_malformed();
@@ -1774,14 +1834,84 @@ fn parse_trace_tolerant(
             }
         }
     }
-    let metadata = root
-        .get("metadata")
-        .and_then(|m| serde_json::from_value::<TraceMetadata>(m.clone()).ok());
+    let metadata = map
+        .remove("metadata")
+        .and_then(|m| serde_json::from_value::<TraceMetadata>(m).ok());
     Ok(TraceFile {
         trace_events,
         metadata,
         stats,
     })
+}
+
+/// Salvage path for input whose root JSON won't decode (truncated mid-event
+/// write, trailing garbage after the array). Locates the top-level
+/// `"traceEvents": [` opener with a quote/colon structural probe (first
+/// plausible candidate — the header is intact in truncation scenarios) and
+/// parses the complete-event prefix with the tolerant per-element walk:
+/// unterminated tail input simply stops the walk, keeping what parsed.
+/// Still errors (clearly) when no array opener exists — that input was never
+/// a trace — and yields zero events only for the caller to report "no
+/// events".
+fn parse_trace_truncated(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<TraceFile, Box<dyn std::error::Error>> {
+    take_serde_malformed();
+    let open = find_trace_events_open(bytes).ok_or_else(|| {
+        Box::<dyn std::error::Error>::from(format!(
+            "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
+            path.display()
+        ))
+    })?;
+    let (trace_events, stats) = parse_slice_tolerant(bytes, open + 1, bytes.len());
+    Ok(TraceFile {
+        trace_events,
+        metadata: None,
+        stats,
+    })
+}
+
+/// Byte offset of the `[` opening the top-level `traceEvents` value: the
+/// first `"traceEvents"` occurrence followed by `"`, `:`, `[` whose
+/// preceding non-whitespace byte is `{` or `,` (a member position, not
+/// string content). `None` when no such opener exists.
+fn find_trace_events_open(bytes: &[u8]) -> Option<usize> {
+    for m in memchr::memmem::find_iter(bytes, b"traceEvents") {
+        if m == 0 || bytes[m - 1] != b'"' {
+            continue;
+        }
+        let after = m + b"traceEvents".len();
+        if after >= bytes.len() || bytes[after] != b'"' {
+            continue;
+        }
+        let mut j = after + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'[' {
+            // Byte before the key (skipping whitespace) must be `{` or `,`
+            // — a member position, not string content.
+            let mut k = m - 1;
+            while k > 0 {
+                k -= 1;
+                if !bytes[k].is_ascii_whitespace() {
+                    break;
+                }
+            }
+            if bytes[k] == b'{' || bytes[k] == b',' {
+                return Some(j);
+            }
+        }
+    }
+    None
 }
 
 /// `processId`: integer or numeric string, else 0.
@@ -2295,5 +2425,353 @@ mod tests {
         assert_eq!(trace.stats.skipped, 1);
         // 1300 string-ts coercions (fast or tolerant chunk alike) + 1 skip.
         assert_eq!(trace.stats.malformed, 1301);
+    }
+
+    /// Truncated mid-event: the complete-event prefix is salvaged, the torn
+    /// tail stops the walk. No panic, no whole-file failure.
+    #[test]
+    fn truncated_mid_event_salvages_complete_prefix() {
+        let body = concat!(
+            r#"{"traceEvents":["#,
+            r#"{"name":"A","ph":"X","ts":1,"pid":1,"tid":1},"#,
+            r#"{"name":"B","ph":"X","ts":2,"pid":1,"tid":1},"#,
+            r#"{"name":"C","ph":"X","ts":3,"pid":1,"ti"#,
+        );
+        let path = write_trace("truncated", body);
+        let trace = parse_trace(&path).expect("truncated prefix must salvage");
+        let _ = std::fs::remove_file(&path);
+        let names: Vec<&str> = trace.trace_events.iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["A", "B"]);
+        assert_eq!(trace.stats.parsed, 2);
+        assert_eq!(trace.stats.parsed + trace.stats.skipped, 2);
+    }
+
+    /// Truncated with zero complete events is still an error (nothing to
+    /// analyze) — but a clear one, not a panic.
+    #[test]
+    fn truncated_with_no_complete_event_errors_clearly() {
+        let path = write_trace(
+            "truncated-none",
+            r#"{"traceEvents":[{"name":"A","ph":"X","ts"#,
+        );
+        let err = match parse_trace(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains("no events"), "unexpected: {err}");
+    }
+
+    /// Trailing garbage after the array close is ignored: all events parse,
+    /// stats stay clean.
+    #[test]
+    fn trailing_garbage_after_array_ignored() {
+        let body = concat!(
+            r#"{"traceEvents":["#,
+            r#"{"name":"A","ph":"X","ts":1,"pid":1,"tid":1},"#,
+            r#"{"name":"B","ph":"X","ts":2,"pid":1,"tid":1}]"#,
+            r#"} this is not json at all"#,
+        );
+        let path = write_trace("trailing", body);
+        let trace = parse_trace(&path).expect("trailing garbage must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 2);
+        assert_eq!(trace.stats.parsed, 2);
+        assert_eq!(trace.stats.skipped, 0);
+    }
+
+    /// Missing / null / non-array `traceEvents` is genuinely non-trace
+    /// input: a clear error naming `traceEvents`, never a panic.
+    #[test]
+    fn non_array_trace_events_errors_clearly() {
+        for (tag, body) in [
+            ("missing", r#"{"metadata":{}}"#),
+            ("null", r#"{"traceEvents":null}"#),
+            ("object", r#"{"traceEvents":{}}"#),
+            ("string", r#"{"traceEvents":"nope"}"#),
+            ("number", r#"{"traceEvents":42}"#),
+            ("toplevel-array", r#"[1,2,3]"#),
+        ] {
+            let path = write_trace(&format!("nonarray-{tag}"), body);
+            let err = match parse_trace(&path) {
+                Err(e) => e,
+                Ok(_) => panic!("{tag}: must fail"),
+            };
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                err.to_string().contains("traceEvents"),
+                "{tag}: unexpected error: {err}"
+            );
+        }
+    }
+
+    /// One >1MB event parses intact (exceeds any chunk/walk cap), args kept.
+    #[test]
+    fn single_giant_event_over_1mb() {
+        let blob_len = 1_200_000;
+        let body = format!(
+            "{{\"traceEvents\":[{{\"name\":\"Huge\",\"ph\":\"X\",\"ts\":1,\"pid\":1,\"tid\":1,\"args\":{{\"blob\":\"{}\"}}}}]}}",
+            "B".repeat(blob_len)
+        );
+        let path = write_trace("giant1m", &body);
+        let trace = parse_trace(&path).expect("giant event must parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 1);
+        assert_eq!(trace.trace_events[0].name, "Huge");
+        assert_eq!(trace.stats.parsed, 1);
+        assert_eq!(trace.stats.skipped, 0);
+        let raw = trace.trace_events[0].args_raw().expect("args kept");
+        assert!(raw.len() > blob_len, "args preserved, got {}", raw.len());
+    }
+
+    /// `args` as string / number / null / missing: all kept, none fatal.
+    #[test]
+    fn args_wrong_types_kept_not_fatal() {
+        let body = r#"{"traceEvents":[
+            {"name":"S","ph":"X","ts":1,"pid":1,"tid":1,"args":"just a string"},
+            {"name":"N","ph":"X","ts":2,"pid":1,"tid":1,"args":42},
+            {"name":"Z","ph":"X","ts":3,"pid":1,"tid":1,"args":null},
+            {"name":"M","ph":"X","ts":4,"pid":1,"tid":1}
+        ]}"#;
+        let path = write_trace("argstypes", body);
+        let trace = parse_trace(&path).expect("args types must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 4);
+        assert_eq!(trace.stats.parsed + trace.stats.skipped, 4);
+        let evs = &trace.trace_events;
+        assert_eq!(
+            evs[0]
+                .args_value()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .as_deref(),
+            Some("just a string")
+        );
+        assert_eq!(evs[1].args_value().and_then(|v| v.as_u64()), Some(42));
+        assert!(evs[2].args_value().is_none());
+        assert!(evs[3].args_value().is_none());
+    }
+
+    /// 200-deep nested `args` parses without stack overflow or panic (the
+    /// fast path skips values iteratively; serde never recurses into
+    /// `RawValue`).
+    #[test]
+    fn deeply_nested_args_no_panic() {
+        let mut inner = String::from("1");
+        for _ in 0..200 {
+            inner = format!("{{\"a\":{inner}}}");
+        }
+        let body = format!(
+            "{{\"traceEvents\":[{{\"name\":\"Deep\",\"ph\":\"X\",\"ts\":1,\"pid\":1,\"tid\":1,\"args\":{inner}}}]}}"
+        );
+        let path = write_trace("deepnest", &body);
+        let trace = parse_trace(&path).expect("deep nesting must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 1);
+        assert_eq!(trace.stats.parsed + trace.stats.skipped, 1);
+    }
+
+    /// `ts` as string / float / negative / null coerces or defaults, file
+    /// survives with exact accounting.
+    #[test]
+    fn duplicate_ts_types_coerce() {
+        let body = r#"{"traceEvents":[
+            {"name":"S","ph":"X","ts":"100.5","pid":1,"tid":1},
+            {"name":"F","ph":"X","ts":200.25,"pid":1,"tid":1},
+            {"name":"G","ph":"X","ts":-5,"pid":1,"tid":1},
+            {"name":"U","ph":"X","ts":null,"pid":1,"tid":1}
+        ]}"#;
+        let path = write_trace("tstypes", body);
+        let trace = parse_trace(&path).expect("ts types must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 4);
+        assert_eq!(trace.stats.parsed, 4);
+        assert_eq!(trace.stats.skipped, 0);
+        let evs = &trace.trace_events;
+        assert_eq!(evs[0].ts, 100.5);
+        assert_eq!(evs[1].ts, 200.25);
+        assert_eq!(evs[2].ts, -5.0);
+        assert_eq!(evs[3].ts, 0.0);
+    }
+
+    /// `ph` empty / missing / two-byte: empty and missing read as 0,
+    /// two-byte keeps the first byte. No bail-outs.
+    #[test]
+    fn ph_empty_missing_two_byte() {
+        let body = r#"{"traceEvents":[
+            {"name":"E","ph":"","ts":1,"pid":1,"tid":1},
+            {"name":"M","ts":2,"pid":1,"tid":1},
+            {"name":"T","ph":"Xy","ts":3,"pid":1,"tid":1}
+        ]}"#;
+        let path = write_trace("phtypes", body);
+        let trace = parse_trace(&path).expect("ph variants must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 3);
+        assert_eq!(trace.stats.parsed, 3);
+        assert_eq!(trace.stats.skipped, 0);
+        assert_eq!(trace.trace_events[0].ph, 0);
+        assert_eq!(trace.trace_events[1].ph, 0);
+        assert_eq!(trace.trace_events[2].ph, b'X');
+    }
+
+    /// Literal control bytes in strings don't panic the tokenizer (lenient
+    /// fast path keeps the event).
+    #[test]
+    fn control_chars_in_strings_no_panic() {
+        let body =
+            "{\"traceEvents\":[{\"name\":\"A\x01B\",\"ph\":\"X\",\"ts\":1,\"pid\":1,\"tid\":1}]}";
+        let path = write_trace("ctrlchars", body);
+        let trace = parse_trace(&path).expect("control chars must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 1);
+        assert_eq!(trace.stats.parsed + trace.stats.skipped, 1);
+    }
+
+    /// A lone-surrogate escape (`\uD800`) split across a 64KB block boundary
+    /// parses without panic; every input element is accounted exactly once.
+    #[test]
+    fn lone_surrogate_split_across_block_boundary() {
+        // Layout: prefix + padded args put `\` at byte 65535 of block 0.
+        let mut json =
+            String::from(r#"{"traceEvents":[{"name":"pad","ph":"X","ts":0,"args":{"s":""#);
+        let prefix_len = json.len();
+        // `\uD800` is 6 bytes; pad so `\` lands on the last byte of block 0.
+        let pad = 65_535 - prefix_len;
+        json.push_str(&"x".repeat(pad));
+        json.push_str("\\uD800");
+        json.push_str("rest");
+        json.push_str("\"}}");
+        for i in 0..10 {
+            json.push_str(&format!(r#",{{"name":"tail{i}","ph":"X","ts":{i}}}"#));
+        }
+        json.push_str("]}");
+        let b = json.as_bytes();
+        assert_eq!(b[65_535], b'\\', "escape must straddle the boundary");
+        let path = write_trace("surrogate-split", &json);
+        let trace = parse_trace(&path).expect("surrogate split must not fail");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 11);
+        assert_eq!(trace.stats.parsed + trace.stats.skipped, 11);
+    }
+
+    /// `\r\n` line endings parse like `\n`.
+    #[test]
+    fn crlf_line_endings() {
+        let body = "{\r\n\"traceEvents\": [\r\n{\"name\":\"A\",\"ph\":\"X\",\"ts\":1,\"pid\":1,\"tid\":1},\r\n{\"name\":\"B\",\"ph\":\"X\",\"ts\":2,\"pid\":1,\"tid\":1}\r\n]\r\n}";
+        let path = write_trace("crlf", body);
+        let trace = parse_trace(&path).expect("crlf must parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 2);
+        assert_eq!(trace.stats.parsed, 2);
+        assert_eq!(trace.stats.skipped, 0);
+    }
+
+    /// A UTF-8 BOM at the file start is stripped: clean stats, fast path.
+    #[test]
+    fn bom_at_start_stripped() {
+        let mut body = vec![0xEF, 0xBB, 0xBF];
+        body.extend_from_slice(
+            br#"{"traceEvents":[
+            {"name":"A","ph":"X","ts":1,"pid":1,"tid":1},
+            {"name":"B","ph":"X","ts":2,"pid":1,"tid":1}
+        ]}"#,
+        );
+        let path = std::env::temp_dir().join(format!("chperf-bom-{}.json", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        let trace = parse_trace(&path).expect("BOM must be stripped");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 2);
+        assert_eq!(trace.stats.parsed, 2);
+        assert_eq!(trace.stats.skipped, 0);
+        assert_eq!(trace.stats.malformed, 0);
+    }
+
+    /// Throughput sanity: 200k clean events parse fast on the fast
+    /// single-pass path (well under 3s even in debug) with exact stats.
+    #[test]
+    fn perf_200k_events_sane_throughput() {
+        use std::sync::atomic::Ordering;
+        let n = 200_000usize;
+        let mut body = String::with_capacity(n * 56);
+        body.push_str("{\"traceEvents\":[");
+        for i in 0..n {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                "{{\"name\":\"Ev{}\",\"ph\":\"X\",\"ts\":{},\"pid\":1,\"tid\":1}}",
+                i % 50,
+                i
+            ));
+        }
+        body.push_str("]}");
+        let path = write_trace("perf200k", &body);
+        drop(body);
+        let before = FAST_SINGLE_PASS_HITS.load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let trace = parse_trace(&path).expect("200k must parse");
+        let dt = t0.elapsed();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), n);
+        assert_eq!(trace.stats.parsed, n);
+        assert_eq!(trace.stats.skipped, 0);
+        assert_eq!(trace.stats.malformed, 0);
+        assert!(
+            FAST_SINGLE_PASS_HITS.load(Ordering::Relaxed) > before,
+            "clean input must take the fast single-pass path"
+        );
+        assert!(
+            dt.as_secs_f64() < 3.0,
+            "200k events took {:.2}s, expected < 3s (fast path regression?)",
+            dt.as_secs_f64()
+        );
+    }
+
+    /// `normalize_be_pairs` results flow through `parse_trace` with raw-only
+    /// stats, and `detect_main_thread` counts exactly one vote per pair
+    /// (synthetic `X` only — original `B`/`E` never vote, no doubling).
+    #[test]
+    fn be_synthetic_x_counts_once_in_main_detection() {
+        // Thread 1: three genuine X RunTasks. Thread 2: two B/E pairs
+        // (2 synthetic X after normalize). B/E originals must not vote.
+        let body = r#"{"traceEvents":[
+            {"name":"thread_name","ph":"M","ts":0,"pid":1,"tid":1,"args":{"name":"Worker"}},
+            {"name":"thread_name","ph":"M","ts":0,"pid":1,"tid":2,"args":{"name":"Worker"}},
+            {"name":"RunTask","ph":"X","ts":1,"pid":1,"tid":1,"dur":10},
+            {"name":"RunTask","ph":"X","ts":2,"pid":1,"tid":1,"dur":10},
+            {"name":"RunTask","ph":"X","ts":3,"pid":1,"tid":1,"dur":10},
+            {"name":"RunTask","ph":"B","ts":4,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"E","ts":14,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"B","ts":5,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"E","ts":15,"pid":1,"tid":2}
+        ]}"#;
+        let path = write_trace("bexcount", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // 9 raw events in, 2 synthetics appended, stats count raw only.
+        assert_eq!(trace.stats.parsed, 9);
+        assert_eq!(trace.trace_events.len(), 11);
+        assert_eq!(super::super::detect_main_thread(&trace.trace_events), 1);
+        // Flip the majority: four B/E pairs on thread 2 (4 synthetic X)
+        // beat three genuine X on thread 1 — synthetics elect, originals
+        // don't double-vote.
+        let body2 = r#"{"traceEvents":[
+            {"name":"RunTask","ph":"X","ts":1,"pid":1,"tid":1,"dur":10},
+            {"name":"RunTask","ph":"X","ts":2,"pid":1,"tid":1,"dur":10},
+            {"name":"RunTask","ph":"X","ts":3,"pid":1,"tid":1,"dur":10},
+            {"name":"RunTask","ph":"B","ts":4,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"E","ts":14,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"B","ts":5,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"E","ts":15,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"B","ts":6,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"E","ts":16,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"B","ts":7,"pid":1,"tid":2},
+            {"name":"RunTask","ph":"E","ts":17,"pid":1,"tid":2}
+        ]}"#;
+        let path2 = write_trace("bexcount2", body2);
+        let trace2 = parse_trace(&path2).unwrap();
+        let _ = std::fs::remove_file(&path2);
+        assert_eq!(trace2.stats.parsed, 11);
+        assert_eq!(trace2.trace_events.len(), 15);
+        assert_eq!(super::super::detect_main_thread(&trace2.trace_events), 2);
     }
 }

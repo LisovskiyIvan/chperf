@@ -12,7 +12,7 @@ fn ms(us: f64) -> f64 {
 
 /// Full-report JSON value. Top-level shape (stable):
 /// trace, trace_health, summary, frame_blocking_tasks, cpu_profile,
-/// jank, loading, network, raster, memory?, compare?.
+/// jank, loading, network, raster, renderers, memory?, compare?.
 pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) -> Value {
     let scope = inspect::Scope {
         window: None,
@@ -44,6 +44,11 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
             "frame_budget_us": app.frame_budget_us.round(),
             "frame_budget_ms": ms(app.frame_budget_us),
             "frame_budget": inspect::frame_budget_label(app.frame_budget_us),
+            "renderers": app.thread_model.renderers.iter().map(|r| json!({
+                "pid": r.pid, "tid": r.tid, "name": r.name,
+            })).collect::<Vec<_>>(),
+            "browser_main_tid": app.thread_model.browser_main,
+            "compositor_tids": app.thread_model.compositor,
             "cpu_throttle": app.metadata.as_ref().and_then(|m| m.cpu_throttling),
             "network_throttle": app.metadata.as_ref().and_then(|m| m.network_throttling.clone()),
         }),
@@ -176,6 +181,37 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
                 "t_us": h.ts_us.round(), "dur_us": h.dur_us.round(), "source": h.url_or_node,
             })).collect::<Vec<_>>(),
         }),
+    );
+    obj.insert(
+        "renderers".into(),
+        json!(
+            app.thread_model
+                .renderers
+                .iter()
+                .map(|r| {
+                    let sum = app
+                        .renderer_summaries
+                        .iter()
+                        .find(|(x, _)| x.tid == r.tid)
+                        .map(|(_, s)| s);
+                    let jk = app
+                        .renderer_janks
+                        .iter()
+                        .find(|(x, _)| x.tid == r.tid)
+                        .map(|(_, j)| j);
+                    json!({
+                        "pid": r.pid, "tid": r.tid, "name": r.name,
+                        "is_primary": r.tid == app.thread_model.primary.tid,
+                        "main_busy_us": sum.map(|s| s.main_thread_busy_us.round()),
+                        "runtask_total_us": sum.map(|s| s.runtask_total_us.round()),
+                        "long_task_count": sum.map(|s| s.long_task_count),
+                        "long_tasks_total_us": sum.map(|s| s.long_tasks_total_us.round()),
+                        "dropped_frames": jk.map(|j| j.total_dropped),
+                        "jank_clusters": jk.map(|j| j.clusters.len()),
+                    })
+                })
+                .collect::<Vec<_>>()
+        ),
     );
     if has_memory {
         obj.insert("memory".into(), mem_json);

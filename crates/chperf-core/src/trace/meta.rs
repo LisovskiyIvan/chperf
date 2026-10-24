@@ -448,14 +448,21 @@ pub fn expand_trace_input(input: &str) -> Result<Vec<PathBuf>, String> {
 }
 
 /// Glob branch of `expand_trace_input` (non-recursive, see its docs).
+/// `**` is accepted but treated as a single-directory match (never
+/// recursive, never an error): `**` segments in the directory part are
+/// dropped and a bare `**` file pattern means `*` (still filtered to trace
+/// extensions). Redundant separators (`dir//*.json`) and `./` prefixes are
+/// normalized away. Matches are sorted for deterministic output.
 fn expand_glob_input(input: &str) -> Result<Vec<PathBuf>, String> {
     let (dir_part, file_pat) = match input.rfind('/') {
         Some(i) => (&input[..i], &input[i + 1..]),
         None => (".", input),
     };
-    let dir = if dir_part.is_empty() { "/" } else { dir_part };
+    let absolute = input.starts_with('/');
+    let dir = normalize_glob_dir(dir_part, absolute);
+    let file_pat = if file_pat == "**" { "*" } else { file_pat };
     let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("cannot list directory '{dir}': {e}"))?;
+        std::fs::read_dir(&dir).map_err(|e| format!("cannot list directory '{dir}': {e}"))?;
     let mut out: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot list directory '{dir}': {e}"))?;
@@ -482,6 +489,37 @@ fn expand_glob_input(input: &str) -> Result<Vec<PathBuf>, String> {
         ));
     }
     Ok(out)
+}
+
+/// Normalize the directory part of a glob pattern to a single listable
+/// directory (unix only): collapse redundant separators (`dir//sub` →
+/// `dir/sub`), drop `.` segments (`./dir` → `dir`), and drop `**` / other
+/// glob-meta segments (`dir/**` → `dir`) — the match stays non-recursive by
+/// design. Falls back to `.` (relative) or `/` (absolute) when nothing
+/// listable remains.
+fn normalize_glob_dir(raw: &str, absolute: bool) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for s in raw.split('/') {
+        if s.is_empty() || s == "." || s == "**" {
+            continue;
+        }
+        if s.contains(['*', '?', '[']) {
+            continue;
+        }
+        segs.push(s);
+    }
+    if segs.is_empty() {
+        return if absolute {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        };
+    }
+    let mut d = segs.join("/");
+    if absolute {
+        d.insert(0, '/');
+    }
+    d
 }
 
 /// Minimal glob matcher for file names: `*` (any run), `?` (one char) and
@@ -869,6 +907,46 @@ mod tests {
         let nomatch = format!("{}/zzz*.json", dir.display());
         let err = super::expand_trace_input(&nomatch).unwrap_err();
         assert!(err.contains("matched no"), "unexpected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Glob polish: `./` prefixes, `//` separators, `**` (single-dir, never
+    /// an error), absolute patterns, and deterministic sorted output.
+    #[test]
+    fn expand_glob_polish_and_sorted() {
+        // Unit-level: dir normalization without touching the real cwd.
+        assert_eq!(super::normalize_glob_dir(".", false), ".");
+        assert_eq!(super::normalize_glob_dir("./dir", false), "dir");
+        assert_eq!(super::normalize_glob_dir("dir//sub", false), "dir/sub");
+        assert_eq!(super::normalize_glob_dir("dir/**", false), "dir");
+        assert_eq!(super::normalize_glob_dir("**", false), ".");
+        assert_eq!(super::normalize_glob_dir("", true), "/");
+        assert_eq!(super::normalize_glob_dir("tmp/x", true), "/tmp/x");
+        assert!(super::glob_match("**", "a.json"));
+        assert!(super::glob_match("*.json", "a.json"));
+
+        let dir = std::env::temp_dir().join(format!("chperf-glob2-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Created out of order; output must still be sorted.
+        for n in ["z.json", "a.json", "m.json"] {
+            std::fs::write(dir.join(n), "{}").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        let exp = vec![dir.join("a.json"), dir.join("m.json"), dir.join("z.json")];
+
+        // Absolute patterns (dir is absolute).
+        let abs_star = format!("{}/*.json", dir.display());
+        assert_eq!(super::expand_trace_input(&abs_star), Ok(exp.clone()));
+        // Redundant separators collapse.
+        let dbl = format!("{}//*.json", dir.display());
+        assert_eq!(super::expand_trace_input(&dbl), Ok(exp.clone()));
+        // Bare `**` matches all trace files in the single dir.
+        let star2 = format!("{}/**", dir.display());
+        assert_eq!(super::expand_trace_input(&star2), Ok(exp.clone()));
+        // `**` in the directory part stays non-recursive, not an error.
+        let mid = format!("{}/**/*.json", dir.display());
+        assert_eq!(super::expand_trace_input(&mid), Ok(exp.clone()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

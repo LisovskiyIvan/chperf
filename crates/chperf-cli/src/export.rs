@@ -102,6 +102,9 @@ pub fn export_markdown(app: &App) -> String {
     // ── Overview ──
     export_overview(&mut out, &app.summary, &app.trace_name_a);
 
+    // ── Renderers (multi-process / OOPIF) ──
+    export_renderers(&mut out, app);
+
     // ── Frame-Blocking Main-Thread Tasks ──
     export_scroll_frames(&mut out, &app.scroll_frames);
 
@@ -157,6 +160,27 @@ fn export_trace_health(out: &mut String, app: &App) {
         app.thread_count,
         fmt_us(app.trace_span_us)
     ));
+    out.push_str(&format!(
+        "- **Renderers**: {} · **Browser main**: {} · **Compositor**: {}\n",
+        renderers_line(app),
+        app.thread_model
+            .browser_main
+            .map(|t| format!("tid {}", t))
+            .unwrap_or_else(|| "none".to_string()),
+        if app.thread_model.compositor.is_empty() {
+            "none".to_string()
+        } else {
+            format!(
+                "tids {}",
+                app.thread_model
+                    .compositor
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    ));
     let budget_label = match app.frame_budget_us.round() as i64 {
         8333 => "8.33ms (120Hz detected)",
         11111 => "11.11ms (90Hz detected)",
@@ -178,6 +202,81 @@ fn export_trace_health(out: &mut String, app: &App) {
         {
             out.push_str(&format!("- **Network throttle**: {}\n", net));
         }
+    }
+    out.push('\n');
+}
+
+fn renderers_line(app: &App) -> String {
+    let mut rs = app.thread_model.renderers.clone();
+    rs.sort_by_key(|r| (r.pid, r.tid));
+    if rs.is_empty() {
+        return "0 pids".to_string();
+    }
+    let parts: Vec<String> = rs
+        .iter()
+        .map(|r| format!("{}:tid {}", r.pid, r.tid))
+        .collect();
+    format!(
+        "{} pid{} ({})",
+        rs.len(),
+        if rs.len() == 1 { "" } else { "s" },
+        parts.join(", ")
+    )
+}
+
+/// Per-renderer table (pid/tid, busy union, RunTask total, long tasks,
+/// dropped frames + jank clusters). Single-renderer traces get a one-liner.
+fn export_renderers(out: &mut String, app: &App) {
+    out.push_str("## Renderers\n\n");
+    let mut rs = app.thread_model.renderers.clone();
+    rs.sort_by_key(|r| (r.pid, r.tid));
+    if rs.len() <= 1 {
+        let who = rs
+            .first()
+            .map(|r| format!(" (pid {} tid {})", r.pid, r.tid))
+            .unwrap_or_default();
+        out.push_str(&format!("Renderers: 1 (single-process trace){}.\n\n", who));
+        return;
+    }
+    out.push_str(&format!(
+        "_Primary renderer (tid {}) feeds the main report; other renderers' numbers are secondary (OOPIF/iframe/workers)._ \n\n",
+        app.thread_model.primary.tid,
+    ));
+    out.push_str("| pid | tid | thread | main busy | RunTask total | long tasks | dropped | clusters | primary |\n");
+    out.push_str("|-----|-----|--------|-----------|---------------|------------|---------|----------|---------|\n");
+    for r in &rs {
+        let sum = app
+            .renderer_summaries
+            .iter()
+            .find(|(x, _)| x.tid == r.tid)
+            .map(|(_, s)| s);
+        let jk = app
+            .renderer_janks
+            .iter()
+            .find(|(x, _)| x.tid == r.tid)
+            .map(|(_, j)| j);
+        let name = if r.name.is_empty() { "—" } else { &r.name };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.pid,
+            r.tid,
+            name,
+            sum.map(|s| fmt_us(s.main_thread_busy_us))
+                .unwrap_or_else(|| "—".to_string()),
+            sum.map(|s| fmt_us(s.runtask_total_us))
+                .unwrap_or_else(|| "—".to_string()),
+            sum.map(|s| s.long_task_count.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            jk.map(|j| j.total_dropped.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            jk.map(|j| j.clusters.len().to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            if r.tid == app.thread_model.primary.tid {
+                "yes"
+            } else {
+                "no"
+            },
+        ));
     }
     out.push('\n');
 }

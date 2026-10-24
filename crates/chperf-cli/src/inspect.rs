@@ -539,6 +539,10 @@ fn build_sections(
         let (m, j) = inspect::coverage_section(events, scope, stats, min_ts);
         sections.push(("coverage", m, j));
     }
+    if cli.renderers {
+        let (m, j) = inspect::renderers_section(events, scope, min_ts);
+        sections.push(("renderers", m, j));
+    }
 
     if cli.frame_tree {
         let (m, j) = inspect::frame_tree_section(events, None, min_ts);

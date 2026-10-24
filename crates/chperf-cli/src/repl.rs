@@ -61,6 +61,7 @@ const BARE: &[(&str, &str)] = &[
     ("network", "--network"),
     ("raster", "--raster"),
     ("coverage", "--coverage"),
+    ("renderers", "--renderers"),
     ("frame-budget", "--frame-budget"),
 ];
 
@@ -609,7 +610,7 @@ fn print_help() {
     );
     println!("  memory [--around MS] [--window MS] | input [--top N] | async [--top N]");
     println!(
-        "  loading | network | raster | coverage | frame-budget MS | bucket MS | url P | lt MS | pre MS | post MS"
+        "  loading | network | raster | coverage | renderers | frame-budget MS | bucket MS | url P | lt MS | pre MS | post MS"
     );
     println!(
         "  compare <file2> | export [file] | html [file] | summary | throttle N | status | clear | help | quit"
