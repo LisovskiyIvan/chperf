@@ -505,6 +505,15 @@ fn build_sections(
         let (m, j) = inspect::async_section(events, scope, cli.top, min_ts);
         sections.push(("async", m, j));
     }
+    if let Some(name_raw) = &cli.flows {
+        let name = if name_raw.is_empty() {
+            None
+        } else {
+            Some(name_raw.as_str())
+        };
+        let (m, j) = inspect::flows_section(events, scope, cli.top, min_ts, name);
+        sections.push(("flows", m, j));
+    }
 
     if cli.timeline {
         let (m, j) = inspect::timeline_section(events, scope, cli.bucket, min_ts);

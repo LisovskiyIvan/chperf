@@ -1870,7 +1870,7 @@ fn counter_block(
         out.push('\n');
     }
     if series.is_empty() {
-        out.push_str(&format!("No counter samples found for `{}`.\n\n", n));
+        out.push_str(&format!("No counter matching `{}`.\n\n", n));
         return (out, json!({"name": n, "samples": 0, "series": []}));
     }
     let vals: Vec<f64> = series.iter().map(|(_, v)| *v).collect();
@@ -2856,6 +2856,170 @@ pub fn async_section(
     (out, json!({"tasks": task_rows, "longest": longest_rows}))
 }
 
+/// Async/causality flow chains: Chrome async events (`s`/`t`/`f`/`n`,
+/// legacy `b`/`e` with ids) grouped by `(pid, id)` — see
+/// `analysis::flow_chains`. Steps are scope-filtered *before* pairing, so a
+/// chain cut by the window/tid filter shows as unpaired. `name` is a
+/// case-insensitive substring filter on the chain name.
+pub fn flows_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+    name: Option<&str>,
+) -> (String, Value) {
+    let scoped: Vec<TraceEvent> = events
+        .iter()
+        .filter(|e| scope.allows_event(e))
+        .copied()
+        .collect();
+    let mut chains = crate::analysis::flow_chains(&scoped);
+    if let Some(n) = name
+        && !n.is_empty()
+    {
+        chains.retain(|c| contains_ignore_case(&c.name, n));
+    }
+    // Longest first (clamped duration); ties by start.
+    chains.sort_by(|a, b| {
+        let da = chain_dur(a);
+        let db = chain_dur(b);
+        db.partial_cmp(&da)
+            .unwrap()
+            .then(a.start_us.partial_cmp(&b.start_us).unwrap())
+    });
+
+    let mut out = String::new();
+    let title = match name {
+        Some(n) if !n.is_empty() => format!("Flow chains matching `{}`", n),
+        _ => "Flow chains".to_string(),
+    };
+    let unpaired = chains.iter().filter(|c| c.end_us.is_none()).count();
+    out.push_str(&format!(
+        "## {} ({} chains, {} unpaired, {})\n\n",
+        title,
+        chains.len(),
+        unpaired,
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if chains.is_empty() {
+        if scoped.iter().any(|e| {
+            e.has_id && matches!(e.ph, b's' | b't' | b'f' | b'n' | b'b' | b'e' | b'B' | b'E')
+        }) {
+            out.push_str("No flows matching the filter.\n\n");
+        } else {
+            out.push_str("No async/flow events found.\n\n");
+        }
+        return (
+            out,
+            json!({"total_chains": 0, "unpaired": 0, "by_name": []}),
+        );
+    }
+
+    // Per-name summary: count, avg/p95/max, unpaired.
+    let mut by_name: rustc_hash::FxHashMap<String, (Vec<f64>, usize)> =
+        rustc_hash::FxHashMap::default();
+    for c in &chains {
+        let e = by_name.entry(c.name.clone()).or_default();
+        e.0.push(chain_dur(c));
+        if c.end_us.is_none() {
+            e.1 += 1;
+        }
+    }
+    let mut rows: Vec<(String, Vec<f64>, usize)> =
+        by_name.into_iter().map(|(n, (d, u))| (n, d, u)).collect();
+    rows.sort_by_key(|(_, d, _)| std::cmp::Reverse(d.len()));
+    out.push_str("| name | chains | unpaired | avg(ms) | p95(ms) | max(ms) |\n");
+    out.push_str("|------|--------|----------|---------|---------|---------|\n");
+    let mut json_names: Vec<Value> = Vec::new();
+    for (n, mut durs, unp) in rows {
+        durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let count = durs.len();
+        let avg = durs.iter().sum::<f64>() / count as f64;
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            n,
+            count,
+            unp,
+            fmt_ms(avg),
+            fmt_ms(percentile(&durs, 95.0)),
+            fmt_ms(*durs.last().unwrap()),
+        ));
+        json_names.push(json!({
+            "name": n,
+            "chains": count,
+            "unpaired": unp,
+            "avg_us": avg.round(),
+            "p95_us": percentile(&durs, 95.0).round(),
+            "max_us": durs.last().unwrap().round(),
+        }));
+    }
+    out.push('\n');
+
+    out.push_str("### Longest chains\n\n");
+    let mut json_longest: Vec<Value> = Vec::new();
+    for (i, c) in chains.iter().take(top).enumerate() {
+        let dur = chain_dur(c);
+        out.push_str(&format!(
+            "#### #{} {} (id={}, dur={}ms{}) — {} steps\n\n",
+            i + 1,
+            c.name,
+            c.id,
+            fmt_ms(dur),
+            if c.end_us.is_none() { ", unpaired" } else { "" },
+            c.steps.len(),
+        ));
+        out.push_str("| t(ms) | phase | name | tid |\n");
+        out.push_str("|-------|-------|------|-----|\n");
+        for s in &c.steps {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                fmt_ms(s.ts_us - min_ts),
+                s.phase,
+                s.name,
+                s.tid,
+            ));
+        }
+        out.push('\n');
+        json_longest.push(json!({
+            "name": c.name,
+            "id": c.id,
+            "pid": c.pid,
+            "start_us": (c.start_us - min_ts).round(),
+            "dur_us": dur.round(),
+            "unpaired": c.end_us.is_none(),
+            "steps": c.steps.iter().map(|s| json!({
+                "name": s.name,
+                "t_us": (s.ts_us - min_ts).round(),
+                "dur_us": s.dur_us.map(|d| d.round()),
+                "phase": s.phase.to_string(),
+                "tid": s.tid,
+                "pid": s.pid,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    if chains.len() > top {
+        out.push_str(&format!(
+            "_Showing {} of {} chains (use --top to see more)._\n\n",
+            top,
+            chains.len()
+        ));
+    }
+    (
+        out,
+        json!({"total_chains": json_longest.len(), "unpaired": unpaired, "by_name": json_names, "longest": json_longest}),
+    )
+}
+
+/// Clamped chain duration: `(last step ts + its dur) − first ts`, ≥ 0.
+fn chain_dur(c: &crate::analysis::FlowChain) -> f64 {
+    let last = &c.steps[c.steps.len() - 1];
+    (last.ts_us + last.dur_us.unwrap_or(0.0) - c.start_us).max(0.0)
+}
+
 // ── Loading / Network / Raster / Coverage (new detectors) ──
 
 /// Loading milestones + user timing + official responsiveness signals.
@@ -3443,7 +3607,7 @@ pub fn renderers_section(events: &[TraceEvent], scope: &Scope, min_ts: f64) -> (
         ));
     }
 
-    out.push_str("| pid | tid | thread | events | RunTask (n) | RunTask total | long tasks | main busy | primary |\n");
+    out.push_str("| pid | tid | thread | events | RunTask (n) | RunTask total(ms) | long tasks | main busy(ms) | primary |\n");
     out.push_str("|-----|-----|--------|--------|-------------|---------------|------------|-----------|---------|\n");
     let overheads = crate::trace::find_profiler_overhead(events);
     for r in &rs {
@@ -3993,7 +4157,7 @@ mod tests {
             Some(json!({"heap": 10.0})),
         )];
         let (md, j) = counters_section(&events, &scope, 10, 0.0, Some("nope"));
-        assert!(md.contains("No counter samples found"), "{}", md);
+        assert!(md.contains("No counter matching"), "{}", md);
         assert_eq!(j["samples"], 0);
 
         // Window scope excludes the only sample.

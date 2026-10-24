@@ -1,0 +1,12 @@
+{
+  "traceEvents": [
+    {"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 0, "args": {"name": "CrRendererMain"}},
+    {"name": "Animation", "ph": "s", "ts": 1000000, "pid": 1, "tid": 1, "id": 7},
+    {"name": "Animation", "ph": "t", "ts": 1005000, "pid": 1, "tid": 2, "id": 7},
+    {"name": "Animation", "ph": "f", "ts": 1010000, "pid": 1, "tid": 1, "id": 7},
+    {"name": "Loader", "ph": "s", "ts": 1002000, "pid": 1, "tid": 3, "id": "job-1"},
+    {"name": "Loader", "ph": "f", "ts": 1008000, "pid": 1, "tid": 3, "id2": {"local": "job-1"}},
+    {"name": "Orphan", "ph": "s", "ts": 1003000, "pid": 1, "tid": 1, "id": 99},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1000000, "dur": 20000, "pid": 1, "tid": 1}
+  ]
+}

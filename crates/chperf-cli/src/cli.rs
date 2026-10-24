@@ -218,6 +218,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) raster: bool,
 
+    /// Inspect: async flow/causality chains (s/t/f/n + legacy b/e with ids,
+    /// grouped by pid+id); optional chain-name filter (no value = all chains)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub(crate) flows: Option<String>,
+
     /// Inspect: trace health + event-name coverage (parsed/skipped/malformed,
     /// top 20 names, recognized vs unrecognized split)
     #[arg(long)]
@@ -232,6 +237,15 @@ pub(crate) struct Cli {
     /// trace instead of exiting 2
     #[arg(long = "full-on-miss")]
     pub(crate) full_on_miss: bool,
+
+    /// Write a JUnit XML report (to FILE, or stdout with bare `--junit`):
+    /// compare mode emits one testcase per compare finding (Regressed =
+    /// failure); single-trace mode emits metric-gate testcases (long tasks,
+    /// dropped frames, total blocking time, frame-blocking tasks).
+    /// Report-only: never changes the exit code (that stays with
+    /// `--fail-on-regressed`).
+    #[arg(long, num_args = 0..=1, default_missing_value = "-")]
+    pub(crate) junit: Option<String>,
 
     /// Compare mode: exit 3 when any finding is Regressed
     #[arg(long = "fail-on-regressed")]
@@ -269,6 +283,7 @@ impl Cli {
             || self.memory
             || self.input
             || self.async_
+            || self.flows.is_some()
             || self.anchor.is_some()
             || self.delta
             || self.calltree

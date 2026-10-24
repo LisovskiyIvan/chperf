@@ -242,7 +242,7 @@ fn export_renderers(out: &mut String, app: &App) {
         "_Primary renderer (tid {}) feeds the main report; other renderers' numbers are secondary (OOPIF/iframe/workers)._ \n\n",
         app.thread_model.primary.tid,
     ));
-    out.push_str("| pid | tid | thread | main busy | RunTask total | long tasks | dropped | clusters | primary |\n");
+    out.push_str("| pid | tid | thread | main busy(ms) | RunTask total(ms) | long tasks | dropped | clusters | primary |\n");
     out.push_str("|-----|-----|--------|-----------|---------------|------------|---------|----------|---------|\n");
     for r in &rs {
         let sum = app

@@ -44,6 +44,8 @@ const BARE: &[(&str, &str)] = &[
     ("memory", "--memory"),
     ("input", "--input"),
     ("async", "--async"),
+    ("flows", "--flows"),
+    ("junit", "--junit"),
     ("counters", "--counters"),
     ("gaps", "--gaps"),
     ("frame-tree", "--frame-tree"),
@@ -331,6 +333,25 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         }
     }
 
+    // --junit in the REPL: gates for the session trace, findings when a
+    // compare is loaded. Falls through to the inspect/export handling below
+    // so `flows foo junit=out.xml` composes.
+    if let Some(target) = &cmd.junit {
+        let xml = match session.app.compare {
+            Some(ref cmp) => crate::junit::junit_compare_xml(&cmp.findings),
+            None => {
+                let gates = crate::junit::single_gates(
+                    session.app.summary.long_task_count,
+                    session.app.jank.total_dropped,
+                    session.app.summary.total_blocking_time_us,
+                    session.app.scroll_frames.tasks.len(),
+                );
+                crate::junit::junit_single_xml(&gates)
+            }
+        };
+        crate::junit::write_junit(target, &xml)?;
+    }
+
     // Inspect queries run against the session data (no re-parse).
     if cmd.is_inspect() {
         inspect_output(
@@ -609,6 +630,9 @@ fn print_help() {
         "  gc [--lt MS] | frames [--frame-event NAME] [--frame-budget MS] | frame-tree | csv (add --csv to any query)"
     );
     println!("  memory [--around MS] [--window MS] | input [--top N] | async [--top N]");
+    println!(
+        "  flows [name] [--top N] | junit [FILE] (JUnit XML: gates, or findings when compared)"
+    );
     println!(
         "  loading | network | raster | coverage | renderers | frame-budget MS | bucket MS | url P | lt MS | pre MS | post MS"
     );

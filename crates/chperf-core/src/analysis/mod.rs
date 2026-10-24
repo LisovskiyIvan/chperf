@@ -4,6 +4,7 @@
 mod compare;
 mod counters;
 mod cpu;
+mod flow;
 mod jank;
 mod layout;
 mod loading;
@@ -17,6 +18,7 @@ mod summary;
 pub use compare::*;
 pub use counters::*;
 pub use cpu::*;
+pub use flow::*;
 pub use jank::*;
 pub use layout::*;
 pub use loading::*;

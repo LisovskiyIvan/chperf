@@ -89,6 +89,8 @@ chperf --repl trace.json.gz
 > zoom | out                   # halve / double the current window
 > reset                        # clear the window/anchor (full trace again)
 > counters fps                 # generic Counter (ph C) time series
+> flows [name]                 # async/causality chains (pid+id groups)
+> junit out.xml                # JUnit XML: gates, or findings when compared
 > compare after.json.gz        # load second trace, rebuild compare
 > export report.md             # full markdown export of current app
 > html report.html             # paired A-vs-B HTML when a compare is loaded
@@ -186,6 +188,13 @@ chperf trace.json --counters fps --json | jq '.sections.counters'
 chperf trace.json --async
 chperf trace.json --async --top 20 --json | jq '.sections.async.longest'
 
+# Async flow/causality chains (`s`/`t`/`f`/`n` + legacy `b`/`e` with ids,
+# grouped by pid+id): per-name summary (count, avg/p95, unpaired) plus the
+# longest chains with their steps. Optional case-insensitive name filter.
+# Traces without async/flow events render an explicit none-found.
+chperf trace.json --flows
+chperf trace.json --flows loader --top 10 --json | jq '.sections.flows.longest'
+
 # Per-renderer overview for multi-process traces (OOPIF/iframes/workers):
 # full reports already carry a Renderers section + `renderers` JSON key.
 chperf trace.json --renderers
@@ -257,6 +266,8 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--raster` | Compositor/raster/GPU lanes + decode hotspots (`Decode Image`, `PaintImage`) |
 | `--renderers` | Per-renderer overview (pid/tid, RunTask totals, long tasks, primary marker) for multi-process traces |
 | `--counters [name]` | Generic Counter (`ph C`) series: list (samples per counter) or named series table + min/max/last |
+| `--flows [name]` | Async flow/causality chains (`s`/`t`/`f`/`n`, legacy `b`/`e`+id) grouped by pid+id; optional chain-name filter |
+| `--junit[=FILE]` | Write a JUnit XML report (to FILE, or stdout with bare `--junit`); compare = one testcase per finding, single-trace = metric gates (see CI) |
 | `--coverage` | Trust diagnostics: parsed/skipped/malformed, recognized vs unrecognized events |
 | `--frame-budget <ms>` | Frame budget override (0/auto = detect refresh rate from frame cadence) |
 | `--full-on-miss` | Fall back to full trace when `--anchor`/`--worst` finds nothing (default: error) |
@@ -316,7 +327,6 @@ Automatically detects and flags:
 Exports structured Markdown (~7KB for a compare report) suitable for feeding to AI for further analysis. Includes all analysis sections, trace metadata, and throttle context.
 
 ### Summary Export (`--summary`)
-
 PR-friendly comparison summary for use with `--compare --export --summary`. Outputs a concise, sectioned Markdown report:
 
 | Section | Content |
@@ -348,6 +358,32 @@ Ready to paste directly into a PR description:
 > | Style (ULT) | 330.70ms | 174.68ms | -47% :white_check_mark: |
 > | Paint | 26.61ms | 88.78ms | +234% :red_circle: |
 > | HitTest | 72.28ms | 28.49ms | -61% :white_check_mark: |
+
+### JUnit XML for CI (`--junit`)
+
+```sh
+# Single trace: metric gates → report.xml (report still prints to stdout)
+chperf trace.json --junit=report.xml
+
+# Bare --junit: XML only on stdout (alongside nothing else)
+chperf trace.json --junit | xunit-viewer
+
+# Compare: one testcase per finding (Regressed = failure)
+chperf before.json --compare after.json --junit=report.xml
+```
+
+Report-only: `--junit` never changes the exit code (exit 3 still comes
+only from `--fail-on-regressed`). `--junit` with `--compare` needs the full
+report path (no inspect flags); bare `--junit` cannot share stdout with an
+inspect query (use `--junit=FILE` there).
+
+| Mode | Testcase | Failure when |
+|------|----------|--------------|
+| compare | `{category}: {message}` (classname `chperf.compare`) | Finding severity is `Regressed` (Improved/Neutral pass; detail = finding detail) |
+| single: `long-tasks` | `{N} long tasks (>50ms)` | Any main-thread RunTask > 50ms |
+| single: `dropped-frames` | `{N} dropped frames` | Any `DroppedFrame` recorded |
+| single: `total-blocking-time` | `TBT {ms} exceeds 500ms` | Sum of long-task time past 50ms > 500ms |
+| single: `frame-blocking-tasks` | `{N} frame-blocking tasks` | Any attributed frame-blocking main-thread task (scroll or heuristic fallback) |
 
 ## Analyzed Events
 

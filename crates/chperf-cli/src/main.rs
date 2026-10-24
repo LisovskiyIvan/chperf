@@ -3,6 +3,7 @@ mod cli;
 mod export;
 mod html;
 mod inspect;
+mod junit;
 mod repl;
 mod report_json;
 
@@ -377,6 +378,33 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("  {} events", trace.trace_events.len());
     let name_a = trace::trace_stem(path);
     let min_ts = chperf_core::inspect::trace_start_us(&trace.trace_events);
+    // --junit with --compare needs the full compare report path (findings
+    // only exist there); bare --junit writes XML to stdout, so it cannot
+    // share stdout with an inspect query.
+    if cli.junit.is_some() && cli.compare.is_some() {
+        return Err(
+            "usage: --junit with --compare needs the full report path (drop inspect flags)".into(),
+        );
+    }
+    if cli.junit.as_deref() == Some("-") {
+        return Err(
+            "usage: bare --junit writes XML to stdout (alongside nothing else) — drop inspect flags or use --junit=FILE"
+                .into(),
+        );
+    }
+    if let Some(target) = cli.junit.as_deref() {
+        let main_tid = trace::detect_main_thread(&trace.trace_events);
+        let summary = analysis::analyze_summary(&trace.trace_events, main_tid);
+        let jank = analysis::analyze_jank(&trace.trace_events, main_tid, None);
+        let scroll = analysis::analyze_scroll_frames(&trace.trace_events, main_tid);
+        let gates = junit::single_gates(
+            summary.long_task_count,
+            jank.total_dropped,
+            summary.total_blocking_time_us,
+            scroll.tasks.len(),
+        );
+        junit::write_junit(target, &junit::junit_single_xml(&gates))?;
+    }
     let Some(path_b) = cli.compare.as_deref().map(Path::new) else {
         return inspect::inspect_output(
             &trace.trace_events,
@@ -427,7 +455,6 @@ fn run_single(
         b_opt.as_ref().map(|(b, n)| (b, n.clone())),
         trace::trace_stem(path_a),
     );
-
     // Apply throttle: CLI flag takes priority, otherwise auto-detect from trace metadata
     let throttle = cli.throttle.unwrap_or_else(|| {
         analyzed_a
@@ -450,6 +477,27 @@ fn run_single(
         );
     }
 
+    // --junit: report-only XML (compare findings or single-trace gates).
+    // Bare `--junit` (stdout) suppresses the normal stdout report so stdout
+    // carries only XML; file exports still happen. Never changes the exit
+    // code (that stays with --fail-on-regressed).
+    let junit_stdout = cli.junit.as_deref() == Some("-");
+    if let Some(target) = cli.junit.as_deref() {
+        let xml = match app.compare {
+            Some(ref cmp) => junit::junit_compare_xml(&cmp.findings),
+            None => {
+                let gates = junit::single_gates(
+                    app.summary.long_task_count,
+                    app.jank.total_dropped,
+                    app.summary.total_blocking_time_us,
+                    app.scroll_frames.tasks.len(),
+                );
+                junit::junit_single_xml(&gates)
+            }
+        };
+        junit::write_junit(target, &xml)?;
+    }
+
     // CLI-only: render the report to stdout (or a file via --export=FILE).
     // --html wins over --export: it needs the raw events for the memory /
     // input / async sections, which only live on `Analyzed` here.
@@ -469,7 +517,11 @@ fn run_single(
             b_param,
         );
         match target {
-            "-" => print!("{}", doc),
+            "-" => {
+                if !junit_stdout {
+                    print!("{}", doc)
+                }
+            }
             t => {
                 std::fs::write(t, &doc).map_err(|e| format!("{}: {}", t, e))?;
                 eprintln!("Exported HTML to {}", t);
@@ -488,7 +540,11 @@ fn run_single(
                 std::fs::write(target, &s).map_err(|e| format!("{}: {}", target, e))?;
                 eprintln!("Exported JSON to {}", target);
             }
-            _ => print!("{}", s),
+            _ => {
+                if !junit_stdout {
+                    print!("{}", s)
+                }
+            }
         }
         return check_fail_on_regressed(&app, cli);
     }
@@ -499,7 +555,11 @@ fn run_single(
         export::export_markdown(&app)
     };
     match cli.export.as_deref() {
-        Some("-") | None => print!("{}", md),
+        Some("-") | None => {
+            if !junit_stdout {
+                print!("{}", md)
+            }
+        }
         Some(target) => {
             std::fs::write(target, &md).map_err(|e| format!("{}: {}", target, e))?;
             eprintln!("Exported to {}", target);

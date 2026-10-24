@@ -6,6 +6,8 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_chperf");
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.json");
+const FLOWS_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/flows.json");
+const MEDIUM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/medium.json");
 
 struct Out {
     status: i32,
@@ -571,6 +573,139 @@ fn smoke_html_compare_names() {
     assert!(o.stdout.contains("Trace A:"), "missing Trace A body");
     assert!(o.stdout.contains("Trace B:"), "missing Trace B body");
     let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+#[test]
+fn smoke_flows() {
+    contains(
+        &[FLOWS_FIXTURE, "--flows"],
+        "## Flow chains (3 chains, 1 unpaired",
+    );
+    contains(&[FLOWS_FIXTURE, "--flows"], "Animation");
+    contains(&[FLOWS_FIXTURE, "--flows"], "unpaired");
+    // Name filter is a case-insensitive substring.
+    contains(
+        &[FLOWS_FIXTURE, "--flows", "anim"],
+        "## Flow chains matching `anim`",
+    );
+    let o = ok(&[FLOWS_FIXTURE, "--flows", "zzz_no_match"]);
+    assert!(
+        o.stdout.contains("No flows matching the filter"),
+        "{}",
+        o.stdout
+    );
+    // Trace without async/flow events renders the explicit none-found.
+    contains(&[FIXTURE, "--flows"], "No async/flow events found");
+    // JSON shape + CSV blocks.
+    let o = ok(&[FLOWS_FIXTURE, "--flows", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    let flows = &v["sections"]["flows"];
+    assert_eq!(flows["total_chains"], 3);
+    assert_eq!(flows["unpaired"], 1);
+    assert_eq!(flows["by_name"].as_array().unwrap().len(), 3);
+    assert_eq!(flows["longest"].as_array().unwrap().len(), 3);
+    assert_eq!(flows["longest"][0]["name"], "Animation");
+    let steps = flows["longest"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0]["phase"], "s");
+    let o = ok(&[FLOWS_FIXTURE, "--flows", "--csv"]);
+    assert!(o.stdout.contains("# flows.by_name"), "{}", o.stdout);
+    assert!(o.stdout.contains("# flows.longest"), "{}", o.stdout);
+}
+
+#[test]
+fn smoke_junit() {
+    let dir = std::env::temp_dir().join(format!("chperf-junit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Single-trace: gate testcases, well-formed XML, failures for tiny's
+    // long task + dropped frames + TBT + frame-blocking task.
+    let single = dir.join("single.xml");
+    let o = run(&[FIXTURE, &format!("--junit={}", single.display())]);
+    assert_eq!(o.status, 0, "junit single: {}{}", o.stdout, o.stderr);
+    let xml = std::fs::read_to_string(&single).unwrap();
+    assert!(xml.starts_with("<?xml"), "{}", xml);
+    assert!(xml.contains("<testsuite"), "{}", xml);
+    assert!(xml.contains("</testsuite>"), "{}", xml);
+    for gate in [
+        "long-tasks",
+        "dropped-frames",
+        "total-blocking-time",
+        "frame-blocking-tasks",
+    ] {
+        assert!(xml.contains(gate), "missing gate {gate}:\n{xml}");
+    }
+    assert!(xml.contains("failures=\"4\""), "{}", xml);
+    assert_eq!(xml.matches("<failure").count(), 4);
+
+    // Bare --junit: XML only on stdout (no markdown alongside).
+    let o = ok(&[FIXTURE, "--junit"]);
+    assert!(o.stdout.starts_with("<?xml"), "{}", o.stdout);
+    assert!(o.stdout.contains("<testsuite"), "{}", o.stdout);
+    assert!(!o.stdout.contains("## "), "markdown leaked:\n{}", o.stdout);
+
+    // Compare: one testcase per finding; tiny vs medium regresses long tasks.
+    let cmp = dir.join("compare.xml");
+    let o = run(&[
+        FIXTURE,
+        "--compare",
+        MEDIUM,
+        &format!("--junit={}", cmp.display()),
+    ]);
+    assert_eq!(o.status, 0, "junit compare: {}{}", o.stdout, o.stderr);
+    let xml = std::fs::read_to_string(&cmp).unwrap();
+    assert!(xml.contains("<testsuite"), "{}", xml);
+    // Escaped `->` proves messages went through XML escaping.
+    assert!(xml.contains("Long Tasks: 1 -&gt; 2"), "{}", xml);
+    assert!(xml.contains("<failure"), "{}", xml);
+
+    // Self-compare: no Regressed findings, zero failures.
+    let same = dir.join("same.xml");
+    let o = run(&[
+        FIXTURE,
+        "--compare",
+        FIXTURE,
+        &format!("--junit={}", same.display()),
+    ]);
+    assert_eq!(o.status, 0, "junit self-compare: {}{}", o.stdout, o.stderr);
+    let xml = std::fs::read_to_string(&same).unwrap();
+    assert!(xml.contains("failures=\"0\""), "{}", xml);
+
+    // Report-only: --junit never changes the exit code; regressions still
+    // exit 3 via --fail-on-regressed, with the file written.
+    let o = run(&[
+        FIXTURE,
+        "--compare",
+        MEDIUM,
+        "--fail-on-regressed",
+        &format!("--junit={}", cmp.display()),
+    ]);
+    assert_eq!(
+        o.status, 3,
+        "junit+fail-on-regressed: {}{}",
+        o.stdout, o.stderr
+    );
+    assert!(
+        std::fs::read_to_string(&cmp)
+            .unwrap()
+            .contains("<testsuite")
+    );
+
+    // Bare --junit with an inspect query, and --junit with compare+inspect,
+    // are usage errors (exit 2).
+    exits_code(&[FIXTURE, "--events", "RunTask", "--junit"], 2);
+    exits_code(
+        &[
+            FIXTURE,
+            "--compare",
+            MEDIUM,
+            "--frames",
+            &format!("--junit={}", cmp.display()),
+        ],
+        2,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
