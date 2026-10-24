@@ -1702,6 +1702,168 @@ pub fn jank_section_with_budget(
     (out, Value::Array(json_rows))
 }
 
+/// Chrome `ph:"C"` counter series. With `name: None` lists the available
+/// counters and their sample counts; with `Some(name)` renders the series
+/// table (ts, value, capped at `top` rows) plus a min/max/last summary.
+/// `scope` filters which samples count; `top` caps Markdown rows only (the
+/// JSON always carries the full list). Honors the report style: an empty
+/// result is an explicit "No counters found." line, not an empty table.
+pub fn counters_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+    name: Option<&str>,
+) -> (String, Value) {
+    let scoped: Vec<TraceEvent> = events
+        .iter()
+        .filter(|e| scope.allows_event(e))
+        .copied()
+        .collect();
+    match name {
+        None => {
+            let names = crate::analysis::counter_names(&scoped);
+            let mut out = String::new();
+            out.push_str(&format!(
+                "## Counters ({} counters, {})\n\n",
+                names.len(),
+                window_label(scope.window),
+            ));
+            if let Some(line) = scope.window_line(min_ts) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            let mut json_rows: Vec<Value> = Vec::new();
+            if names.is_empty() {
+                out.push_str("No counters found.\n\n");
+                return (out, Value::Array(json_rows));
+            }
+            out.push_str("| # | counter | samples |\n");
+            out.push_str("|---|---------|---------|\n");
+            for (i, (n, c)) in names.iter().take(top).enumerate() {
+                out.push_str(&format!("| {} | {} | {} |\n", i + 1, n, c));
+                json_rows.push(json!({"name": n, "samples": c}));
+            }
+            if names.len() > top {
+                out.push_str(&format!(
+                    "\n_Showing {} of {} counters (use --top to see more)._\n",
+                    top,
+                    names.len()
+                ));
+            }
+            out.push('\n');
+            (out, Value::Array(json_rows))
+        }
+        Some(n) => {
+            // Substring match first (users type partial names via `--counters`);
+            // exact-name behavior is preserved when exactly one counter matches.
+            let lower = n.to_ascii_lowercase();
+            let mut matched: Vec<String> = crate::analysis::counter_names(&scoped)
+                .into_iter()
+                .map(|(nm, _)| nm)
+                .filter(|nm| nm.to_ascii_lowercase().contains(&lower))
+                .collect();
+            matched.sort();
+            matched.dedup();
+            if matched.len() > 1 {
+                let mut out = String::new();
+                out.push_str(&format!(
+                    "## Counters matching `{}` ({} counters, {})\n\n",
+                    n,
+                    matched.len(),
+                    window_label(scope.window),
+                ));
+                if let Some(line) = scope.window_line(min_ts) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                let mut blocks = Vec::new();
+                for nm in matched.iter().take(5) {
+                    let (b, v) = counter_block(&scoped, scope, nm, top, min_ts);
+                    out.push_str(&b);
+                    blocks.push(v);
+                }
+                if matched.len() > 5 {
+                    out.push_str(&format!(
+                        "_…and {} more matching counters (narrow the name)._\n\n",
+                        matched.len() - 5
+                    ));
+                }
+                return (out, json!({"matches": blocks}));
+            }
+            let n = matched.first().map(|s| s.as_str()).unwrap_or(n);
+            counter_block(&scoped, scope, n, top, min_ts)
+        }
+    }
+}
+
+/// One `## Counter:` block (markdown + JSON) for a single counter name.
+fn counter_block(
+    scoped: &[TraceEvent],
+    scope: &Scope,
+    n: &str,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    let series = crate::analysis::counter_series(scoped, n);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Counter: {} ({} samples, {})\n\n",
+        n,
+        series.len(),
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if series.is_empty() {
+        out.push_str(&format!("No counter samples found for `{}`.\n\n", n));
+        return (out, json!({"name": n, "samples": 0, "series": []}));
+    }
+    let vals: Vec<f64> = series.iter().map(|(_, v)| *v).collect();
+    let min = vals.iter().fold(f64::INFINITY, |a, b| a.min(*b));
+    let max = vals.iter().fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+    let last = vals[vals.len() - 1];
+    out.push_str(&format!(
+        "- **min**: {} · **max**: {} · **last**: {}\n\n",
+        min, max, last,
+    ));
+    out.push_str("| # | t(ms) | value |\n");
+    out.push_str("|---|-------|-------|\n");
+    for (i, (ts, v)) in series.iter().take(top).enumerate() {
+        out.push_str(&format!(
+            "| {} | {} | {} |\n",
+            i + 1,
+            fmt_ms(*ts - min_ts),
+            v
+        ));
+    }
+    if series.len() > top {
+        out.push_str(&format!(
+            "\n_Showing {} of {} samples (use --top to see more)._\n",
+            top,
+            series.len()
+        ));
+    }
+    out.push('\n');
+    let json_rows: Vec<Value> = series
+        .iter()
+        .map(|(ts, v)| json!({"t_us": (ts - min_ts).round(), "value": *v}))
+        .collect();
+    (
+        out,
+        json!({
+            "name": n,
+            "samples": series.len(),
+            "min": min,
+            "max": max,
+            "last": last,
+            "series": json_rows,
+        }),
+    )
+}
+
 /// Evenly-spaced index selection for downsampling a long timeline to `top`
 /// rows. Always includes the first and last sample.
 fn downsample_indices(n: usize, top: usize) -> Vec<usize> {
@@ -3567,5 +3729,93 @@ mod tests {
         assert_eq!(seeking_row["count"], 2);
         assert_eq!(seeking_row["median_gap_ms"], 50.0);
         assert_eq!(seeking_row["cadence_hz"], 20.0);
+    }
+
+    #[test]
+    fn counters_section_lists_then_series() {
+        let events = vec![
+            evx(
+                1_000.0,
+                "Mem",
+                b'C',
+                None,
+                0,
+                false,
+                Some(json!({"heap": 10.0})),
+            ),
+            evx(
+                2_000.0,
+                "Mem",
+                b'C',
+                None,
+                0,
+                false,
+                Some(json!({"data": {"heap": 20.0}})),
+            ),
+            evx(
+                3_000.0,
+                "Fps",
+                b'C',
+                None,
+                0,
+                false,
+                Some(json!({"fps": 60.0})),
+            ),
+        ];
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, j) = counters_section(&events, &scope, 10, 1_000.0, None);
+        assert!(md.contains("2 counters"), "{}", md);
+        assert!(md.contains("heap"), "{}", md);
+        assert_eq!(j.as_array().unwrap().len(), 2);
+
+        let (md, j) = counters_section(&events, &scope, 10, 1_000.0, Some("heap"));
+        assert!(md.contains("2 samples"), "{}", md);
+        assert!(md.contains("**min**: 10"), "{}", md);
+        assert!(md.contains("**max**: 20"), "{}", md);
+        assert!(md.contains("**last**: 20"), "{}", md);
+        assert_eq!(j["samples"], 2);
+        assert_eq!(j["series"].as_array().unwrap().len(), 2);
+        assert_eq!(j["series"][0]["t_us"], 0.0);
+    }
+
+    #[test]
+    fn counters_section_empty_and_unknown_and_scoped() {
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, j) = counters_section(&[], &scope, 10, 0.0, None);
+        assert!(md.contains("No counters found."), "{}", md);
+        assert_eq!(j.as_array().unwrap().len(), 0);
+
+        let events = vec![evx(
+            1_000.0,
+            "Mem",
+            b'C',
+            None,
+            0,
+            false,
+            Some(json!({"heap": 10.0})),
+        )];
+        let (md, j) = counters_section(&events, &scope, 10, 0.0, Some("nope"));
+        assert!(md.contains("No counter samples found"), "{}", md);
+        assert_eq!(j["samples"], 0);
+
+        // Window scope excludes the only sample.
+        let win_scope = Scope {
+            window: Some((5_000.0, 6_000.0)),
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, _) = counters_section(&events, &win_scope, 10, 0.0, None);
+        assert!(md.contains("No counters found."), "{}", md);
     }
 }

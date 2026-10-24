@@ -87,7 +87,7 @@ pub(crate) fn inspect_compare_output(
         None
     };
 
-    let sections_a = build_sections(
+    let mut sections_a = build_sections(
         events_a,
         min_ts_a,
         &ws_a,
@@ -96,7 +96,7 @@ pub(crate) fn inspect_compare_output(
         None,
         stats_a,
     )?;
-    let sections_b = build_sections(
+    let mut sections_b = build_sections(
         events_b,
         min_ts_b,
         &ws_b,
@@ -107,6 +107,8 @@ pub(crate) fn inspect_compare_output(
     )?;
 
     if cli.json {
+        cap_memory_json(&mut sections_a, cli.top);
+        cap_memory_json(&mut sections_b, cli.top);
         let mut obj = serde_json::Map::new();
         obj.insert("trace_a".into(), serde_json::json!(name_a));
         obj.insert("trace_b".into(), serde_json::json!(name_b));
@@ -298,7 +300,8 @@ pub(crate) fn inspect_output(
         return Ok(());
     }
 
-    let sections = build_sections(events, min_ts, &ws, cli, None, cpu_cache, stats)?;
+    let mut sections = build_sections(events, min_ts, &ws, cli, None, cpu_cache, stats)?;
+    cap_memory_json(&mut sections, cli.top);
     dispatch_output(&sections, trace_name, min_ts, &ws, cli)
 }
 
@@ -542,6 +545,17 @@ fn build_sections(
         sections.push(("frame_tree", m, j));
     }
 
+    // --counters: generic Counter (ph C) series, optional counter name.
+    if let Some(name_raw) = &cli.counters {
+        let name = if name_raw.is_empty() {
+            None
+        } else {
+            Some(name_raw.as_str())
+        };
+        let (m, j) = inspect::counters_section(events, scope, cli.top, min_ts, name);
+        sections.push(("counters", m, j));
+    }
+
     if let Some(names_raw) = &cli.events {
         let names: Vec<String> = names_raw
             .split(',')
@@ -728,6 +742,25 @@ fn build_sections(
     }
 
     Ok(sections)
+}
+
+/// `--memory --json` cap (CLI post-processing layer; core is untouched):
+/// truncate the `samples` array to `top` rows and note the remainder.
+/// Counter-style small row arrays (names/threads/counters/…) pass through.
+fn cap_memory_json(sections: &mut [Section], top: usize) {
+    for (key, _, j) in sections.iter_mut() {
+        if *key != "memory" {
+            continue;
+        }
+        if let Value::Object(o) = j
+            && let Some(Value::Array(arr)) = o.get_mut("samples")
+            && arr.len() > top
+        {
+            let dropped = arr.len() - top;
+            arr.truncate(top);
+            o.insert("truncated".into(), serde_json::json!(dropped));
+        }
+    }
 }
 
 /// Render collected sections as JSON / CSV / Markdown.

@@ -373,6 +373,63 @@ pub(crate) fn test_args(v: serde_json::Value) -> Option<&'static str> {
     }
 }
 
+/// Pair `B` (begin) / `E` (end) events into synthetic `X` (complete)
+/// events, for old-style Chrome exporters that emit `ph:"B"`/`"E"` instead
+/// of `X` (every duration analysis filters `ph == b'X'` and would otherwise
+/// see zero durations).
+///
+/// Stack-based pairing per `(pid, tid)`: `B` pushes, `E` pops the most recent
+/// unmatched `B` with the same name on the same thread (nesting-safe).
+/// Each pair appends one synthetic `X` event (`ts = b.ts`,
+/// `dur = (e.ts - b.ts).max(0.0)`, same name/pid/tid/cat/args as the `B`
+/// event). Returns the number of synthesized pairs.
+///
+/// INVARIANT — no double counting: the original `B`/`E` events are left in
+/// place (not removed or rewritten) because `paired_durations`
+/// (windowed.rs) still needs them for frame-event pairing. That is safe
+/// because `B`/`E` phases are never `X`: every `X`-only analysis sees
+/// exactly the synthetic event, and `paired_durations` (which only looks at
+/// lowercase `b`/`e` frame ticks, a different phase) never sees the
+/// synthetic `X`. Unpaired `B`/`E` stay as-is and are ignored by `X`-only
+/// passes. `dur` on the synthetic clamps clock-skew (`e.ts < b.ts`) to 0.
+pub fn normalize_be_pairs(events: &mut Vec<TraceEvent>) -> usize {
+    let orig_len = events.len();
+    // Per-thread stack of unmatched begins: (name, event copy).
+    let mut stacks: rustc_hash::FxHashMap<(u64, u64), Vec<TraceEvent>> =
+        rustc_hash::FxHashMap::default();
+    let mut made = 0usize;
+    for i in 0..orig_len {
+        let e = events[i];
+        match e.ph {
+            b'B' => {
+                stacks.entry((e.pid, e.tid)).or_default().push(e);
+            }
+            b'E' => {
+                if let Some(st) = stacks.get_mut(&(e.pid, e.tid))
+                    && let Some(pos) = st.iter().rposition(|b| b.name == e.name)
+                {
+                    let b = st.remove(pos);
+                    events.push(TraceEvent {
+                        name: b.name,
+                        id: 0,
+                        has_id: false,
+                        ph: b'X',
+                        ts: b.ts,
+                        dur: Some((e.ts - b.ts).max(0.0)),
+                        tid: b.tid,
+                        pid: b.pid,
+                        cat: b.cat,
+                        args: b.args,
+                    });
+                    made += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    made
+}
+
 impl TraceEvent {
     /// Parsed `args` JSON, or `None` when the event carries no args.
     /// Parsed on-demand; no heavy JSON DOM trees retained in memory.
@@ -391,6 +448,96 @@ impl TraceEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn be(
+        name: &str,
+        ph: u8,
+        ts: f64,
+        pid: u64,
+        tid: u64,
+        cat: Option<&'static str>,
+        args: Option<&'static str>,
+    ) -> TraceEvent {
+        TraceEvent {
+            name: intern_name(name),
+            id: 0,
+            has_id: false,
+            ph,
+            ts,
+            dur: None,
+            tid,
+            pid,
+            cat,
+            args,
+        }
+    }
+
+    /// Nested same-thread pairs synthesize one X each; originals stay.
+    #[test]
+    fn be_pairs_synthesize_x_without_removing_originals() {
+        let cat: &'static str = intern_name("devtools.timeline");
+        let args: &'static str = Box::leak(r#"{"x":1}"#.to_string().into_boxed_str());
+        let mut events = vec![
+            be("RunTask", b'B', 0.0, 1, 1, Some(cat), Some(args)),
+            be("FunctionCall", b'B', 10_000.0, 1, 1, None, None),
+            be("FunctionCall", b'E', 30_000.0, 1, 1, None, None),
+            be("RunTask", b'E', 100_000.0, 1, 1, None, None),
+        ];
+        assert_eq!(normalize_be_pairs(&mut events), 2);
+        assert_eq!(events.len(), 6);
+        assert!(
+            events[..4].iter().all(|e| e.ph == b'B' || e.ph == b'E'),
+            "originals must be untouched"
+        );
+        let xs: Vec<&TraceEvent> = events.iter().filter(|e| e.ph == b'X').collect();
+        assert_eq!(xs.len(), 2);
+        let rt = xs.iter().find(|e| e.name == "RunTask").unwrap();
+        assert_eq!(rt.ts, 0.0);
+        assert_eq!(rt.dur, Some(100_000.0));
+        assert_eq!(
+            (rt.pid, rt.tid, rt.cat, rt.args),
+            (1, 1, Some(cat), Some(args))
+        );
+        let fc = xs.iter().find(|e| e.name == "FunctionCall").unwrap();
+        assert_eq!((fc.ts, fc.dur), (10_000.0, Some(20_000.0)));
+    }
+
+    /// Interleaved names pair by name (LIFO per name); unpaired and
+    /// cross-thread events are left alone; skew clamps to 0.
+    #[test]
+    fn be_pairing_edge_cases() {
+        let mut events = vec![
+            be("A", b'B', 0.0, 1, 1, None, None),
+            be("B", b'B', 1_000.0, 1, 1, None, None),
+            be("A", b'E', 5_000.0, 1, 1, None, None), // pairs A[0,5000]
+            be("B", b'E', 3_000.0, 1, 1, None, None), // pairs B[1000,3000]
+            be("C", b'B', 0.0, 1, 1, None, None),     // unpaired B
+            be("D", b'E', 9_000.0, 1, 1, None, None), // unpaired E
+            be("A", b'B', 0.0, 1, 2, None, None),     // other thread
+            be("A", b'E', 7_000.0, 1, 9, None, None), // other thread
+            be("S", b'B', 10_000.0, 1, 1, None, None),
+            be("S", b'E', 9_000.0, 1, 1, None, None), // skew -> 0
+        ];
+        assert_eq!(normalize_be_pairs(&mut events), 3);
+        let mut durs: Vec<f64> = events
+            .iter()
+            .filter(|e| e.ph == b'X')
+            .map(|e| e.dur.unwrap())
+            .collect();
+        durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(durs, vec![0.0, 2_000.0, 5_000.0]);
+    }
+
+    /// Lowercase frame phases (`b`/`e`) are a different phase and untouched.
+    #[test]
+    fn be_leaves_frame_phases_alone() {
+        let mut events = vec![
+            be("DrawFrame", b'b', 0.0, 1, 1, None, None),
+            be("DrawFrame", b'e', 8_000.0, 1, 1, None, None),
+        ];
+        assert_eq!(normalize_be_pairs(&mut events), 0);
+        assert_eq!(events.len(), 2);
+    }
 
     fn event_from_json(s: &str) -> TraceEvent {
         serde_json::from_str(s).expect("test event must deserialize")

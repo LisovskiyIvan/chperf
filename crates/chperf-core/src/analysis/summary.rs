@@ -193,7 +193,13 @@ pub struct SummaryResult {
     pub long_task_count: usize,
     pub long_tasks_top: Vec<f64>,
     pub total_trace_duration_us: f64,
-    pub main_thread_busy_us: f64, // total RunTask time on main thread
+    /// Honest main-thread busy time: the UNION of effective RunTask intervals
+    /// (sweep-merged, O(n log n)), so overlapping/synthetic tasks never report
+    /// more than the trace span. For the raw sum see `runtask_total_us`.
+    pub main_thread_busy_us: f64,
+    /// Raw sum of effective RunTask durations (may exceed the trace span when
+    /// tasks overlap; kept for accounting against the union above).
+    pub runtask_total_us: f64,
     pub event_stats: Vec<EventTypeStat>,
     pub total_blocking_time_us: f64, // sum of (dur - 50ms) for main thread RunTasks > 50ms (TBT)
     pub long_tasks_total_us: f64,    // total duration of all long tasks on main thread
@@ -229,7 +235,8 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
     let mut long_tasks_total_us = 0.0f64;
     let mut stats_map: rustc_hash::FxHashMap<&'static str, (f64, f64, usize)> =
         rustc_hash::FxHashMap::default();
-    let mut main_thread_busy_us = 0.0f64;
+    let mut runtask_total_us = 0.0f64;
+    let mut busy_intervals: Vec<(f64, f64)> = Vec::new();
     let mut min_ts = f64::INFINITY;
     let mut max_ts = 0.0f64;
 
@@ -265,7 +272,10 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         }
         if e.name == "RunTask" && e.dur.is_some() {
             let eff = dur_of[idx];
-            main_thread_busy_us += eff;
+            runtask_total_us += eff;
+            if eff > 0.0 {
+                busy_intervals.push((e.ts, e.ts + eff));
+            }
             if eff > 50_000.0 {
                 long_task_durs.push(eff);
                 total_blocking_time_us += eff - 50_000.0;
@@ -286,6 +296,30 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
     let long_task_count = long_task_durs.len();
     let long_tasks_top: Vec<f64> = long_task_durs.into_iter().take(10).collect();
     let total_trace_duration_us = (max_ts - min_ts).max(0.0);
+
+    // Honest busy: union of effective RunTask intervals (sweep-merge,
+    // O(n log n) via the sort; the linear merge keeps nesting/overlap from
+    // reporting more than the trace span.
+    busy_intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut union_busy_us = 0.0f64;
+    let mut cur_s = f64::INFINITY;
+    let mut cur_e = f64::NEG_INFINITY;
+    for (s, e) in busy_intervals {
+        if s <= cur_e {
+            if e > cur_e {
+                cur_e = e;
+            }
+        } else {
+            if cur_e > cur_s {
+                union_busy_us += cur_e - cur_s;
+            }
+            cur_s = s;
+            cur_e = e;
+        }
+    }
+    if cur_e > cur_s {
+        union_busy_us += cur_e - cur_s;
+    }
 
     let mut event_stats: Vec<EventTypeStat> = stats_map
         .into_iter()
@@ -313,11 +347,32 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         long_task_count,
         long_tasks_top,
         total_trace_duration_us,
-        main_thread_busy_us,
+        main_thread_busy_us: union_busy_us,
+        runtask_total_us,
         event_stats,
         total_blocking_time_us,
         long_tasks_total_us,
     }
+}
+
+/// Per-renderer summaries: one `analyze_summary` per `ThreadModel` renderer.
+/// The full event list is passed each time with that renderer's tid as the
+/// main thread (events are NOT pre-filtered, so the trace window stays
+/// global while busy/long-task attribution is per-renderer). Tids are
+/// assumed unique across pids, as in `detect_main_thread`.
+pub fn analyze_summary_per_renderer(
+    events: &[TraceEvent],
+    model: &crate::trace::ThreadModel,
+) -> Vec<(crate::trace::RendererThread, SummaryResult)> {
+    model
+        .renderers
+        .iter()
+        .cloned()
+        .map(|r| {
+            let res = analyze_summary(events, r.tid);
+            (r, res)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -469,5 +524,77 @@ mod tests {
         let dur_of = vec![100_000.0, 0.0, 30_000.0];
         let selfs = main_thread_self_times(&events, 1, &dur_of);
         assert_eq!(selfs, vec![70_000.0, 0.0, 30_000.0]);
+    }
+
+    #[test]
+    fn busy_time_is_union_not_sum() {
+        // Overlapping 100ms tasks [0,100] + [50,150]: raw sum is 200ms but
+        // honest busy is the 150ms union — never past the trace span.
+        let events = vec![
+            ev("RunTask", b'X', 0.0, Some(100_000.0), 1),
+            ev("RunTask", b'X', 50_000.0, Some(100_000.0), 1),
+        ];
+        let res = analyze_summary(&events, 1);
+        assert_eq!(res.runtask_total_us, 200_000.0);
+        assert_eq!(res.main_thread_busy_us, 150_000.0);
+        // Nested tasks collapse to the outer interval.
+        let nested = vec![
+            ev("RunTask", b'X', 0.0, Some(100_000.0), 1),
+            ev("RunTask", b'X', 10_000.0, Some(10_000.0), 1),
+        ];
+        let res = analyze_summary(&nested, 1);
+        assert_eq!(res.runtask_total_us, 110_000.0);
+        assert_eq!(res.main_thread_busy_us, 100_000.0);
+        // Disjoint tasks: union equals the sum (old behavior preserved).
+        let apart = vec![
+            ev("RunTask", b'X', 0.0, Some(100_000.0), 1),
+            ev("RunTask", b'X', 200_000.0, Some(50_000.0), 1),
+        ];
+        let res = analyze_summary(&apart, 1);
+        assert_eq!(res.runtask_total_us, 150_000.0);
+        assert_eq!(res.main_thread_busy_us, 150_000.0);
+    }
+
+    #[test]
+    fn per_renderer_attributes_own_thread() {
+        use crate::trace::{RendererThread, ThreadModel};
+        let model = ThreadModel {
+            primary: RendererThread {
+                pid: 1,
+                tid: 1,
+                name: "CrRendererMain".to_string(),
+            },
+            renderers: vec![
+                RendererThread {
+                    pid: 1,
+                    tid: 1,
+                    name: "CrRendererMain".to_string(),
+                },
+                RendererThread {
+                    pid: 2,
+                    tid: 2,
+                    name: "Renderer".to_string(),
+                },
+            ],
+            browser_main: None,
+            compositor: vec![],
+        };
+        let events = vec![
+            ev("RunTask", b'X', 0.0, Some(60_000.0), 1),
+            ev("RunTask", b'X', 0.0, Some(10_000.0), 2),
+        ];
+        let out = analyze_summary_per_renderer(&events, &model);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0.tid, 1);
+        assert_eq!(out[0].1.main_thread_busy_us, 60_000.0);
+        assert_eq!(out[0].1.long_task_count, 1);
+        assert_eq!(out[1].0.tid, 2);
+        assert_eq!(out[1].1.main_thread_busy_us, 10_000.0);
+        assert_eq!(out[1].1.long_task_count, 0);
+        // Trace window stays global in both.
+        assert_eq!(
+            out[0].1.total_trace_duration_us,
+            out[1].1.total_trace_duration_us
+        );
     }
 }

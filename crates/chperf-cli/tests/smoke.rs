@@ -432,3 +432,175 @@ fn smoke_full_report_sections() {
     assert!(o.stdout.contains("Trace health"));
     assert!(o.stdout.contains("Frame-blocking main-thread tasks"));
 }
+
+/// Temp dir with two trace copies under distinct stems.
+fn two_traces(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("chperf-wave4-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("alpha.json");
+    let b = dir.join("beta.json");
+    let src = std::fs::read(FIXTURE).unwrap();
+    std::fs::write(&a, &src).unwrap();
+    std::fs::write(&b, &src).unwrap();
+    (dir, a, b)
+}
+
+#[test]
+fn smoke_glob_input() {
+    let (dir, _, _) = two_traces("glob");
+    let pat = format!("{}/*.json", dir.to_str().unwrap());
+    // Glob without export flags lists the matches like a directory.
+    let o = run(&[&pat, "--names"]);
+    assert_eq!(o.status, 0, "glob list: {}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("2 trace(s)"), "stderr: {}", o.stderr);
+    // Empty glob match errors (exit 1).
+    let pat_none = format!("{}/zzz-no-match-*.json", dir.to_str().unwrap());
+    exits_code(&[&pat_none, "--names"], 1);
+    // Single-file glob match batch-exports.
+    let out = dir.join("out");
+    let o = run(&[&pat, "--json", "--out-dir", out.to_str().unwrap()]);
+    assert_eq!(o.status, 0, "batch glob: {}{}", o.stdout, o.stderr);
+    assert!(out.join("chperf-export-alpha.json").is_file());
+    assert!(out.join("chperf-export-beta.json").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn smoke_batch_export_formats() {
+    let (dir, _, _) = two_traces("batch");
+    let out = dir.join("out");
+    let o = run(&[
+        dir.to_str().unwrap(),
+        "--export",
+        "--html",
+        "--json",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status, 0, "batch: {}{}", o.stdout, o.stderr);
+    for stem in ["alpha", "beta"] {
+        let md = out.join(format!("chperf-export-{}.md", stem));
+        let html = out.join(format!("chperf-export-{}.html", stem));
+        let json = out.join(format!("chperf-export-{}.json", stem));
+        assert!(md.is_file(), "missing {}", md.display());
+        assert!(html.is_file(), "missing {}", html.display());
+        assert!(json.is_file(), "missing {}", json.display());
+        let h = std::fs::read_to_string(&html).unwrap();
+        assert!(h.starts_with("<!DOCTYPE html>"), "bad html head");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert!(v.get("trace").is_some(), "full JSON missing trace");
+    }
+    // Default out location: next to each trace.
+    let o = run(&[dir.to_str().unwrap(), "--export"]);
+    assert_eq!(o.status, 0, "batch md: {}{}", o.stdout, o.stderr);
+    assert!(dir.join("chperf-export-alpha.md").is_file());
+    // Per-file failure keeps going: poison one trace, others still export.
+    std::fs::write(dir.join("broken.json"), "{not json").unwrap();
+    let out2 = dir.join("out2");
+    let o = run(&[
+        dir.to_str().unwrap(),
+        "--export",
+        "--out-dir",
+        out2.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        o.status, 1,
+        "batch with broken file: {}{}",
+        o.stdout, o.stderr
+    );
+    assert!(o.stderr.contains("broken.json"), "stderr: {}", o.stderr);
+    assert!(o.stderr.contains("1 failed"), "stderr: {}", o.stderr);
+    assert!(out2.join("chperf-export-alpha.md").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn smoke_counters() {
+    // Fixture has no Counter events: explicit none-found.
+    contains(&[FIXTURE, "--counters"], "No counters found");
+    let o = ok(&[FIXTURE, "--counters", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    assert_eq!(v["sections"]["counters"].as_array().unwrap().len(), 0);
+    // Trace with Counter events: summary rows, name filter, JSON + CSV.
+    let dir = std::env::temp_dir().join(format!("chperf-wave4-counters-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("c.json");
+    let trace = serde_json::json!({"traceEvents": [
+        {"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 1, "args": {"name": "CrRendererMain"}},
+        {"name": "fpsCounter", "ph": "C", "ts": 1000000, "pid": 1, "tid": 1, "args": {"fps": 60, "dropped": 0}},
+        {"name": "fpsCounter", "ph": "C", "ts": 2000000, "pid": 1, "tid": 1, "args": {"fps": 30, "dropped": 4}},
+        {"name": "otherCounter", "ph": "C", "ts": 1500000, "pid": 1, "tid": 1, "args": {"x": 1}},
+    ]});
+    std::fs::write(&p, serde_json::to_string(&trace).unwrap()).unwrap();
+    let ps = p.to_str().unwrap();
+    contains(&[ps, "--counters"], "## Counters (3 counters");
+    contains(&[ps, "--counters"], "| fps | 2 |");
+    contains(&[ps, "--counters", "fps"], "## Counter: fps (2 samples");
+    let o = ok(&[ps, "--counters", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    assert_eq!(v["sections"]["counters"].as_array().unwrap().len(), 3);
+    let o = ok(&[ps, "--counters", "fps", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    assert_eq!(v["sections"]["counters"]["samples"], 2);
+    assert_eq!(
+        v["sections"]["counters"]["series"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(v["sections"]["counters"]["min"], 30.0);
+    assert_eq!(v["sections"]["counters"]["max"], 60.0);
+    contains(&[ps, "--counters", "--csv"], "# counters");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn smoke_html_compare_names() {
+    let (_, a, b) = two_traces("htmlcmp");
+    let (astr, bstr) = (a.to_str().unwrap(), b.to_str().unwrap());
+    let o = ok(&[astr, "--compare", bstr, "--html"]);
+    assert!(o.stdout.starts_with("<!DOCTYPE html>"), "bad html head");
+    // Both trace names appear: title, A/B header, and both bodies.
+    assert!(o.stdout.contains("alpha"), "missing trace A name");
+    assert!(o.stdout.contains("beta"), "missing trace B name");
+    assert!(o.stdout.contains("Overview: A vs B"), "missing A/B header");
+    assert!(o.stdout.contains("Trace A:"), "missing Trace A body");
+    assert!(o.stdout.contains("Trace B:"), "missing Trace B body");
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+#[test]
+fn smoke_memory_json_cap() {
+    // 40 UpdateCounters samples: --memory --json caps at --top, notes the rest.
+    let dir = std::env::temp_dir().join(format!("chperf-wave4-memcap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("m.json");
+    let mut evs = vec![
+        serde_json::json!({"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 1, "tid": 1, "args": {"name": "CrRendererMain"}}),
+        serde_json::json!({"name": "RunTask", "ph": "X", "ts": 1000000, "dur": 60000, "pid": 1, "tid": 1}),
+    ];
+    for i in 0..40 {
+        evs.push(serde_json::json!({"name": "UpdateCounters", "ph": "I", "ts": 1000000 + i * 100000, "pid": 1, "tid": 1,
+            "args": {"data": {"jsHeapSizeUsed": 10000000 + i * 100000, "nodes": 100 + i, "documents": 5, "jsEventListeners": 10}}}));
+    }
+    std::fs::write(
+        &p,
+        serde_json::to_string(&serde_json::json!({"traceEvents": evs})).unwrap(),
+    )
+    .unwrap();
+    let ps = p.to_str().unwrap();
+    let o = ok(&[ps, "--memory", "--top", "10", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    let mem = &v["sections"]["memory"];
+    assert_eq!(mem["samples"].as_array().unwrap().len(), 10);
+    assert_eq!(mem["truncated"], 30);
+    assert_eq!(mem["summary"]["samples"], 40);
+    // Markdown is unaffected by the JSON cap.
+    contains(&[ps, "--memory"], "## Memory timeline");
+    let _ = std::fs::remove_dir_all(&dir);
+}

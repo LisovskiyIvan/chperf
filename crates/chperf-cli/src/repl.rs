@@ -44,6 +44,7 @@ const BARE: &[(&str, &str)] = &[
     ("memory", "--memory"),
     ("input", "--input"),
     ("async", "--async"),
+    ("counters", "--counters"),
     ("gaps", "--gaps"),
     ("frame-tree", "--frame-tree"),
     ("anchor", "--anchor"),
@@ -68,7 +69,17 @@ struct Session {
     name_a: String,
     app: App,
     compare_name: Option<String>,
+    /// Full B analysis, kept so `html` can render the paired A-vs-B report
+    /// without re-parsing.
+    compared: Option<Compared>,
     pending_window: Option<(f64, f64)>,
+    history: Vec<String>,
+}
+
+/// Retained trace-B analysis for compare rendering.
+struct Compared {
+    analyzed: Analyzed,
+    app: App,
 }
 
 enum Cmd {
@@ -100,6 +111,13 @@ pub fn run_repl(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>
         "# chperf REPL — `{}` loaded in {:.1}s ({} events, all data in memory)\n",
         name_a, load_s, n
     );
+    let history = load_history();
+    if !history.is_empty() {
+        println!(
+            "# {} history lines loaded from ~/.chperf_history",
+            history.len()
+        );
+    }
     print_help();
 
     let mut session = Session {
@@ -107,7 +125,9 @@ pub fn run_repl(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>
         name_a,
         app,
         compare_name: None,
+        compared: None,
         pending_window: None,
+        history,
     };
 
     loop {
@@ -129,6 +149,8 @@ pub fn run_repl(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>
         if line.is_empty() {
             continue;
         }
+        session.history.push(line.to_string());
+        save_history(&session.history);
         match run_command(&mut session, line) {
             Ok(Cmd::Quit) => break,
             Ok(Cmd::Run) => {}
@@ -236,6 +258,19 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
     {
         return run_jank_n(session, n);
     }
+    // Jank/frame navigation over the detected clusters.
+    match tokens[0].as_str() {
+        "next" if tokens.len() == 1 => return run_jank_step(session, 1),
+        "prev" if tokens.len() == 1 => return run_jank_step(session, -1),
+        "zoom" if tokens.len() == 1 => return run_zoom(session, 0.5),
+        "out" if tokens.len() == 1 => return run_zoom(session, 2.0),
+        "reset" if tokens.len() == 1 => {
+            session.pending_window = None;
+            println!("# window/anchor cleared (full trace)");
+            return Ok(Cmd::Done);
+        }
+        _ => {}
+    }
     map_bare(&mut tokens);
 
     let mut argv = vec!["chperf".to_string()];
@@ -269,6 +304,7 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         let t0 = Instant::now();
         let analyzed_b = load_and_analyze(Path::new(b_path))?;
         let name_b = trace::trace_stem(Path::new(b_path));
+        let app_b = build_app(&analyzed_b, None, name_b.clone());
         // build_app constructs a fresh App; carry the session throttle over
         // or a previously set `throttle N` silently resets to 1x.
         let throttle = session.app.throttle_factor;
@@ -279,6 +315,10 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         );
         session.app.throttle_factor = throttle;
         session.compare_name = Some(name_b.clone());
+        session.compared = Some(Compared {
+            analyzed: analyzed_b,
+            app: app_b,
+        });
         println!(
             "# compare `{}` vs `{}` built in {:.1}s\n",
             session.name_a,
@@ -318,17 +358,21 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         }
         return Ok(Cmd::Done);
     }
-    // Self-contained HTML report (trace A only; the compared trace's raw
-    // events are dropped after `compare` rebuilds the app).
+    // Self-contained HTML report; with a loaded compare it renders the
+    // paired A-vs-B report (findings at top, per-section tables for both).
     if let Some(target) = &cmd.html {
-        if session.compare_name.is_some() {
-            eprintln!("warning: HTML export renders trace A only (compare B dropped)");
-        }
+        let b_param = session.compared.as_ref().map(|c| {
+            (
+                &c.app,
+                c.analyzed.trace.trace_events.as_slice(),
+                c.analyzed.min_ts,
+            )
+        });
         let doc = crate::html::export_html(
             &session.app,
             &session.analyzed.trace.trace_events,
             session.analyzed.min_ts,
-            None,
+            b_param,
         );
         if target == "-" {
             print!("{}", doc);
@@ -419,6 +463,117 @@ fn run_jank_n(session: &mut Session, n: usize) -> Result<Cmd, Box<dyn std::error
     Ok(Cmd::Done)
 }
 
+/// `next` / `prev`: move the pending window to the next/previous jank
+/// cluster (from the session jank analysis, reusing cluster start/span).
+fn run_jank_step(session: &mut Session, dir: i8) -> Result<Cmd, Box<dyn std::error::Error>> {
+    let clusters = &session.app.jank.clusters;
+    if clusters.is_empty() {
+        println!(
+            "no jank clusters (0 clusters, {} dropped)",
+            session.app.jank.total_dropped
+        );
+        return Ok(Cmd::Done);
+    }
+    let center = session.pending_window.map(|(lo, hi)| (lo + hi) / 2.0);
+    // No window yet: `next` starts at the first cluster, `prev` at the last.
+    if center.is_none() {
+        let (i, c) = if dir > 0 {
+            (0, &clusters[0])
+        } else {
+            (clusters.len() - 1, &clusters[clusters.len() - 1])
+        };
+        let (n, start, end, dropped) = (i + 1, c.start_us, c.end_us, c.dropped_frames);
+        session.pending_window = Some((start, end));
+        println!(
+            "# window set around jank cluster #{}: {:.2}ms … {:.2}ms from trace start (span {:.2}ms, {} dropped)",
+            n,
+            (start - session.analyzed.min_ts) / 1000.0,
+            (end - session.analyzed.min_ts) / 1000.0,
+            (end - start) / 1000.0,
+            dropped,
+        );
+        return Ok(Cmd::Done);
+    }
+    let center = center.unwrap_or(session.analyzed.min_ts);
+    let pick = if dir > 0 {
+        clusters
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.start_us > center + 1.0)
+    } else {
+        clusters
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, c)| c.start_us < center - 1.0)
+    };
+    let Some((i, c)) = pick else {
+        println!(
+            "no {} jank cluster from here ({} clusters)",
+            if dir > 0 { "further" } else { "earlier" },
+            clusters.len()
+        );
+        return Ok(Cmd::Done);
+    };
+    let (n, start, end, dropped) = (i + 1, c.start_us, c.end_us, c.dropped_frames);
+    session.pending_window = Some((start, end));
+    println!(
+        "# window set around jank cluster #{}: {:.2}ms … {:.2}ms from trace start (span {:.2}ms, {} dropped)",
+        n,
+        (start - session.analyzed.min_ts) / 1000.0,
+        (end - session.analyzed.min_ts) / 1000.0,
+        (end - start) / 1000.0,
+        dropped,
+    );
+    Ok(Cmd::Done)
+}
+
+/// `zoom` halves the pending window, `out` doubles it (around its center).
+fn run_zoom(session: &mut Session, factor: f64) -> Result<Cmd, Box<dyn std::error::Error>> {
+    let Some((lo, hi)) = session.pending_window else {
+        println!("no window set (use `jank N` or `next`/`prev` first)");
+        return Ok(Cmd::Done);
+    };
+    let center = (lo + hi) / 2.0;
+    let half = (hi - lo) / 2.0 * factor;
+    session.pending_window = Some((center - half, center + half));
+    println!(
+        "# window {:.2}ms … {:.2}ms from trace start (span {:.2}ms)",
+        (center - half - session.analyzed.min_ts) / 1000.0,
+        (center + half - session.analyzed.min_ts) / 1000.0,
+        half * 2.0 / 1000.0,
+    );
+    Ok(Cmd::Done)
+}
+
+/// Persistent REPL history: last 500 lines in `~/.chperf_history`.
+/// Missing/unwritable home is silently skipped.
+fn history_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::Path::new(&h).join(".chperf_history"))
+}
+
+fn load_history() -> Vec<String> {
+    let Some(p) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let skip = lines.len().saturating_sub(500);
+    lines[skip..].to_vec()
+}
+
+fn save_history(history: &[String]) {
+    let Some(p) = history_path() else { return };
+    let skip = history.len().saturating_sub(500);
+    let mut text = history[skip..].join("\n");
+    text.push('\n');
+    let _ = std::fs::write(p, text);
+}
+
 fn print_status(s: &Session) {
     let ev = s.analyzed.trace.trace_events.len();
     let busy = s.app.summary.main_thread_busy_us / 1e6;
@@ -460,5 +615,11 @@ fn print_help() {
         "  compare <file2> | export [file] | html [file] | summary | throttle N | status | clear | help | quit"
     );
     println!("  every query also accepts [--json] for jq/pipelines");
+    println!(
+        "  next | prev (walk jank clusters) | zoom | out (halve/double window) | reset (clear window/anchor)"
+    );
+    println!(
+        "  counters [name] (generic Counter time series) | history: last 500 lines in ~/.chperf_history"
+    );
     println!();
 }

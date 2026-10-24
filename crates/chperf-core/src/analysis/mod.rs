@@ -2,6 +2,7 @@
 //! style/layout/reflow diagnostics, two-trace comparison and jank clusters.
 
 mod compare;
+mod counters;
 mod cpu;
 mod jank;
 mod layout;
@@ -14,6 +15,7 @@ mod style;
 mod summary;
 
 pub use compare::*;
+pub use counters::*;
 pub use cpu::*;
 pub use jank::*;
 pub use layout::*;

@@ -715,6 +715,7 @@ mod tests {
             long_tasks_top: vec![],
             total_trace_duration_us: 5_000_000.0,
             main_thread_busy_us: busy,
+            runtask_total_us: busy,
             event_stats: stats,
             total_blocking_time_us: tbt,
             long_tasks_total_us: tbt + (lt_count as f64 * 50_000.0),

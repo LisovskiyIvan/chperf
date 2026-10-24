@@ -7,10 +7,12 @@ use std::path::Path;
 
 /// Counters for how a trace parsed. Filled by `parse_trace` (fast path,
 /// parallel pipeline and serde fallbacks all fold into the same counters):
-/// `parsed` per successfully parsed event, `skipped` per event dropped
+/// `parsed` per successfully parsed raw event, `skipped` per event dropped
 /// (structurally unusable — never fails the file), `malformed` per event
 /// whose fields were usable only after coercion (numeric strings, clamped
-/// negative durations) or unusable (drops also count here).
+/// negative durations) or unusable (drops also count here). `parsed` counts
+/// raw events as read — including unpaired `B`/`E` — and does not count the
+/// synthetic `X` events `normalize_be_pairs` appends afterwards.
 #[derive(Default, Clone, Debug, serde::Serialize)]
 pub struct ParseStats {
     pub parsed: usize,
@@ -1598,6 +1600,14 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         eprintln!("  [parse] trace ready: {} events", trace.trace_events.len());
     }
 
+    // Pair old-exporter B/E events into synthetic X completes. Runs once
+    // here so every parse path (fast single-pass, parallel, serde and
+    // tolerant fallbacks) funnels through it. Originals are kept (see the
+    // invariant on `normalize_be_pairs`); `stats.parsed` still counts raw
+    // events only. B/E-heavy traces analyzed before this step saw zero
+    // durations everywhere, since all analysis filters `ph == b'X'`.
+    super::normalize_be_pairs(&mut trace.trace_events);
+
     // An empty trace has no time base (downstream would compute -inf), so it
     // is an error rather than a valid empty TraceFile.
     if trace.trace_events.is_empty() {
@@ -1861,6 +1871,55 @@ mod tests {
         assert_eq!(evs[3].id, evs[4].id);
         // Negative ids stay unpaired.
         assert!(!evs[5].has_id);
+    }
+
+    /// Old-exporter B/E trace: synthetic X events make summary/jank see
+    /// nonzero durations; `stats.parsed` still counts raw events; lowercase
+    /// frame b/e pairs still work in frames_section.
+    #[test]
+    fn old_exporter_be_trace_analyzes_with_synthetic_x() {
+        let body = r#"{"traceEvents":[
+            {"name":"thread_name","ph":"M","ts":0,"pid":1,"tid":1,"args":{"name":"CrRendererMain"}},
+            {"name":"RunTask","ph":"B","ts":1000,"pid":1,"tid":1},
+            {"name":"FunctionCall","ph":"B","ts":2000,"pid":1,"tid":1,"args":{"data":{"functionName":"f"}}},
+            {"name":"FunctionCall","ph":"E","ts":22000,"pid":1,"tid":1},
+            {"name":"Layout","ph":"B","ts":30000,"pid":1,"tid":1},
+            {"name":"Layout","ph":"E","ts":45000,"pid":1,"tid":1},
+            {"name":"RunTask","ph":"E","ts":61000,"pid":1,"tid":1},
+            {"name":"DrawFrame","ph":"b","ts":1000,"pid":2,"tid":7},
+            {"name":"DrawFrame","ph":"e","ts":9000,"pid":2,"tid":7},
+            {"name":"DrawFrame","ph":"b","ts":17000,"pid":2,"tid":7},
+            {"name":"DrawFrame","ph":"e","ts":25000,"pid":2,"tid":7}
+        ]}"#;
+        let path = write_trace("be", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // 7 raw + 4 frame ticks = 11 raw events; 3 synthetic X appended.
+        assert_eq!(trace.stats.parsed, 11);
+        assert_eq!(
+            trace.trace_events.iter().filter(|e| e.ph == b'X').count(),
+            3
+        );
+        let main = super::super::detect_main_thread(&trace.trace_events);
+        assert_eq!(main, 1);
+        // RunTask synthetic is 60ms -> one long task; busy is the 60ms union.
+        let res = crate::analysis::analyze_summary(&trace.trace_events, main);
+        assert_eq!(res.long_task_count, 1);
+        assert_eq!(res.main_thread_busy_us, 60_000.0);
+        assert_eq!(res.runtask_total_us, 60_000.0);
+        assert_eq!(res.long_tasks_total_us, 60_000.0);
+        let jk = crate::analysis::analyze_jank(&trace.trace_events, main, None);
+        assert!(!jk.clusters.is_empty(), "60ms task must cluster");
+        // Lowercase frame pairing is unaffected by B/E normalization.
+        let scope = crate::inspect::Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (_, json) =
+            crate::windowed::frames_section(&trace.trace_events, &scope, "DrawFrame", 1000.0);
+        assert_eq!(json[0]["count"], 2);
     }
 
     fn tiny_event(ts: f64) -> String {

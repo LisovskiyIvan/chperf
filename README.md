@@ -2,7 +2,8 @@
 
 Chrome DevTools Performance trace analyzer, command-line only. Parses `{ "traceEvents": [...] }` JSON and surfaces actionable performance insights.
 
-Accepts plain `.json` and gzipped `.json.gz` traces — a single file, or a directory (list / batch export).
+Accepts plain `.json` and gzipped `.json.gz` traces — a single file, a glob
+pattern (e.g. `'traces/*.json'`), or a directory (list / batch export).
 
 Chrome DevTools trace JSON files are massive and impractical to read by hand. chperf structures and summarizes the trace, then exports it as Markdown. Feed the exported result directly to an LLM like Claude Code for instant bottleneck identification and improvement suggestions.
 
@@ -39,7 +40,10 @@ chperf trace.json --export
 # Export to file
 chperf trace.json --export=report.md
 
-# Self-contained HTML report (single file, SVG memory charts, A/B compare)
+# Self-contained HTML report (single file, SVG memory charts).
+# With --compare it renders a paired A-vs-B report: comparison findings at
+# the top, a shared A/B overview header, per-section tables for both traces,
+# then the detailed compare tables.
 chperf trace.json --html=report.html
 chperf before.json --compare after.json --html=report.html
 
@@ -57,6 +61,12 @@ chperf traces/
 
 # Batch-export every trace in a directory to `chperf-export-<name>.md` files
 chperf traces/ --export
+
+# ... as HTML and/or machine-readable JSON instead (or as well)
+chperf traces/ --html --json --out-dir out/
+
+# The positional trace also accepts a glob pattern (expanded like a directory)
+chperf 'traces/*.json' --export --out-dir out/
 ```
 
 ## REPL (interactive)
@@ -74,16 +84,24 @@ chperf --repl trace.json.gz
 > function render --top 10
 > find setPlayerRespawned --regex
 > worst --task
+> jank 2                       # window around jank cluster #2
+> next | prev                  # walk to the next/previous jank cluster
+> zoom | out                   # halve / double the current window
+> reset                        # clear the window/anchor (full trace again)
+> counters fps                 # generic Counter (ph C) time series
 > compare after.json.gz        # load second trace, rebuild compare
 > export report.md             # full markdown export of current app
+> html report.html             # paired A-vs-B HTML when a compare is loaded
 > summary                      # compare summary (after `compare`)
 > throttle 6 | status | clear | help | quit
 ```
 
 Commands mirror the CLI flags (bare words map to flags: `events X` ≡
 `--events X`, `export=file` ≡ `--export=file`); `--around/--window` anchor
-subsequent time-windowed queries. Data is loaded once — a 1.3M-event trace
-loads in ~1.5s and every query answers in tens of milliseconds.
+subsequent time-windowed queries. Commands are saved to
+`~/.chperf_history` (last 500 lines, loaded on start). Data is loaded once —
+a 1.3M-event trace loads in ~1.5s and every query answers in tens of
+milliseconds.
 
 ## Inspect
 
@@ -139,7 +157,9 @@ chperf trace.json --events FireAnimationFrame --json | jq '.sections.events[].ar
 chperf trace.json --jank
 
 # Memory timeline: JS heap / DOM nodes / documents / listeners over time,
-# with peak, growth velocity, and significant change points (leak check). JSON gives the full sample list.
+# with peak, growth velocity, and significant change points (leak check).
+# --memory --json caps the sample list at --top rows (default 30) and notes
+# the remainder as `"truncated": N`; the summary always covers all samples.
 chperf trace.json --memory
 chperf trace.json --memory --around 5000 --window 2000 --top 100 --json | jq '.sections.memory.summary'
 
@@ -156,6 +176,11 @@ chperf trace.json --events RunTask --gaps
 # Browser frame/document hierarchy from TracingStartedInBrowser:
 # reveals iframes, embedded SVGs, and document topology across processes.
 chperf trace.json --frame-tree
+
+# Generic Counter (ph C) series: `--counters` lists counters with sample
+# counts; `--counters fps` renders the series table (t, value) + min/max/last.
+chperf trace.json --counters
+chperf trace.json --counters fps --json | jq '.sections.counters'
 
 # Async task timings (s/f events paired by id): RAF, GC jobs, timers, …
 chperf trace.json --async
@@ -225,11 +250,13 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--loading` | Loading milestones: FCP/LCP candidates, navigation timings, user timing |
 | `--network` | Request lifecycle (Resource*/XHR): counts, cache hits, render-blocking, slowest |
 | `--raster` | Compositor/raster/GPU lanes + decode hotspots (`Decode Image`, `PaintImage`) |
+| `--counters [name]` | Generic Counter (`ph C`) series: list (samples per counter) or named series table + min/max/last |
 | `--coverage` | Trust diagnostics: parsed/skipped/malformed, recognized vs unrecognized events |
 | `--frame-budget <ms>` | Frame budget override (0/auto = detect refresh rate from frame cadence) |
 | `--full-on-miss` | Fall back to full trace when `--anchor`/`--worst` finds nothing (default: error) |
 | `--fail-on-regressed` | Exit 3 when a compare finding is `Regressed` (for CI) |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
+| `--out-dir <dir>` | Batch mode: write per-file `--export`/`--html`/`--json` outputs here (default: next to each trace) |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |
 | `--pid <n>` | Restrict to this process |
 | `--cat <substr>` | Restrict to events whose category contains this |

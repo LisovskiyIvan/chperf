@@ -47,6 +47,8 @@ pub struct TraceFile {
     pub metadata: Option<TraceMetadata>,
     /// Parse counters (parsed/skipped/malformed). Skipped by serde: only
     /// `parse_trace` fills them; deserialized traces default to zeros.
+    /// `parsed` counts raw events as read (unpaired `B`/`E` included);
+    /// synthetic `X` events appended by `normalize_be_pairs` are not counted.
     #[serde(skip)]
     pub stats: ParseStats,
 }
@@ -172,6 +174,175 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     0
 }
 
+/// One renderer main thread: a `(pid, tid)` pair plus its `thread_name`
+/// metadata (`""` when the trace carries no `thread_name` for it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RendererThread {
+    pub pid: u64,
+    pub tid: u64,
+    pub name: String,
+}
+
+/// Per-pid / multi-renderer thread model (OOPIF, workers, browser process).
+///
+/// Name patterns keyed on (all matching is case-insensitive):
+/// - renderer-main-ish: `CrRendererMain` (top priority), then
+///   `RendererMain` / `Renderer Main` / `CrRendererMainThread` / `Renderer`
+///   (see `main_name_priority`);
+/// - browser main: `CrBrowserMain` / `Main`;
+/// - compositor lanes: thread names containing `Compositor`
+///   (`VizCompositorThread`, `CompositorTileWorker`, …);
+/// - excluded lanes: everything `is_known_non_main` rejects (IOThread,
+///   GPU, audio, media, workers, thread pools, …).
+#[derive(Clone, Debug)]
+pub struct ThreadModel {
+    /// The global main thread: `tid == detect_main_thread(events)`
+    /// (guaranteed consistent — an entry is added even when it is not a
+    /// per-pid winner). Sentinel `{pid: 0, tid: 0, name: ""}` when the trace
+    /// has no main thread.
+    pub primary: RendererThread,
+    /// One entry per renderer process: the pid's renderer-main-ish thread,
+    /// or its majority-RunTask thread for nameless traces. Sorted by
+    /// `(pid, tid)`. Pids whose winner is a browser-main name or a known
+    /// non-main lane (GPU/IO/…) are not renderers and are skipped.
+    pub renderers: Vec<RendererThread>,
+    /// The browser main thread (`CrBrowserMain`/`Main`), if named.
+    pub browser_main: Option<u64>,
+    /// Tids whose thread name contains `Compositor` (any pid).
+    pub compositor: Vec<u64>,
+}
+
+/// Build the multi-renderer thread model. Reuses the `detect_main_thread`
+/// heuristics per pid (named renderer main wins, then most RunTasks with
+/// known non-main lanes excluded, then unrestricted). `primary.tid` always
+/// equals `detect_main_thread(events)`.
+pub fn detect_thread_model(events: &[TraceEvent]) -> ThreadModel {
+    // Per (pid, tid): pid (first seen), name (latest thread_name wins),
+    // RunTask (ph X) count.
+    let mut threads: rustc_hash::FxHashMap<(u64, u64), (u64, Option<&'static str>, usize)> =
+        rustc_hash::FxHashMap::default();
+    for e in events {
+        if e.name == "thread_name" {
+            let args = e.args_value();
+            let name = args
+                .as_ref()
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+                .map(crate::trace::intern_name);
+            let slot = threads.entry((e.pid, e.tid)).or_insert((e.pid, None, 0));
+            if name.is_some() {
+                slot.1 = name;
+            }
+        } else if e.name == "RunTask" && e.ph == b'X' {
+            threads.entry((e.pid, e.tid)).or_insert((e.pid, None, 0)).2 += 1;
+        }
+    }
+
+    // Compositor lanes: any thread named *Compositor*.
+    let mut compositor: Vec<u64> = threads
+        .iter()
+        .filter(|(_, (_, name, _))| {
+            (*name).is_some_and(|n| n.to_ascii_lowercase().contains("compositor"))
+        })
+        .map(|((_, tid), _)| *tid)
+        .collect();
+    compositor.sort_unstable();
+    compositor.dedup();
+
+    // Browser main: the CrBrowserMain/Main thread with the most RunTasks.
+    let browser_main: Option<u64> = threads
+        .iter()
+        .filter(|(_, (_, name, n))| *n > 0 && (*name).is_some_and(|x| main_name_priority(x) == 1))
+        .max_by_key(|((_, tid), (_, _, n))| (*n, std::cmp::Reverse(*tid)))
+        .map(|((_, tid), _)| *tid);
+
+    // One renderer per pid that carries RunTasks.
+    let mut pids: Vec<u64> = threads
+        .values()
+        .filter(|(_, _, n)| *n > 0)
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    let mut renderers: Vec<RendererThread> = Vec::new();
+    for pid in pids {
+        let in_pid: Vec<((u64, u64), Option<&'static str>, usize)> = threads
+            .iter()
+            .filter(|((p, _), (_, _, n))| *p == pid && *n > 0)
+            .map(|(k, (_, name, n))| (*k, *name, *n))
+            .collect();
+        if in_pid.is_empty() {
+            continue;
+        }
+        // (a) Named renderer main in this pid.
+        let mut winner: Option<((u64, u64), &'static str, usize)> = in_pid
+            .iter()
+            .filter(|(_, name, _)| (*name).is_some_and(|x| main_name_priority(x) > 1))
+            .map(|(k, name, n)| (*k, (*name).unwrap(), *n))
+            .max_by_key(|(k, name, n)| (main_name_priority(name), *n, std::cmp::Reverse(k.1)));
+        // (b) Most RunTasks, known non-main lanes excluded; (c) unrestricted.
+        if winner.is_none() {
+            for exclude_known in [true, false] {
+                if let Some((k, name, n)) = in_pid
+                    .iter()
+                    .filter(|(_, name, _)| {
+                        !(exclude_known && (*name).is_some_and(is_known_non_main))
+                    })
+                    .map(|(k, name, n)| (*k, *name, *n))
+                    .max_by_key(|(k, _, n)| (*n, std::cmp::Reverse(k.1)))
+                {
+                    winner = Some((k, name.unwrap_or(""), n));
+                    break;
+                }
+            }
+        }
+        let Some(((wpid, wtid), wname, _)) = winner else {
+            continue;
+        };
+        // A browser-main or known-non-main winner means this pid is not a
+        // renderer process (browser / GPU / IO / …).
+        if main_name_priority(wname) == 1 || is_known_non_main(wname) {
+            continue;
+        }
+        renderers.push(RendererThread {
+            pid: wpid,
+            tid: wtid,
+            name: wname.to_string(),
+        });
+    }
+
+    // Primary: identical to detect_main_thread; ensure it is listed.
+    let primary_tid = detect_main_thread(events);
+    let mut primary = RendererThread {
+        pid: 0,
+        tid: primary_tid,
+        name: String::new(),
+    };
+    if primary_tid != 0 {
+        let mut cands: Vec<((u64, u64), Option<&'static str>)> = threads
+            .iter()
+            .filter(|((_, tid), _)| *tid == primary_tid)
+            .map(|(k, (pid, name, _))| ((*pid, k.1), *name))
+            .collect();
+        cands.sort();
+        if let Some(((pid, _), name)) = cands.into_iter().next() {
+            primary.pid = pid;
+            primary.name = name.unwrap_or("").to_string();
+        }
+        if !renderers.iter().any(|r| r.tid == primary_tid) {
+            renderers.push(primary.clone());
+        }
+    }
+    renderers.sort_by_key(|r| (r.pid, r.tid));
+
+    ThreadModel {
+        primary,
+        renderers,
+        browser_main,
+        compositor,
+    }
+}
+
 /// Stable stem for a trace file: strips both `.json` and `.json.gz`
 /// (case-insensitive: `Trace-….JSON.GZ` -> `Trace-…`).
 /// `Trace-20260731T180758.json.gz` -> `Trace-20260731T180758`.
@@ -237,6 +408,143 @@ pub fn list_traces_with_skipped(
         }
     }
     Ok((by_stem.into_values().collect(), skipped))
+}
+
+/// Resolve a trace input string to trace file paths:
+/// - an existing `.json` / `.json.gz` file → `vec![it]`;
+/// - an existing directory → the `list_traces` listing (`.gz` preferred);
+/// - a glob pattern (contains `*`, `?` or `[`) → the matching `*.json` /
+///   `*.json.gz` files in one directory (**non-recursive**; the pattern's
+///   directory part, or `.` when bare, is listed and file names are matched
+///   with `*` / `?` / `[...]` — document this limit to callers);
+/// - anything else (missing path, pattern with no matches, empty directory)
+///   → `Err` with a human-readable message.
+pub fn expand_trace_input(input: &str) -> Result<Vec<PathBuf>, String> {
+    if input.contains(['*', '?', '[']) {
+        return expand_glob_input(input);
+    }
+    let p = Path::new(input);
+    if p.is_file() {
+        let lower = input.to_ascii_lowercase();
+        if lower.ends_with(".json") || lower.ends_with(".json.gz") {
+            return Ok(vec![p.to_path_buf()]);
+        }
+        return Err(format!(
+            "input '{input}' is not a trace file: expected a .json or .json.gz file, a directory, or a glob pattern"
+        ));
+    }
+    if p.is_dir() {
+        let traces = list_traces(p).map_err(|e| format!("cannot list directory '{input}': {e}"))?;
+        if traces.is_empty() {
+            return Err(format!(
+                "no trace files (*.json, *.json.gz) found in directory '{input}'"
+            ));
+        }
+        return Ok(traces);
+    }
+    Err(format!(
+        "input '{input}' does not exist: expected a .json/.json.gz file, a directory, or a glob pattern"
+    ))
+}
+
+/// Glob branch of `expand_trace_input` (non-recursive, see its docs).
+fn expand_glob_input(input: &str) -> Result<Vec<PathBuf>, String> {
+    let (dir_part, file_pat) = match input.rfind('/') {
+        Some(i) => (&input[..i], &input[i + 1..]),
+        None => (".", input),
+    };
+    let dir = if dir_part.is_empty() { "/" } else { dir_part };
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot list directory '{dir}': {e}"))?;
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot list directory '{dir}': {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".json") || lower.ends_with(".json.gz")) {
+            continue;
+        }
+        if glob_match(file_pat, name) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    if out.is_empty() {
+        return Err(format!(
+            "pattern '{input}' matched no trace files (*.json, *.json.gz; non-recursive)"
+        ));
+    }
+    Ok(out)
+}
+
+/// Minimal glob matcher for file names: `*` (any run), `?` (one char) and
+/// `[...]` classes (`[abc]`, `[a-z]`, `[!abc]`). Case-sensitive (callers
+/// lowercase both sides when they need otherwise).
+fn glob_match(pat: &str, s: &str) -> bool {
+    fn classes(p: &[u8], c: u8) -> (bool, usize) {
+        // Returns (matched, pattern bytes consumed incl. brackets).
+        let mut i = 1usize;
+        let mut neg = false;
+        if i < p.len() && (p[i] == b'!' || p[i] == b'^') {
+            neg = true;
+            i += 1;
+        }
+        let mut hit = false;
+        let mut first = true;
+        while i < p.len() && !(p[i] == b']' && !first) {
+            if i + 2 < p.len() && p[i + 1] == b'-' && p[i + 2] != b']' {
+                if p[i] <= c && c <= p[i + 2] {
+                    hit = true;
+                }
+                i += 3;
+            } else {
+                if p[i] == c {
+                    hit = true;
+                }
+                i += 1;
+            }
+            first = false;
+        }
+        let consumed = if i < p.len() { i + 1 } else { i };
+        (hit != neg, consumed)
+    }
+    fn rec(p: &[u8], s: &[u8]) -> bool {
+        if p.is_empty() {
+            return s.is_empty();
+        }
+        match p[0] {
+            b'*' => {
+                let mut q = 1;
+                while q < p.len() && p[q] == b'*' {
+                    q += 1;
+                }
+                for k in 0..=s.len() {
+                    if rec(&p[q..], &s[k..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !s.is_empty() && rec(&p[1..], &s[1..]),
+            b'[' => {
+                if s.is_empty() {
+                    return false;
+                }
+                let (hit, consumed) = classes(p, s[0]);
+                hit && rec(&p[consumed.min(p.len())..], &s[1..])
+            }
+            b'\\' if p.len() > 1 => s.first() == Some(&p[1]) && rec(&p[2..], &s[1..]),
+            c => s.first() == Some(&c) && rec(&p[1..], &s[1..]),
+        }
+    }
+    rec(pat.as_bytes(), s.as_bytes())
 }
 
 #[cfg(test)]
@@ -419,5 +727,148 @@ mod tests {
         assert_eq!(plain.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(super::trace_stem(std::path::Path::new("T.JSON.GZ")), "T");
+    }
+
+    fn be(name: &str, ph: u8, tid: u64, pid: u64, dur: Option<f64>) -> TraceEvent {
+        TraceEvent {
+            name: intern_name(name),
+            id: 0,
+            has_id: false,
+            ph,
+            ts: 0.0,
+            dur,
+            tid,
+            pid,
+            cat: None,
+            args: None,
+        }
+    }
+
+    fn tn(pid: u64, tid: u64, name: &str) -> TraceEvent {
+        TraceEvent {
+            name: intern_name("thread_name"),
+            id: 0,
+            has_id: false,
+            ph: b'M',
+            ts: 0.0,
+            dur: None,
+            tid,
+            pid,
+            cat: None,
+            args: Some(
+                Box::leak(format!(r#"{{"name":"{name}"}}"#).into_boxed_str()) as &'static str,
+            ),
+        }
+    }
+
+    /// Multi-renderer model: named renderer + nameless OOPIF pids become
+    /// renderers; browser and GPU pids don't; compositor tids are listed;
+    /// primary matches detect_main_thread.
+    #[test]
+    fn thread_model_multi_renderer() {
+        let events = vec![
+            tn(1, 11, "CrRendererMain"),
+            tn(1, 12, "ThreadPoolForegroundWorker"),
+            tn(3, 31, "CrBrowserMain"),
+            tn(4, 41, "CrGpuMain"),
+            tn(1, 51, "VizCompositorThread"),
+            be("RunTask", b'X', 11, 1, Some(100.0)),
+            be("RunTask", b'X', 11, 1, Some(100.0)),
+            be("RunTask", b'X', 12, 1, Some(100.0)),
+            be("RunTask", b'X', 12, 1, Some(100.0)),
+            be("RunTask", b'X', 12, 1, Some(100.0)),
+            be("RunTask", b'X', 21, 2, Some(100.0)),
+            be("RunTask", b'X', 21, 2, Some(100.0)),
+            be("RunTask", b'X', 31, 3, Some(100.0)),
+            be("RunTask", b'X', 41, 4, Some(100.0)),
+        ];
+        let m = super::detect_thread_model(&events);
+        // Named renderer main beats the busier worker in pid 1.
+        assert_eq!(m.renderers.len(), 2);
+        assert_eq!(m.renderers[0].pid, 1);
+        assert_eq!(m.renderers[0].tid, 11);
+        assert_eq!(m.renderers[0].name, "CrRendererMain");
+        // Nameless OOPIF pid is a renderer with an empty name.
+        assert_eq!(m.renderers[1].pid, 2);
+        assert_eq!(m.renderers[1].tid, 21);
+        assert_eq!(m.renderers[1].name, "");
+        assert_eq!(m.browser_main, Some(31));
+        assert_eq!(m.compositor, vec![51]);
+        assert_eq!(m.primary.tid, detect_main_thread(&events));
+        assert_eq!(m.primary.tid, 11);
+    }
+
+    /// Primary is listed even when it is not its pid's majority winner
+    /// (here: the long-task fallback beats the busier nameless sibling).
+    #[test]
+    fn thread_model_lists_non_majority_primary() {
+        let mut events = vec![];
+        for _ in 0..5 {
+            events.push(be("RunTask", b'X', 11, 1, Some(10_000.0)));
+        }
+        events.push(be("RunTask", b'X', 12, 1, Some(600_000.0)));
+        let m = super::detect_thread_model(&events);
+        assert_eq!(detect_main_thread(&events), 12);
+        assert_eq!(m.primary.tid, 12);
+        assert!(m.renderers.iter().any(|r| r.tid == 11));
+        assert!(m.renderers.iter().any(|r| r.tid == 12));
+    }
+
+    /// Compositor matching is a case-insensitive substring; browser aliases
+    /// map to browser_main.
+    #[test]
+    fn thread_model_compositor_substring_and_browser_alias() {
+        let events = vec![
+            tn(1, 7, "CompositorTileWorker"),
+            tn(1, 8, "compositor"),
+            tn(3, 9, "Main"),
+            be("RunTask", b'X', 9, 3, Some(100.0)),
+            be("RunTask", b'X', 10, 5, Some(100.0)),
+        ];
+        let m = super::detect_thread_model(&events);
+        assert_eq!(m.compositor, vec![7, 8]);
+        assert_eq!(m.browser_main, Some(9));
+    }
+
+    #[test]
+    fn expand_trace_input_file_dir_glob_and_errors() {
+        let dir = std::env::temp_dir().join(format!("chperf-expand-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let a = dir.join("a.json");
+        let b = dir.join("b.JSON.GZ");
+        std::fs::write(&a, "{}").unwrap();
+        std::fs::write(&b, "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(dir.join("sub").join("c.json"), "{}").unwrap();
+
+        // Single file (case-insensitive .gz).
+        assert_eq!(
+            super::expand_trace_input(a.to_str().unwrap()),
+            Ok(vec![a.clone()])
+        );
+        assert_eq!(
+            super::expand_trace_input(b.to_str().unwrap()),
+            Ok(vec![b.clone()])
+        );
+        // Directory: non-recursive listing, notes.txt skipped.
+        assert_eq!(
+            super::expand_trace_input(dir.to_str().unwrap()),
+            Ok(vec![a.clone(), b.clone()])
+        );
+        // Non-trace file is an error.
+        let txt = dir.join("notes.txt");
+        assert!(super::expand_trace_input(txt.to_str().unwrap()).is_err());
+        // Glob: non-recursive, trace extensions only.
+        let pat = format!("{}/*.json", dir.display());
+        assert_eq!(super::expand_trace_input(&pat), Ok(vec![a.clone()]));
+        let star = format!("{}/*", dir.display());
+        assert_eq!(super::expand_trace_input(&star), Ok(vec![a, b]));
+        // Missing path and empty match are errors with a message.
+        assert!(super::expand_trace_input(dir.join("nope.json").to_str().unwrap()).is_err());
+        let nomatch = format!("{}/zzz*.json", dir.display());
+        let err = super::expand_trace_input(&nomatch).unwrap_err();
+        assert!(err.contains("matched no"), "unexpected: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

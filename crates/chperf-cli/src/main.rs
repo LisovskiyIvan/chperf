@@ -203,8 +203,8 @@ fn main() {
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let trace_path = match cli.trace.as_deref().map(Path::new) {
-        Some(p) => p,
+    let raw = match cli.trace.as_deref() {
+        Some(t) => t,
         None => {
             eprintln!("error: a trace file path is required (or use `--repl <trace>`)");
             std::process::exit(2);
@@ -212,48 +212,95 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Interactive REPL: load + analyze once, then run live queries.
+    // Needs a single trace file (no directory / glob expansion here).
     if cli.repl {
-        return repl::run_repl(trace_path, &cli);
+        let p = Path::new(raw);
+        if p.is_dir() || has_glob_magic(raw) {
+            return Err(
+                "usage: --repl takes a single trace file (no directory or glob pattern)".into(),
+            );
+        }
+        return repl::run_repl(p, &cli);
     }
 
-    // Directory mode: scan for traces, then batch-export or list them.
-    if trace_path.is_dir() {
-        let traces = trace::list_traces(trace_path).map_err(|e| {
+    match resolve_inputs(raw)? {
+        Input::Single(path) => {
+            if cli.out_dir.is_some() {
+                return Err(
+                    "usage: --out-dir needs batch input (a directory or glob pattern)".into(),
+                );
+            }
+            run_single_input(&path, &cli)
+        }
+        Input::Batch(traces) => {
+            if traces.is_empty() {
+                eprintln!(
+                    "No trace files (*.json / *.json.gz) found in {}",
+                    cli.trace.as_deref().unwrap_or("")
+                );
+                return Ok(());
+            }
+            if cli.export.is_none() && cli.html.is_none() && !cli.json {
+                // No TUI picker: list traces and guide the user to pick one explicitly.
+                eprintln!(
+                    "Found {} trace(s) in {}:",
+                    traces.len(),
+                    cli.trace.as_deref().unwrap_or("")
+                );
+                for (i, p) in traces.iter().enumerate() {
+                    eprintln!("  {:>3}. {}", i + 1, p.display());
+                }
+                eprintln!(
+                    "\nAnalyze one: chperf <file> [--export] [--compare <file2>] | inspect: --events/--function/--find"
+                );
+                eprintln!(
+                    "Export all:  chperf {} --export [--html] [--json] [--out-dir DIR]",
+                    cli.trace.as_deref().unwrap_or("")
+                );
+                return Ok(());
+            }
+            batch_export(&cli, &traces)
+        }
+    }
+}
+
+/// Positional trace input after expansion: one file, or many (directory /
+/// glob) for batch export.
+enum Input {
+    Single(PathBuf),
+    Batch(Vec<PathBuf>),
+}
+
+/// File → itself; directory → its `.json`/`.json.gz` listing (empty
+/// directories list nothing and report, they are not an error); anything
+/// else (glob pattern, missing path) → `chperf_core::trace::expand_trace_input`
+/// (file → itself, glob → matches, Err when nothing found, exit 1).
+fn resolve_inputs(raw: &str) -> Result<Input, Box<dyn std::error::Error>> {
+    let p = Path::new(raw);
+    if p.is_file() {
+        return Ok(Input::Single(p.to_path_buf()));
+    }
+    if p.is_dir() {
+        let traces = trace::list_traces(p).map_err(|e| {
             format!(
                 "{}: {}",
-                trace_path.display(),
+                p.display(),
                 e.to_string().split('\n').next().unwrap_or("")
             )
         })?;
-        if traces.is_empty() {
-            eprintln!(
-                "No trace files (*.json / *.json.gz) found in {}",
-                cli.trace.as_deref().unwrap_or("")
-            );
-            return Ok(());
-        }
-        if cli.export.is_some() {
-            return batch_export(&cli, &traces);
-        }
-        // No TUI picker: list traces and guide the user to pick one explicitly.
-        eprintln!(
-            "Found {} trace(s) in {}:",
-            traces.len(),
-            cli.trace.as_deref().unwrap_or("")
-        );
-        for (i, p) in traces.iter().enumerate() {
-            eprintln!("  {:>3}. {}", i + 1, p.display());
-        }
-        eprintln!(
-            "\nAnalyze one: chperf <file> [--export] [--compare <file2>] | inspect: --events/--function/--find"
-        );
-        eprintln!(
-            "Export all:  chperf {} --export",
-            cli.trace.as_deref().unwrap_or("")
-        );
-        return Ok(());
+        return Ok(Input::Batch(traces));
     }
+    let mut traces = trace::expand_trace_input(raw).map_err(|e| format!("{}: {}", raw, e))?;
+    traces.sort();
+    Ok(Input::Batch(traces))
+}
 
+/// True when the input should be glob-expanded (contains `*`, `?` or `[`).
+fn has_glob_magic(input: &str) -> bool {
+    input.chars().any(|c| c == '*' || c == '?' || c == '[')
+}
+
+fn run_single_input(trace_path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Modifier gating + full-report JSON/CSV handling (no inspect query).
     if !cli.is_inspect() {
         if cli.stats {
@@ -281,13 +328,13 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("usage: --fail-on-regressed requires --compare <file>".into());
         }
         if cli.json {
-            if has_inspect_modifier(&cli) {
+            if has_inspect_modifier(cli) {
                 // --json with other modifiers but no query: modifiers are meaningless.
                 return Err("usage: no inspect query given — add --events/--timeline/--frames/--loading/--network/--raster/--coverage/... or drop these flags for the full report".into());
             }
-            return run_single(trace_path, cli.compare.as_deref().map(Path::new), &cli);
+            return run_single(trace_path, cli.compare.as_deref().map(Path::new), cli);
         }
-        if has_inspect_modifier(&cli) {
+        if has_inspect_modifier(cli) {
             return Err("usage: no inspect query given — add --events/--timeline/--frames/--loading/--network/--raster/--coverage/... or drop these flags for the full report".into());
         }
     } else {
@@ -303,10 +350,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Granular inspect mode: print targeted tables to stdout, skip analysis.
     if cli.is_inspect() {
-        return run_inspect(trace_path, &cli);
+        return run_inspect(trace_path, cli);
     }
 
-    run_single(trace_path, cli.compare.as_deref().map(Path::new), &cli)
+    run_single(trace_path, cli.compare.as_deref().map(Path::new), cli)
 }
 
 /// Granular inspection: events/functions/stacks/timeline/args, each scoped to a
@@ -400,14 +447,19 @@ fn run_single(
     // --html wins over --export: it needs the raw events for the memory /
     // input / async sections, which only live on `Analyzed` here.
     if let Some(target) = cli.html.as_deref() {
-        let events_b = b_opt
-            .as_ref()
-            .map(|(b, _)| (b.trace.trace_events.as_slice(), b.min_ts));
+        // Paired A-vs-B report: build the standalone B app so the HTML can
+        // reuse the per-section renderers for both traces.
+        let app_b_opt: Option<app::App> =
+            b_opt.as_ref().map(|(bb, n)| build_app(bb, None, n.clone()));
+        let b_param = match (&app_b_opt, &b_opt) {
+            (Some(ab), Some((bb, _))) => Some((ab, bb.trace.trace_events.as_slice(), bb.min_ts)),
+            _ => None,
+        };
         let doc = html::export_html(
             &app,
             &analyzed_a.trace.trace_events,
             analyzed_a.min_ts,
-            events_b,
+            b_param,
         );
         match target {
             "-" => print!("{}", doc),
@@ -463,25 +515,37 @@ fn check_fail_on_regressed(app: &app::App, cli: &Cli) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// Batch-export every trace in a directory as Markdown files.
-/// Traces are analyzed in parallel in small groups: trace parsing is
+/// Batch-export every trace (directory / glob) as Markdown, HTML and/or JSON
+/// files. Traces are analyzed in parallel in small groups: trace parsing is
 /// memory-heavy, so we cap concurrency to keep peak RAM bounded.
-/// Per-file failures print + final "N failed" + exit 1.
+/// Per-file failures print `chperf: {path}: {msg}` + final "N failed" + exit 1.
 fn batch_export(cli: &Cli, traces: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     const GROUP: usize = 3;
-    let summary_only = cli.summary;
-    if summary_only {
+    if cli.summary {
         return Err("usage: --summary requires --compare <file> (not batch export)".into());
     }
+    let formats = BatchFormats {
+        md: cli.export.is_some(),
+        html: cli.html.is_some(),
+        json: cli.json,
+    };
+    let out_dir: Option<PathBuf> = match cli.out_dir.as_deref() {
+        Some(d) => {
+            std::fs::create_dir_all(d)
+                .map_err(|e| format!("{}: cannot create --out-dir: {}", d, e))?;
+            Some(PathBuf::from(d))
+        }
+        None => None,
+    };
     let throttle = cli.throttle;
     let failed = AtomicUsize::new(0);
     for group in traces.chunks(GROUP) {
         std::thread::scope(|s| {
             for path in group {
                 s.spawn(|| {
-                    if let Err(e) = export_one(path, throttle, summary_only) {
-                        eprintln!("  ERROR {}: {}", path.display(), e);
+                    if let Err(e) = export_one(path, throttle, out_dir.as_deref(), &formats) {
+                        eprintln!("chperf: {}: {}", path.display(), e);
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
                 });
@@ -496,11 +560,21 @@ fn batch_export(cli: &Cli, traces: &[PathBuf]) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Load, analyze, apply throttle, export a single trace to `chperf-export-<stem>.md`.
+#[derive(Clone, Copy)]
+struct BatchFormats {
+    md: bool,
+    html: bool,
+    json: bool,
+}
+
+/// Load, analyze, apply throttle, export a single trace to
+/// `chperf-export-<stem>.md` / `.html` / `.json` (per requested format) in
+/// `out_dir`, or next to the trace when `out_dir` is None.
 fn export_one(
     path: &Path,
     throttle: Option<f64>,
-    summary_only: bool,
+    out_dir: Option<&Path>,
+    formats: &BatchFormats,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stem = trace::trace_stem(path);
     let analyzed = load_and_analyze(path)?;
@@ -519,18 +593,28 @@ fn export_one(
         app.throttle_factor = throttle;
     }
 
-    let md = if summary_only {
-        export::export_summary_only(&app)
-    } else {
-        export::export_markdown(&app)
-    };
+    let dir: &Path = out_dir.unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")));
+    let out_path = |ext: &str| dir.join(format!("chperf-export-{}.{}", stem, ext));
+    let events = &analyzed.trace.trace_events;
 
-    let out_path = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(format!("chperf-export-{}.md", stem));
-    std::fs::write(&out_path, &md)?;
-    eprintln!("  -> {}", out_path.display());
+    if formats.md {
+        let md = export::export_markdown(&app);
+        let p = out_path("md");
+        std::fs::write(&p, &md)?;
+        eprintln!("  -> {}", p.display());
+    }
+    if formats.html {
+        let doc = html::export_html(&app, events, analyzed.min_ts, None);
+        let p = out_path("html");
+        std::fs::write(&p, &doc)?;
+        eprintln!("  -> {}", p.display());
+    }
+    if formats.json {
+        let v = report_json::full_report_json(&app, events, analyzed.min_ts);
+        let p = out_path("json");
+        std::fs::write(&p, serde_json::to_string_pretty(&v)?)?;
+        eprintln!("  -> {}", p.display());
+    }
     Ok(())
 }
 

@@ -235,6 +235,16 @@ pub(crate) struct Cli {
     /// Inspect: browser frame/document hierarchy from TracingStartedInBrowser
     #[arg(long = "frame-tree")]
     pub(crate) frame_tree: bool,
+
+    /// Inspect: generic Counter (ph C) series; optional counter name
+    /// (no value = list all counters)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub(crate) counters: Option<String>,
+
+    /// Batch mode: write per-file exports into this directory (created if
+    /// missing) instead of next to each trace
+    #[arg(long = "out-dir")]
+    pub(crate) out_dir: Option<String>,
 }
 
 impl Cli {
@@ -261,6 +271,7 @@ impl Cli {
             || self.frames
             || self.gaps
             || self.frame_tree
+            || self.counters.is_some()
             || self.loading
             || self.network
             || self.raster

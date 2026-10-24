@@ -332,6 +332,28 @@ pub fn analyze_jank_with_budget_and_bucket(
     }
 }
 
+/// Per-renderer jank: one `analyze_jank` per `ThreadModel` renderer.
+/// The full event list is passed each time with that renderer's tid as the
+/// main thread (events are NOT pre-filtered, so buckets and the trace window
+/// stay global while busy/spike attribution is per-renderer). The budget is
+/// detected once (`detect_frame_budget_us`) unless `budget_us` overrides it.
+pub fn analyze_jank_per_renderer(
+    events: &[TraceEvent],
+    model: &crate::trace::ThreadModel,
+    budget_us: Option<f64>,
+) -> Vec<(crate::trace::RendererThread, JankResult)> {
+    let budget = budget_us.unwrap_or_else(|| crate::windowed::detect_frame_budget_us(events));
+    model
+        .renderers
+        .iter()
+        .cloned()
+        .map(|r| {
+            let res = analyze_jank_with_budget(events, r.tid, None, budget);
+            (r, res)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +493,46 @@ mod tests {
             crate::windowed::dropped_frames(&events, None)
         );
         assert_eq!(res.total_dropped, 2);
+    }
+
+    #[test]
+    fn per_renderer_attributes_own_thread() {
+        use crate::trace::{RendererThread, ThreadModel};
+        let model = ThreadModel {
+            primary: RendererThread {
+                pid: 1,
+                tid: 1,
+                name: String::new(),
+            },
+            renderers: vec![
+                RendererThread {
+                    pid: 1,
+                    tid: 1,
+                    name: String::new(),
+                },
+                RendererThread {
+                    pid: 2,
+                    tid: 2,
+                    name: String::new(),
+                },
+            ],
+            browser_main: None,
+            compositor: vec![],
+        };
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(100_000.0), 1),
+            ev("RunTask", b'X', 1_000_000.0, Some(1_000.0), 2),
+            ev("RunTask", b'X', 3_000_000.0, Some(1_000.0), 1),
+        ];
+        // Huge budget isolates the 50ms busy rule: 100ms of renderer-1 busy
+        // fills two buckets (50ms + 50ms, merged) and trips it; 1ms of
+        // renderer-2 busy does not.
+        let out = analyze_jank_per_renderer(&events, &model, Some(1e12));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0.tid, 1);
+        assert_eq!(out[0].1.clusters.len(), 1);
+        assert!((out[0].1.clusters[0].busy_us - 100_000.0).abs() < 1e-6);
+        assert_eq!(out[1].0.tid, 2);
+        assert!(out[1].1.clusters.is_empty());
     }
 }
