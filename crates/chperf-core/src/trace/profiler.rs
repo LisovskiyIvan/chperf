@@ -59,18 +59,21 @@ pub fn find_profiler_overhead(events: &[TraceEvent]) -> Vec<ProfilerOverhead> {
             let sp_end = sp_ts + sp_dur;
             let mut enclosing_task: Option<(f64, f64)> = None;
             for e in events {
-                if e.tid == tid && e.name == "RunTask" && e.ph == b'X'
-                    && let Some(dur) = e.dur {
-                        let rt_ts = e.ts;
-                        let rt_end = rt_ts + dur;
-                        // StartProfiling is nested inside this RunTask (allow 10µs float tolerance)
-                        if rt_ts <= sp_ts + 10.0 && rt_end + 10.0 >= sp_end {
-                            if sp_dur >= 50_000.0 || sp_dur >= 0.5 * dur {
-                                enclosing_task = Some((rt_ts, rt_end));
-                            }
-                            break;
+                if e.tid == tid
+                    && e.name == "RunTask"
+                    && e.ph == b'X'
+                    && let Some(dur) = e.dur
+                {
+                    let rt_ts = e.ts;
+                    let rt_end = rt_ts + dur;
+                    // StartProfiling is nested inside this RunTask (allow 10µs float tolerance)
+                    if rt_ts <= sp_ts + 10.0 && rt_end + 10.0 >= sp_end {
+                        if sp_dur >= 50_000.0 || sp_dur >= 0.5 * dur {
+                            enclosing_task = Some((rt_ts, rt_end));
                         }
+                        break;
                     }
+                }
             }
             ProfilerOverhead {
                 tid,
@@ -114,9 +117,11 @@ pub fn is_profiler_dropped_frame(ts: f64, overheads: &[ProfilerOverhead]) -> boo
     }
     for ov in overheads {
         if let Some((win_lo, win_hi)) = ov.task_window
-            && ts >= win_lo && ts <= win_hi {
-                return true;
-            }
+            && ts >= win_lo
+            && ts <= win_hi
+        {
+            return true;
+        }
         if ts >= ov.ts && ts <= ov.end() {
             return true;
         }
@@ -147,7 +152,13 @@ mod tests {
     fn test_profiler_overhead_detection_and_deduction() {
         let events = vec![
             ev("RunTask", b'X', 1_000_000.0, Some(1_079_000.0), 1),
-            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(1_076_000.0), 1),
+            ev(
+                "CpuProfiler::StartProfiling",
+                b'X',
+                1_001_000.0,
+                Some(1_076_000.0),
+                1,
+            ),
             ev("DroppedFrame", b'I', 1_005_000.0, None, 7),
             ev("DroppedFrame", b'I', 1_050_000.0, None, 7),
             ev("DroppedFrame", b'I', 3_000_000.0, None, 7),

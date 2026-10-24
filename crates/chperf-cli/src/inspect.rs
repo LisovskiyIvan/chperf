@@ -15,7 +15,10 @@ pub(crate) fn inspect_compare_output(
     events_b: &[trace::TraceEvent],
     name_b: &str,
     cli: &Cli,
+    stats_a: &trace::ParseStats,
+    stats_b: &trace::ParseStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_inspect_query(cli)?;
     let min_ts_a = inspect::trace_start_us(events_a);
     let min_ts_b = inspect::trace_start_us(events_b);
     let ws_a = resolve_windows(events_a, min_ts_a, cli)?;
@@ -28,8 +31,14 @@ pub(crate) fn inspect_compare_output(
             .as_deref()
             .map(|p| inspect::Matcher::new(p, cli.regex))
             .transpose()?;
-        print!("{}", inspect::stacks_folded(events_a, matcher.as_ref(), &ws_a.scope, None));
-        print!("{}", inspect::stacks_folded(events_b, matcher.as_ref(), &ws_b.scope, None));
+        print!(
+            "{}",
+            inspect::stacks_folded(events_a, matcher.as_ref(), &ws_a.scope, None)
+        );
+        print!(
+            "{}",
+            inspect::stacks_folded(events_b, matcher.as_ref(), &ws_b.scope, None)
+        );
         return Ok(());
     }
 
@@ -38,12 +47,38 @@ pub(crate) fn inspect_compare_output(
     // multi-window CPU scan), so computing it twice would double that work.
     let compare = if cli.delta {
         match (
-            ws_a.pre, ws_a.shoot, ws_a.post, ws_a.anchor_ts,
-            ws_b.pre, ws_b.shoot, ws_b.post, ws_b.anchor_ts,
+            ws_a.pre,
+            ws_a.shoot,
+            ws_a.post,
+            ws_a.anchor_ts,
+            ws_b.pre,
+            ws_b.shoot,
+            ws_b.post,
+            ws_b.anchor_ts,
         ) {
             (Some(pa), Some(sa), Some(qa), Some(aa), Some(pb), Some(sb), Some(qb), Some(ab)) => {
-                let da = windowed::delta_data(events_a, pa, sa, qa, aa, &cli.frame_event, cli.lt);
-                let db = windowed::delta_data(events_b, pb, sb, qb, ab, &cli.frame_event, cli.lt);
+                let ba = inspect_budget_us(events_a, cli);
+                let bb = inspect_budget_us(events_b, cli);
+                let da = windowed::delta_data_with_budget(
+                    events_a,
+                    pa,
+                    sa,
+                    qa,
+                    aa,
+                    &cli.frame_event,
+                    cli.lt,
+                    ba,
+                );
+                let db = windowed::delta_data_with_budget(
+                    events_b,
+                    pb,
+                    sb,
+                    qb,
+                    ab,
+                    &cli.frame_event,
+                    cli.lt,
+                    bb,
+                );
                 Some((da, db))
             }
             _ => None,
@@ -52,8 +87,24 @@ pub(crate) fn inspect_compare_output(
         None
     };
 
-    let sections_a = build_sections(events_a, min_ts_a, &ws_a, cli, compare.as_ref().map(|(da, _)| da), None)?;
-    let sections_b = build_sections(events_b, min_ts_b, &ws_b, cli, compare.as_ref().map(|(_, db)| db), None)?;
+    let sections_a = build_sections(
+        events_a,
+        min_ts_a,
+        &ws_a,
+        cli,
+        compare.as_ref().map(|(da, _)| da),
+        None,
+        stats_a,
+    )?;
+    let sections_b = build_sections(
+        events_b,
+        min_ts_b,
+        &ws_b,
+        cli,
+        compare.as_ref().map(|(_, db)| db),
+        None,
+        stats_b,
+    )?;
 
     if cli.json {
         let mut obj = serde_json::Map::new();
@@ -76,7 +127,10 @@ pub(crate) fn inspect_compare_output(
         obj.insert("sections_a".into(), serde_json::Value::Object(secs_a));
         obj.insert("sections_b".into(), serde_json::Value::Object(secs_b));
         obj.insert("compare".into(), compare_json(&compare));
-        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(obj))?
+        );
         return Ok(());
     }
 
@@ -91,7 +145,10 @@ pub(crate) fn inspect_compare_output(
     }
 
     let mut out = String::new();
-    out.push_str(&format!("# chperf inspect compare: {} vs {}\n\n", name_a, name_b));
+    out.push_str(&format!(
+        "# chperf inspect compare: {} vs {}\n\n",
+        name_a, name_b
+    ));
     if let Some(ref note) = ws_a.anchor_note {
         out.push_str(&format!("**A ({}):** {}\n", name_a, note));
     }
@@ -128,10 +185,18 @@ pub(crate) fn inspect_compare_output(
                 let Some(rb) = rb else { continue };
                 let counts = row.unit == "n";
                 let fmt = |v: f64, counts: bool| {
-                    if counts { format!("{:.0}", v) } else { format!("{:.1}", v / 1000.0) }
+                    if counts {
+                        format!("{:.0}", v)
+                    } else {
+                        format!("{:.1}", v / 1000.0)
+                    }
                 };
                 let dfmt = |v: f64, counts: bool| {
-                    if counts { format!("{:+}", v as i64) } else { format!("{:+.1}", v / 1000.0) }
+                    if counts {
+                        format!("{:+}", v as i64)
+                    } else {
+                        format!("{:+.1}", v / 1000.0)
+                    }
                 };
                 let diff_shoot = rb.shoot - row.shoot;
                 let diff_delta = rb.delta_pre() - row.delta_pre();
@@ -161,13 +226,12 @@ pub(crate) fn inspect_compare_output(
 }
 
 /// Raw compare rows as JSON values (µs for `ms` metrics, counts for `n`).
-pub(crate) fn compare_csv_rows(
-    da: &windowed::DeltaData,
-    db: &windowed::DeltaData,
-) -> Vec<Value> {
+pub(crate) fn compare_csv_rows(da: &windowed::DeltaData, db: &windowed::DeltaData) -> Vec<Value> {
     let mut rows = Vec::new();
     for row in &da.rows {
-        let Some(rb) = db.rows.iter().find(|b| b.metric == row.metric) else { continue };
+        let Some(rb) = db.rows.iter().find(|b| b.metric == row.metric) else {
+            continue;
+        };
         rows.push(serde_json::json!({
             "metric": row.metric,
             "unit": row.unit,
@@ -215,7 +279,9 @@ pub(crate) fn inspect_output(
     trace_name: &str,
     cli: &Cli,
     cpu_cache: Option<&analysis::CpuProfileCache>,
+    stats: &trace::ParseStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_inspect_query(cli)?;
     let ws = resolve_windows(events, min_ts, cli)?;
 
     // --flame: raw folded stacks for flamegraph.pl / speedscope (no markdown/json).
@@ -225,12 +291,36 @@ pub(crate) fn inspect_output(
             .as_deref()
             .map(|p| inspect::Matcher::new(p, cli.regex))
             .transpose()?;
-        print!("{}", inspect::stacks_folded(events, matcher.as_ref(), &ws.scope, cpu_cache));
+        print!(
+            "{}",
+            inspect::stacks_folded(events, matcher.as_ref(), &ws.scope, cpu_cache)
+        );
         return Ok(());
     }
 
-    let sections = build_sections(events, min_ts, &ws, cli, None, cpu_cache)?;
+    let sections = build_sections(events, min_ts, &ws, cli, None, cpu_cache, stats)?;
     dispatch_output(&sections, trace_name, min_ts, &ws, cli)
+}
+
+/// Inspect-query validation: --stats/--gaps need --events (no silent default).
+fn validate_inspect_query(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.stats && cli.events.is_none() {
+        return Err(
+            "usage: --stats requires --events <names> (duration table of an event list)".into(),
+        );
+    }
+    if cli.gaps && cli.events.is_none() {
+        return Err(
+            "usage: --gaps requires --events <names> (no silent EventDispatch default)".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Frame budget in µs for inspect sections: --frame-budget ms override
+/// (<=0/None = auto-detect from vsync cadence).
+pub(crate) fn inspect_budget_us(events: &[trace::TraceEvent], cli: &Cli) -> f64 {
+    inspect::resolve_frame_budget_us(events, cli.frame_budget)
 }
 
 /// Resolved anchor/window state, shared by single-trace and compare output.
@@ -245,11 +335,18 @@ struct WindowState {
 
 /// Determine the time anchor (--worst > --anchor > --around, all relative to
 /// the metadata-free trace start) and derive the SHOOT/PRE/POST windows.
+/// Hard-fails (Err) on --anchor/--worst misses unless --full-on-miss is set,
+/// and on --window without --around/--anchor/--worst.
 fn resolve_windows(
     events: &[trace::TraceEvent],
     min_ts: f64,
     cli: &Cli,
 ) -> Result<WindowState, Box<dyn std::error::Error>> {
+    if cli.window.is_some() && cli.around.is_none() && cli.anchor.is_none() && !cli.worst {
+        return Err(
+            "usage: --window requires --around, --anchor or --worst (a window center)".into(),
+        );
+    }
     // Resolve --tid (numeric or "main" → auto-detected main thread).
     let tid = match &cli.tid {
         None => None,
@@ -265,9 +362,10 @@ fn resolve_windows(
             }
             Some(t)
         }
-        Some(s) => Some(s.parse::<u64>().map_err(|e| {
-            format!("invalid --tid `{}` (use a number or \"main\"): {}", s, e)
-        })?),
+        Some(s) => Some(
+            s.parse::<u64>()
+                .map_err(|e| format!("invalid --tid `{}` (use a number or \"main\"): {}", s, e))?,
+        ),
     };
 
     // Pre-window scope (for --worst search): tid/pid/cat, no window.
@@ -292,6 +390,13 @@ fn resolve_windows(
                 w
             ));
             anchor_ts = Some(ts);
+        } else if cli.full_on_miss {
+            eprintln!("warning: --worst matched nothing, using full trace (--full-on-miss)");
+        } else {
+            return Err(
+                "usage: --worst matched nothing (no RunTask in scope; use --full-on-miss for full trace)"
+                    .into(),
+            );
         }
     } else if let Some(pattern) = &cli.anchor {
         let m = inspect::Matcher::new(pattern, cli.regex)?;
@@ -306,7 +411,16 @@ fn resolve_windows(
                 ));
             }
             None => {
-                eprintln!("warning: --anchor {} matched nothing", pattern);
+                if cli.full_on_miss {
+                    eprintln!(
+                        "warning: --anchor {pattern} matched nothing, using full trace (--full-on-miss)"
+                    );
+                } else {
+                    return Err(format!(
+                        "usage: --anchor {pattern} matched nothing (use --full-on-miss for full trace)"
+                    )
+                    .into());
+                }
             }
         }
     } else {
@@ -317,18 +431,8 @@ fn resolve_windows(
     // exist for --delta comparisons.
     let half_ms = window_ms.unwrap_or(100.0);
     let shoot = anchor_ts.map(|ts| (ts - half_ms * 1000.0, ts + half_ms * 1000.0));
-    let pre = anchor_ts.map(|ts| {
-        (
-            ts - (cli.pre + half_ms) * 1000.0,
-            ts - half_ms * 1000.0,
-        )
-    });
-    let post = anchor_ts.map(|ts| {
-        (
-            ts + half_ms * 1000.0,
-            ts + (half_ms + cli.post) * 1000.0,
-        )
-    });
+    let pre = anchor_ts.map(|ts| (ts - (cli.pre + half_ms) * 1000.0, ts - half_ms * 1000.0));
+    let post = anchor_ts.map(|ts| (ts + half_ms * 1000.0, ts + (half_ms + cli.post) * 1000.0));
     let scope = inspect::Scope {
         window: shoot,
         tid,
@@ -357,6 +461,7 @@ fn build_sections(
     cli: &Cli,
     delta: Option<&windowed::DeltaData>,
     cpu_cache: Option<&analysis::CpuProfileCache>,
+    stats: &trace::ParseStats,
 ) -> Result<Vec<Section>, Box<dyn std::error::Error>> {
     let scope = &ws.scope;
     let sort = match cli.sort.as_deref() {
@@ -369,10 +474,19 @@ fn build_sections(
 
     let mut sections: Vec<Section> = Vec::new();
 
-    // --jank: whole-trace cluster detection (dropped frames / sub-threshold spikes).
+    // --jank: cluster detection with detected/override frame budget + bucket.
     // With a window scope, detection is restricted to the window.
+    // --bucket also sets the jank bucket width.
     if cli.jank {
-        let (m, j) = inspect::jank_section(events, scope, cli.top, min_ts);
+        let budget = inspect_budget_us(events, cli);
+        let (m, j) = inspect::jank_section_with_budget(
+            events,
+            scope,
+            cli.top,
+            min_ts,
+            Some(budget),
+            cli.bucket,
+        );
         sections.push(("jank", m, j));
     }
 
@@ -406,6 +520,23 @@ fn build_sections(
         sections.push(("threads", m, j));
     }
 
+    if cli.loading {
+        let (m, j) = inspect::loading_section(events, scope, cli.top, min_ts);
+        sections.push(("loading", m, j));
+    }
+    if cli.network {
+        let (m, j) = inspect::network_section(events, scope, cli.top, min_ts);
+        sections.push(("network", m, j));
+    }
+    if cli.raster {
+        let (m, j) = inspect::raster_section(events, scope, cli.top, min_ts);
+        sections.push(("raster", m, j));
+    }
+    if cli.coverage {
+        let (m, j) = inspect::coverage_section(events, scope, stats, min_ts);
+        sections.push(("coverage", m, j));
+    }
+
     if cli.frame_tree {
         let (m, j) = inspect::frame_tree_section(events, None, min_ts);
         sections.push(("frame_tree", m, j));
@@ -419,7 +550,15 @@ fn build_sections(
             .collect();
         let filter = inspect::NameFilter::new(&names, cli.regex)?;
         let (m, j) = if cli.gaps {
-            inspect::gaps_section(events, &filter, names_raw.trim(), scope, min_dur_us, cli.top, min_ts)
+            inspect::gaps_section(
+                events,
+                &filter,
+                names_raw.trim(),
+                scope,
+                min_dur_us,
+                cli.top,
+                min_ts,
+            )
         } else if cli.stats {
             inspect::stats_section(events, &filter, names_raw.trim(), scope, min_dur_us, min_ts)
         } else {
@@ -435,13 +574,20 @@ fn build_sections(
                 min_ts,
             )
         };
-        sections.push((if cli.gaps { "gaps" } else if cli.stats { "stats" } else { "events" }, m, j));
-    } else if cli.gaps && !cli.input {
-        let names = vec!["EventDispatch".to_string()];
-        let filter = inspect::NameFilter::new(&names, false)?;
-        let (m, j) = inspect::gaps_section(events, &filter, "EventDispatch", scope, min_dur_us, cli.top, min_ts);
-        sections.push(("gaps", m, j));
+        sections.push((
+            if cli.gaps {
+                "gaps"
+            } else if cli.stats {
+                "stats"
+            } else {
+                "events"
+            },
+            m,
+            j,
+        ));
     }
+    // No silent EventDispatch default: --gaps without --events is a usage error
+    // (validated up front in validate_inspect_query).
 
     // Functions and stacks can share a single matcher (filter by name).
     let func_matcher = if let Some(pattern) = &cli.function {
@@ -454,7 +600,14 @@ fn build_sections(
         sections.push(("functions", md, j));
     }
     if cli.stacks {
-        let (md, j) = inspect::stacks_section(events, func_matcher.as_ref(), scope, cli.top, min_ts, cpu_cache);
+        let (md, j) = inspect::stacks_section(
+            events,
+            func_matcher.as_ref(),
+            scope,
+            cli.top,
+            min_ts,
+            cpu_cache,
+        );
         sections.push(("stacks", md, j));
     }
     if cli.calltree {
@@ -479,12 +632,30 @@ fn build_sections(
         sections.push(("gc", md, j));
     }
     if cli.frames {
-        let (md, j) = windowed::frames_section(events, scope, &cli.frame_event, min_ts);
+        let budget = inspect_budget_us(events, cli);
+        let (md, mut j) =
+            windowed::frames_section_with_budget(events, scope, &cli.frame_event, min_ts, budget);
+        // Enrich the budget line with the detected refresh rate.
+        let label = inspect::frame_budget_label(budget);
+        let md = md.replacen(
+            &format!("- **Frame budget**: {:.2}ms", budget / 1000.0),
+            &format!("- **Frame budget**: {}", label),
+            1,
+        );
+        if let Value::Array(rows) = &mut j
+            && let Some(Value::Object(o)) = rows.first_mut()
+        {
+            o.insert(
+                "frame_budget_ms".into(),
+                serde_json::json!((budget / 1000.0 * 100.0).round() / 100.0),
+            );
+        }
         sections.push(("frames", md, j));
     }
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
-        let (md, j) = inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts, cpu_cache);
+        let (md, j) =
+            inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts, cpu_cache);
         sections.push(("find", md, j));
     }
 
@@ -492,19 +663,41 @@ fn build_sections(
     if cli.delta {
         match (ws.pre, ws.shoot, ws.post, ws.anchor_ts) {
             (Some(p), Some(s), Some(q), Some(a)) => {
-                let (md, j) = match delta {
-                    Some(d) => windowed::delta_section_from_data(d, min_ts),
-                    None => windowed::delta_section(
-                        events,
-                        p,
-                        s,
-                        q,
-                        a,
-                        &cli.frame_event,
-                        cli.lt,
-                        min_ts,
-                    ),
+                let budget = inspect_budget_us(events, cli);
+                let owned;
+                let d_ref: &windowed::DeltaData = match delta {
+                    Some(d) => d,
+                    None => {
+                        owned = windowed::delta_data_with_budget(
+                            events,
+                            p,
+                            s,
+                            q,
+                            a,
+                            &cli.frame_event,
+                            cli.lt,
+                            budget,
+                        );
+                        &owned
+                    }
                 };
+                let (mut md, mut j) = windowed::delta_section_from_data(d_ref, min_ts);
+                let label = inspect::frame_budget_label(budget);
+                md = md.replacen(
+                    "## Delta: PRE → SHOOT → POST\n\n",
+                    &format!(
+                        "## Delta: PRE → SHOOT → POST\n\n- **Frame budget**: {}\n\n",
+                        label
+                    ),
+                    1,
+                );
+                if let Value::Object(o) = &mut j {
+                    o.insert("frame_budget_us".into(), serde_json::json!(budget.round()));
+                    o.insert(
+                        "frame_budget_ms".into(),
+                        serde_json::json!((budget / 1000.0 * 100.0).round() / 100.0),
+                    );
+                }
                 sections.push(("delta", md, j));
             }
             _ => sections.push((
@@ -567,7 +760,10 @@ fn dispatch_output(
             secs.insert((*k).into(), j.clone());
         }
         obj.insert("sections".into(), serde_json::Value::Object(secs));
-        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(obj))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(obj))?
+        );
         return Ok(());
     }
     if cli.csv {

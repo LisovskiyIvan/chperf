@@ -27,15 +27,13 @@ fn value_match_text<'a>(v: &'a Value, matcher: &Matcher) -> Option<&'a str> {
     match v {
         Value::String(s) => matcher.matches(s).then_some(s.as_str()),
         Value::Array(a) => a.iter().find_map(|v| value_match_text(v, matcher)),
-        Value::Object(m) => m
-            .iter()
-            .find_map(|(k, v)| {
-                if matcher.matches(k) {
-                    Some(k.as_str())
-                } else {
-                    value_match_text(v, matcher)
-                }
-            }),
+        Value::Object(m) => m.iter().find_map(|(k, v)| {
+            if matcher.matches(k) {
+                Some(k.as_str())
+            } else {
+                value_match_text(v, matcher)
+            }
+        }),
         Value::Number(n) => {
             let s = n.to_string();
             matcher.matches(&s).then_some(Box::leak(s.into_boxed_str()))
@@ -96,7 +94,9 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     let mut starts: rustc_hash::FxHashMap<(u64, u64), f64> = rustc_hash::FxHashMap::default();
     for e in events {
         if e.name == "Profile" && e.ph == b'P' {
-            starts.entry((e.pid, if e.has_id { e.id } else { e.tid })).or_insert(e.ts);
+            starts
+                .entry((e.pid, if e.has_id { e.id } else { e.tid }))
+                .or_insert(e.ts);
             starts.entry((e.pid, e.tid)).or_insert(e.ts);
         }
     }
@@ -160,9 +160,10 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                 let id = s.as_u64().unwrap_or(0);
                 if id != 0
                     && let Some(entry) = node_first.get_mut(&(sess.0, sess.1, id))
-                        && sample_ts < entry.0 {
-                            entry.0 = sample_ts;
-                        }
+                    && sample_ts < entry.0
+                {
+                    entry.0 = sample_ts;
+                }
             }
             prev_last.insert(sess, sample_ts);
         }
@@ -206,23 +207,94 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     for e in events {
         let Some(raw) = e.args_raw() else { continue };
         if let Matcher::Substr(p) = matcher
-            && !crate::inspect::contains_ignore_case(raw, p) {
-                continue;
-            }
+            && !crate::inspect::contains_ignore_case(raw, p)
+        {
+            continue;
+        }
         let Some(args) = e.args_value() else { continue };
         if let Some(text) = value_match_text(&args, matcher)
-            && args_best.as_ref().is_none_or(|b| e.ts < b.ts) {
-                args_best = Some(Anchor {
-                    ts: e.ts,
-                    kind: "args",
-                    label: text.to_string(),
-                });
-            }
+            && args_best.as_ref().is_none_or(|b| e.ts < b.ts)
+        {
+            args_best = Some(Anchor {
+                ts: e.ts,
+                kind: "args",
+                label: text.to_string(),
+            });
+        }
     }
     args_best
 }
 
 // ── Frame statistics (--frames, --delta) ──
+
+/// Frame budget (µs) per detected refresh rate: 120Hz / 90Hz / 60Hz.
+pub const FRAME_BUDGET_120HZ_US: f64 = 8_333.0;
+pub const FRAME_BUDGET_90HZ_US: f64 = 11_111.0;
+pub const FRAME_BUDGET_60HZ_US: f64 = 16_667.0;
+
+/// Frame-tick event names used for cadence detection, in preference order.
+const FRAME_TICK_EVENTS: [&str; 3] = [
+    "SubmitCompositorFrameToPresentationCompositorFrame",
+    "DrawFrame",
+    "BeginFrame",
+];
+
+/// Detect the frame budget (µs) from the trace's vsync cadence: the median
+/// interval between consecutive frame-tick `b` events (compositor
+/// presentation, else DrawFrame/BeginFrame) maps to the nearest standard
+/// budget (≤10ms → 120Hz, ≤13ms → 90Hz, else 60Hz). Falls back to 60Hz when
+/// fewer than 3 ticks are present. Pure function, deterministic.
+pub fn detect_frame_budget_us(events: &[TraceEvent]) -> f64 {
+    for name in FRAME_TICK_EVENTS {
+        let mut ts: Vec<f64> = events
+            .iter()
+            .filter(|e| e.name == name && e.ph == b'b')
+            .map(|e| e.ts)
+            .collect();
+        if ts.len() < 3 {
+            continue;
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut gaps: Vec<f64> = ts
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|&d| d > 0.0)
+            .collect();
+        if gaps.len() < 2 {
+            continue;
+        }
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mid = gaps.len() / 2;
+        let median = if gaps.len() % 2 == 1 {
+            gaps[mid]
+        } else {
+            (gaps[mid - 1] + gaps[mid]) / 2.0
+        };
+        if median <= 10_000.0 {
+            return FRAME_BUDGET_120HZ_US;
+        }
+        if median <= 13_000.0 {
+            return FRAME_BUDGET_90HZ_US;
+        }
+        return FRAME_BUDGET_60HZ_US;
+    }
+    FRAME_BUDGET_60HZ_US
+}
+
+/// Count DroppedFrame events in scope, excluding ones inside the profiler
+/// startup freeze. Single source of truth shared by `frames_section` and
+/// jank analysis, so the same trace never reports two dropped counts.
+pub fn dropped_frames(events: &[TraceEvent], scope: Option<&Scope>) -> usize {
+    let overheads = find_profiler_overhead(events);
+    events
+        .iter()
+        .filter(|e| {
+            e.name == "DroppedFrame"
+                && scope.is_none_or(|s| s.allows_event(e))
+                && !is_profiler_dropped_frame(e.ts, &overheads)
+        })
+        .count()
+}
 
 /// Pair `b`/`e` events with the given name into durations (µs). Chrome frame
 /// pipeline events are traced as `b`/`e` pairs without `dur`; same-thread
@@ -235,17 +307,19 @@ fn paired_durations(events: &[TraceEvent], name: &str, window: Option<(f64, f64)
             continue;
         }
         if let Some((lo, hi)) = window
-            && (e.ts < lo || e.ts > hi) {
-                continue;
-            }
+            && (e.ts < lo || e.ts > hi)
+        {
+            continue;
+        }
         match e.ph {
             b'b' => stacks.entry(e.tid).or_default().push(e.ts),
             b'e' => {
                 if let Some(st) = stacks.get_mut(&e.tid)
                     && let Some(t) = st.pop()
-                        && e.ts > t {
-                            durs.push(e.ts - t);
-                        }
+                    && e.ts > t
+                {
+                    durs.push(e.ts - t);
+                }
             }
             _ => {}
         }
@@ -253,14 +327,21 @@ fn paired_durations(events: &[TraceEvent], name: &str, window: Option<(f64, f64)
     durs
 }
 
+/// Linear-interpolated percentiles over ascending-sorted samples:
+/// rank = q/100*(n-1), value interpolated between the bracketing samples.
+/// (p50, p90, p99, max). n < 2 degrades gracefully (n=1 returns the sample).
 fn percentiles(sorted_asc: &[f64]) -> (f64, f64, f64, f64) {
     // (p50, p90, p99, max)
     if sorted_asc.is_empty() {
         return (0.0, 0.0, 0.0, 0.0);
     }
+    let n = sorted_asc.len();
     let p = |q: f64| -> f64 {
-        let idx = ((q / 100.0) * (sorted_asc.len() - 1) as f64).round() as usize;
-        sorted_asc[idx.min(sorted_asc.len() - 1)]
+        let rank = q / 100.0 * (n - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        let frac = rank - lo as f64;
+        sorted_asc[lo] + (sorted_asc[hi] - sorted_asc[lo]) * frac
     };
     (p(50.0), p(90.0), p(99.0), *sorted_asc.last().unwrap())
 }
@@ -272,16 +353,39 @@ pub fn frames_section(
     frame_event: &str,
     min_ts: f64,
 ) -> (String, Value) {
-    let overheads = find_profiler_overhead(events);
+    frames_section_impl(events, scope, frame_event, min_ts, None)
+}
+
+/// `frames_section` with an explicit frame budget (µs): the budget is
+/// reported in the output (`frame_budget_us`) but does not change pairing.
+/// Prefer `detect_frame_budget_us` or a `--frame-budget` override.
+pub fn frames_section_with_budget(
+    events: &[TraceEvent],
+    scope: &Scope,
+    frame_event: &str,
+    min_ts: f64,
+    budget_us: f64,
+) -> (String, Value) {
+    frames_section_impl(events, scope, frame_event, min_ts, Some(budget_us))
+}
+
+fn frames_section_impl(
+    events: &[TraceEvent],
+    scope: &Scope,
+    frame_event: &str,
+    min_ts: f64,
+    budget_us: Option<f64>,
+) -> (String, Value) {
     let mut durs = paired_durations(events, frame_event, scope.window);
     durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let dropped = events
-        .iter()
-        .filter(|e| e.name == "DroppedFrame" && scope.allows_event(e) && !is_profiler_dropped_frame(e.ts, &overheads))
-        .count();
+    let dropped = dropped_frames(events, Some(scope));
     let n = durs.len();
     let (p50, p90, p99, max) = percentiles(&durs);
-    let avg = if n > 0 { durs.iter().sum::<f64>() / n as f64 } else { 0.0 };
+    let avg = if n > 0 {
+        durs.iter().sum::<f64>() / n as f64
+    } else {
+        0.0
+    };
     let ms = |v: f64| format!("{:.2}", v / 1000.0);
 
     let mut out = String::new();
@@ -294,10 +398,11 @@ pub fn frames_section(
     if let Some(line) = scope.window_line(min_ts) {
         out.push_str(&line);
     }
-    out.push_str(&format!(
-        "- **Dropped frames**: {}\n\n",
-        dropped
-    ));
+    out.push_str(&format!("- **Dropped frames**: {}\n", dropped));
+    if let Some(b) = budget_us {
+        out.push_str(&format!("- **Frame budget**: {:.2}ms\n", b / 1000.0));
+    }
+    out.push('\n');
     out.push_str("| count | avg(ms) | p50 | p90 | p99 | max |\n");
     out.push_str("|-------|---------|-----|-----|-----|-----|\n");
     out.push_str(&format!(
@@ -311,17 +416,19 @@ pub fn frames_section(
     ));
     out.push('\n');
 
-    let row = json!({
-        "frame_event": frame_event,
-        "count": n,
-        "avg_us": avg.round(),
-        "p50_us": p50.round(),
-        "p90_us": p90.round(),
-        "p99_us": p99.round(),
-        "max_us": max.round(),
-        "dropped_frames": dropped,
-    });
-    (out, Value::Array(vec![row]))
+    let mut obj = serde_json::Map::new();
+    obj.insert("frame_event".into(), json!(frame_event));
+    obj.insert("count".into(), json!(n));
+    obj.insert("avg_us".into(), json!(avg.round()));
+    obj.insert("p50_us".into(), json!(p50.round()));
+    obj.insert("p90_us".into(), json!(p90.round()));
+    obj.insert("p99_us".into(), json!(p99.round()));
+    obj.insert("max_us".into(), json!(max.round()));
+    obj.insert("dropped_frames".into(), json!(dropped));
+    if let Some(b) = budget_us {
+        obj.insert("frame_budget_us".into(), json!(b.round()));
+    }
+    (out, Value::Array(vec![Value::Object(obj)]))
 }
 
 // ── GC & Long Tasks (--gc) ──
@@ -460,8 +567,10 @@ pub fn calltree_section(
 
     // Children map + roots. Keys are (pid, session, node id); a parent id
     // resolves within its own session only.
-    let mut children: rustc_hash::FxHashMap<crate::analysis::NodeKey, Vec<crate::analysis::NodeKey>> =
-        rustc_hash::FxHashMap::default();
+    let mut children: rustc_hash::FxHashMap<
+        crate::analysis::NodeKey,
+        Vec<crate::analysis::NodeKey>,
+    > = rustc_hash::FxHashMap::default();
     let mut roots: Vec<crate::analysis::NodeKey> = Vec::new();
     for (key, (_, _, parent)) in nodes.iter() {
         match parent {
@@ -500,7 +609,9 @@ pub fn calltree_section(
     // Inclusive time: reverse DFS order accumulates children into parents.
     let mut inclusive: crate::analysis::ProfileSelfTimes = self_time.clone();
     for &id in order.iter().rev() {
-        let Some(Some(p)) = nodes.get(&id).map(|n| n.2) else { continue };
+        let Some(Some(p)) = nodes.get(&id).map(|n| n.2) else {
+            continue;
+        };
         let pk = (id.0, id.1, p);
         if nodes.contains_key(&pk) {
             let inc = *inclusive.get(&id).unwrap_or(&0.0);
@@ -523,7 +634,10 @@ pub fn calltree_section(
         let m = matched(nodes.get(&id).unwrap());
         let kids = children
             .get(&id)
-            .map(|ch| ch.iter().any(|c| has_match.get(c).copied().unwrap_or(false)))
+            .map(|ch| {
+                ch.iter()
+                    .any(|c| has_match.get(c).copied().unwrap_or(false))
+            })
             .unwrap_or(false);
         has_match.insert(id, m || (has_filter && kids));
     }
@@ -601,7 +715,11 @@ pub fn calltree_section(
         let (name, url, _) = nodes.get(&row.id).unwrap();
         let inc = *inclusive.get(&row.id).unwrap_or(&0.0);
         let own = *self_time.get(&row.id).unwrap_or(&0.0);
-        let pct = if total_us > 0.0 { inc / total_us * 100.0 } else { 0.0 };
+        let pct = if total_us > 0.0 {
+            inc / total_us * 100.0
+        } else {
+            0.0
+        };
         let label = if name.is_empty() { "(anonymous)" } else { name };
         let indent = "  ".repeat(row.depth);
         let file = if url.is_empty() {
@@ -629,7 +747,11 @@ pub fn calltree_section(
     }
     out.push_str("```\n");
     if rows.len() >= top && !has_filter {
-        out.push_str(&format!("\n_Showing {} of {} nodes (use --top to see more)._", rows.len(), order.len()));
+        out.push_str(&format!(
+            "\n_Showing {} of {} nodes (use --top to see more)._",
+            rows.len(),
+            order.len()
+        ));
     }
     out.push('\n');
     (out, Value::Array(json_rows))
@@ -707,9 +829,33 @@ fn delta_windows_stats(
     let overheads = find_profiler_overhead(events);
     let wins = [pre, shoot, post];
     let mut accs = [
-        WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
-        WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
-        WindowAcc { dropped: 0, runtask: 0.0, js: 0.0, gc: 0.0, gc_count: 0, lt_count: 0, lt_us: 0.0 },
+        WindowAcc {
+            dropped: 0,
+            runtask: 0.0,
+            js: 0.0,
+            gc: 0.0,
+            gc_count: 0,
+            lt_count: 0,
+            lt_us: 0.0,
+        },
+        WindowAcc {
+            dropped: 0,
+            runtask: 0.0,
+            js: 0.0,
+            gc: 0.0,
+            gc_count: 0,
+            lt_count: 0,
+            lt_us: 0.0,
+        },
+        WindowAcc {
+            dropped: 0,
+            runtask: 0.0,
+            js: 0.0,
+            gc: 0.0,
+            gc_count: 0,
+            lt_count: 0,
+            lt_us: 0.0,
+        },
     ];
 
     for e in events {
@@ -748,7 +894,6 @@ fn delta_windows_stats(
                 _ => {}
             }
         }
-
     }
 
     let frame_wins = [
@@ -758,8 +903,7 @@ fn delta_windows_stats(
     ];
 
     let windows: [Option<(f64, f64)>; 3] = [Some(pre), Some(shoot), Some(post)];
-    let (node_map, times) =
-        crate::analysis::scan_profile_chunks_windows(events, None, &windows, 0);
+    let (node_map, times) = crate::analysis::scan_profile_chunks_windows(events, None, &windows, 0);
 
     let mut out: [WindowStats; 3] = std::array::from_fn(|_| WindowStats {
         frames_n: 0,
@@ -821,6 +965,8 @@ pub struct DeltaData {
     pub pre: (f64, f64),
     pub shoot: (f64, f64),
     pub post: (f64, f64),
+    /// Frame budget (µs) in effect for this trace (detected or override).
+    pub frame_budget_us: f64,
 }
 
 /// Compute the PRE/SHOOT/POST metric rows for one trace (frames, dropped
@@ -834,6 +980,31 @@ pub fn delta_data(
     anchor_ts: f64,
     frame_event: &str,
     lt_ms: f64,
+) -> DeltaData {
+    delta_data_with_budget(
+        events,
+        pre,
+        shoot,
+        post,
+        anchor_ts,
+        frame_event,
+        lt_ms,
+        detect_frame_budget_us(events),
+    )
+}
+
+/// `delta_data` with an explicit frame budget (µs), recorded on the result.
+/// Prefer `detect_frame_budget_us` or a `--frame-budget` override.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_data_with_budget(
+    events: &[TraceEvent],
+    pre: (f64, f64),
+    shoot: (f64, f64),
+    post: (f64, f64),
+    anchor_ts: f64,
+    frame_event: &str,
+    lt_ms: f64,
+    budget_us: f64,
 ) -> DeltaData {
     let main_tid = crate::trace::detect_main_thread(events);
     let (s_pre, s_shoot, s_post) =
@@ -849,11 +1020,32 @@ pub fn delta_data(
             post,
         });
     };
-    push("frames", "n", s_pre.frames_n as f64, s_shoot.frames_n as f64, s_post.frames_n as f64);
-    for (i, name) in ["frame p50", "frame p90", "frame p99", "frame max"].iter().enumerate() {
-        push(name, "ms", s_pre.frames[i], s_shoot.frames[i], s_post.frames[i]);
+    push(
+        "frames",
+        "n",
+        s_pre.frames_n as f64,
+        s_shoot.frames_n as f64,
+        s_post.frames_n as f64,
+    );
+    for (i, name) in ["frame p50", "frame p90", "frame p99", "frame max"]
+        .iter()
+        .enumerate()
+    {
+        push(
+            name,
+            "ms",
+            s_pre.frames[i],
+            s_shoot.frames[i],
+            s_post.frames[i],
+        );
     }
-    push("dropped frames", "n", s_pre.dropped as f64, s_shoot.dropped as f64, s_post.dropped as f64);
+    push(
+        "dropped frames",
+        "n",
+        s_pre.dropped as f64,
+        s_shoot.dropped as f64,
+        s_post.dropped as f64,
+    );
     push(
         &format!("long tasks >{:.0}ms", lt_ms),
         "n",
@@ -861,12 +1053,48 @@ pub fn delta_data(
         s_shoot.lt_count as f64,
         s_post.lt_count as f64,
     );
-    push("long task time", "ms", s_pre.lt_us, s_shoot.lt_us, s_post.lt_us);
-    push("main busy (RunTask)", "ms", s_pre.runtask_us, s_shoot.runtask_us, s_post.runtask_us);
-    push("JS (FunctionCall)", "ms", s_pre.js_us, s_shoot.js_us, s_post.js_us);
-    push("GC (Major+Minor)", "ms", s_pre.gc_us, s_shoot.gc_us, s_post.gc_us);
-    push("GC count", "n", s_pre.gc_count as f64, s_shoot.gc_count as f64, s_post.gc_count as f64);
-    push("CPU samples", "ms", s_pre.cpu_us, s_shoot.cpu_us, s_post.cpu_us);
+    push(
+        "long task time",
+        "ms",
+        s_pre.lt_us,
+        s_shoot.lt_us,
+        s_post.lt_us,
+    );
+    push(
+        "main busy (RunTask)",
+        "ms",
+        s_pre.runtask_us,
+        s_shoot.runtask_us,
+        s_post.runtask_us,
+    );
+    push(
+        "JS (FunctionCall)",
+        "ms",
+        s_pre.js_us,
+        s_shoot.js_us,
+        s_post.js_us,
+    );
+    push(
+        "GC (Major+Minor)",
+        "ms",
+        s_pre.gc_us,
+        s_shoot.gc_us,
+        s_post.gc_us,
+    );
+    push(
+        "GC count",
+        "n",
+        s_pre.gc_count as f64,
+        s_shoot.gc_count as f64,
+        s_post.gc_count as f64,
+    );
+    push(
+        "CPU samples",
+        "ms",
+        s_pre.cpu_us,
+        s_shoot.cpu_us,
+        s_post.cpu_us,
+    );
 
     DeltaData {
         rows,
@@ -875,6 +1103,7 @@ pub fn delta_data(
         pre,
         shoot,
         post,
+        frame_budget_us: budget_us,
     }
 }
 
@@ -900,7 +1129,6 @@ pub fn delta_section(
 /// callers that also need the raw rows (e.g. the two-trace compare) compute
 /// `delta_data` exactly once per trace.
 pub fn delta_section_from_data(data: &DeltaData, min_ts: f64) -> (String, Value) {
-
     let ms = |v: f64| format!("{:.1}", v / 1000.0);
     let dms = |a: f64, b: f64| format!("{:+.1}", (b - a) / 1000.0);
     let dcount = |a: f64, b: f64| format!("{:+}", b as i64 - a as i64);
@@ -966,7 +1194,11 @@ pub fn delta_section_from_data(data: &DeltaData, min_ts: f64) -> (String, Value)
     // Top CPU self-time per window.
     out.push_str("| window | top CPU self-time |\n");
     out.push_str("|--------|-------------------|\n");
-    for (label, top_cpu) in [("PRE", &data.top_cpu[0]), ("SHOOT", &data.top_cpu[1]), ("POST", &data.top_cpu[2])] {
+    for (label, top_cpu) in [
+        ("PRE", &data.top_cpu[0]),
+        ("SHOOT", &data.top_cpu[1]),
+        ("POST", &data.top_cpu[2]),
+    ] {
         let top: String = if top_cpu.is_empty() {
             "—".to_string()
         } else {
@@ -990,17 +1222,27 @@ pub fn delta_section_from_data(data: &DeltaData, min_ts: f64) -> (String, Value)
     };
     let mut obj = serde_json::Map::new();
     obj.insert("anchor_us".into(), json!(data.anchor_us.round()));
-    obj.insert("windows".into(), json!({
-        "pre": [data.pre.0.round(), data.pre.1.round()],
-        "shoot": [data.shoot.0.round(), data.shoot.1.round()],
-        "post": [data.post.0.round(), data.post.1.round()],
-    }));
+    obj.insert(
+        "frame_budget_us".into(),
+        json!(data.frame_budget_us.round()),
+    );
+    obj.insert(
+        "windows".into(),
+        json!({
+            "pre": [data.pre.0.round(), data.pre.1.round()],
+            "shoot": [data.shoot.0.round(), data.shoot.1.round()],
+            "post": [data.post.0.round(), data.post.1.round()],
+        }),
+    );
     obj.insert("metrics".into(), Value::Array(json_rows));
-    obj.insert("top_cpu".into(), json!({
-        "pre": top_json(&data.top_cpu[0]),
-        "shoot": top_json(&data.top_cpu[1]),
-        "post": top_json(&data.top_cpu[2]),
-    }));
+    obj.insert(
+        "top_cpu".into(),
+        json!({
+            "pre": top_json(&data.top_cpu[0]),
+            "shoot": top_json(&data.top_cpu[1]),
+            "post": top_json(&data.top_cpu[2]),
+        }),
+    );
     (out, Value::Object(obj))
 }
 
@@ -1059,7 +1301,13 @@ mod tests {
     use super::*;
     use crate::trace::TraceEvent;
 
-    fn ev(name: &str, ph: &str, ts: f64, dur: Option<f64>, args: Option<serde_json::Value>) -> TraceEvent {
+    fn ev(
+        name: &str,
+        ph: &str,
+        ts: f64,
+        dur: Option<f64>,
+        args: Option<serde_json::Value>,
+    ) -> TraceEvent {
         TraceEvent {
             name: crate::trace::intern_name(name),
             id: 0,
@@ -1074,7 +1322,12 @@ mod tests {
         }
     }
 
-    fn chunk(ts: f64, nodes: &[(u64, &str, &str, Option<u64>)], samples: &[u64], deltas: &[f64]) -> TraceEvent {
+    fn chunk(
+        ts: f64,
+        nodes: &[(u64, &str, &str, Option<u64>)],
+        samples: &[u64],
+        deltas: &[f64],
+    ) -> TraceEvent {
         let nodes_json: Vec<serde_json::Value> = nodes
             .iter()
             .map(|(id, name, url, parent)| {
@@ -1093,7 +1346,13 @@ mod tests {
     }
 
     fn fc(ts: f64, fn_name: &str) -> TraceEvent {
-        ev("FunctionCall", "X", ts, Some(1000.0), Some(serde_json::json!({"data": {"functionName": fn_name}})))
+        ev(
+            "FunctionCall",
+            "X",
+            ts,
+            Some(1000.0),
+            Some(serde_json::json!({"data": {"functionName": fn_name}})),
+        )
     }
 
     /// Anchor priority: FunctionCall functionName beats cpu-profile beats args.
@@ -1102,11 +1361,20 @@ mod tests {
         let events = vec![
             ev("Profile", "P", 1_000_000.0, None, None),
             // args match only, earliest of all
-            ev("WebSocketSend", "X", 1_000_100.0, Some(10.0), Some(serde_json::json!({"data": {"msg": "player_shoot"}}))),
+            ev(
+                "WebSocketSend",
+                "X",
+                1_000_100.0,
+                Some(10.0),
+                Some(serde_json::json!({"data": {"msg": "player_shoot"}})),
+            ),
             // cpu-profile node "shoot" first sampled at 1_001_000
             chunk(
                 1_002_000.0,
-                &[(1, "(root)", "", None), (9, "shoot", "http://x/weapon.ts", Some(1))],
+                &[
+                    (1, "(root)", "", None),
+                    (9, "shoot", "http://x/weapon.ts", Some(1)),
+                ],
                 &[9, 9],
                 &[1000.0, 1000.0],
             ),
@@ -1129,7 +1397,11 @@ mod tests {
             ev("Profile", "P", 1_000_000.0, None, None),
             chunk(
                 1_002_000.0,
-                &[(1, "(root)", "", None), (7, "setup", "http://x/games/shooterX/game.ts", Some(1)), (8, "handleShoot", "http://x/weapon.ts", Some(1))],
+                &[
+                    (1, "(root)", "", None),
+                    (7, "setup", "http://x/games/shooterX/game.ts", Some(1)),
+                    (8, "handleShoot", "http://x/weapon.ts", Some(1)),
+                ],
                 &[7, 7, 8],
                 &[1000.0, 1000.0, 1000.0],
             ),
@@ -1149,22 +1421,184 @@ mod tests {
     #[test]
     fn frames_section_golden() {
         let events = vec![
-            ev("SubmitCompositorFrameToPresentationCompositorFrame", "b", 1_000_000.0, None, None),
-            ev("SubmitCompositorFrameToPresentationCompositorFrame", "e", 1_016_000.0, None, None),
-            ev("SubmitCompositorFrameToPresentationCompositorFrame", "b", 1_017_000.0, None, None),
-            ev("SubmitCompositorFrameToPresentationCompositorFrame", "e", 1_037_000.0, None, None),
+            ev(
+                "SubmitCompositorFrameToPresentationCompositorFrame",
+                "b",
+                1_000_000.0,
+                None,
+                None,
+            ),
+            ev(
+                "SubmitCompositorFrameToPresentationCompositorFrame",
+                "e",
+                1_016_000.0,
+                None,
+                None,
+            ),
+            ev(
+                "SubmitCompositorFrameToPresentationCompositorFrame",
+                "b",
+                1_017_000.0,
+                None,
+                None,
+            ),
+            ev(
+                "SubmitCompositorFrameToPresentationCompositorFrame",
+                "e",
+                1_037_000.0,
+                None,
+                None,
+            ),
             ev("DroppedFrame", "I", 1_003_000.0, None, None),
             ev("DroppedFrame", "I", 1_004_000.0, None, None),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
-        let (md, json) = frames_section(&events, &scope, "SubmitCompositorFrameToPresentationCompositorFrame", 1_000_000.0);
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, json) = frames_section(
+            &events,
+            &scope,
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            1_000_000.0,
+        );
         assert!(md.contains("2 paired"), "md: {}", md);
         assert!(md.contains("Dropped frames**: 2"), "md: {}", md);
         let row = json.as_array().unwrap()[0].clone();
         assert_eq!(row["count"], 2);
-        assert_eq!(row["p50_us"], 20_000.0); // nearest-rank index round(0.5 * 1) = 1
+        // Linear interpolation over [16000, 20000].
+        assert_eq!(row["p50_us"], 18_000.0);
+        assert_eq!(row["p90_us"], 19_600.0);
+        assert_eq!(row["p99_us"], 19_960.0);
         assert_eq!(row["max_us"], 20_000.0);
         assert_eq!(row["dropped_frames"], 2);
+    }
+
+    fn tick(ts: f64) -> TraceEvent {
+        ev(
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            "b",
+            ts,
+            None,
+            None,
+        )
+    }
+
+    /// 120Hz cadence (~8.33ms ticks) → 8333µs budget.
+    #[test]
+    fn budget_detects_120hz() {
+        let events: Vec<TraceEvent> = (0..6)
+            .map(|i| tick(1_000_000.0 + i as f64 * 8_333.0))
+            .collect();
+        assert_eq!(detect_frame_budget_us(&events), 8_333.0);
+    }
+
+    /// 90Hz cadence (~11.1ms ticks) → 11111µs budget.
+    #[test]
+    fn budget_detects_90hz() {
+        let events: Vec<TraceEvent> = (0..6)
+            .map(|i| tick(1_000_000.0 + i as f64 * 11_111.0))
+            .collect();
+        assert_eq!(detect_frame_budget_us(&events), 11_111.0);
+    }
+
+    /// 60Hz cadence (~16.67ms ticks) → 16667µs budget.
+    #[test]
+    fn budget_detects_60hz() {
+        let events: Vec<TraceEvent> = (0..6)
+            .map(|i| tick(1_000_000.0 + i as f64 * 16_667.0))
+            .collect();
+        assert_eq!(detect_frame_budget_us(&events), 16_667.0);
+    }
+
+    /// Too few ticks, or none at all → 60Hz fallback.
+    #[test]
+    fn budget_falls_back_without_ticks() {
+        assert_eq!(detect_frame_budget_us(&[]), 16_667.0);
+        let events = vec![tick(1_000_000.0), tick(1_008_333.0)];
+        assert_eq!(detect_frame_budget_us(&events), 16_667.0);
+    }
+
+    /// DrawFrame ticks are used when no compositor presentation events exist.
+    #[test]
+    fn budget_falls_back_to_drawframe() {
+        let events: Vec<TraceEvent> = (0..5)
+            .map(|i| {
+                ev(
+                    "DrawFrame",
+                    "b",
+                    1_000_000.0 + i as f64 * 8_333.0,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        assert_eq!(detect_frame_budget_us(&events), 8_333.0);
+    }
+
+    /// Shared dropped-frame counter honors scope and the profiler freeze.
+    #[test]
+    fn dropped_frames_helper_matches_section() {
+        let events = vec![
+            tick(1_000_000.0),
+            ev("DroppedFrame", "I", 1_003_000.0, None, None),
+            ev("DroppedFrame", "I", 2_000_000.0, None, None),
+        ];
+        let scope = Scope {
+            window: Some((0.0, 1_500_000.0)),
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        assert_eq!(dropped_frames(&events, Some(&scope)), 1);
+        assert_eq!(dropped_frames(&events, None), 2);
+        let (_, json) = frames_section(
+            &events,
+            &scope,
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            1_000_000.0,
+        );
+        assert_eq!(json[0]["dropped_frames"], 1);
+    }
+
+    /// `_with_budget` reports the budget without changing the stats.
+    #[test]
+    fn frames_section_with_budget_reports_budget() {
+        let events = vec![
+            tick(1_000_000.0),
+            ev(
+                "SubmitCompositorFrameToPresentationCompositorFrame",
+                "e",
+                1_016_000.0,
+                None,
+                None,
+            ),
+        ];
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, json) = frames_section_with_budget(
+            &events,
+            &scope,
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            1_000_000.0,
+            8_333.0,
+        );
+        assert!(md.contains("Frame budget**: 8.33ms"), "md: {}", md);
+        assert_eq!(json[0]["frame_budget_us"], 8_333.0);
+        assert_eq!(json[0]["count"], 1);
+        let (md_plain, _) = frames_section(
+            &events,
+            &scope,
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            1_000_000.0,
+        );
+        assert!(!md_plain.contains("Frame budget"));
     }
 
     /// GC golden: 1 Major (5ms), 1 Minor (1ms), 1 long task ≥50ms (600ms).
@@ -1176,7 +1610,12 @@ mod tests {
             ev("RunTask", "X", 1_000_000.0, Some(600_000.0), None),
             ev("RunTask", "X", 1_050_000.0, Some(20_000.0), None),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (md, json) = gc_section(&events, &scope, 50.0, 1_000_000.0);
         assert!(md.contains("| MajorGC | 1 | 5.00 | 5.00 |"));
         assert!(md.contains("Long tasks >50ms**: 1 total, 600.0ms combined"));
@@ -1195,7 +1634,11 @@ mod tests {
             ev("Profile", "P", 1_000_000.0, None, None),
             chunk(
                 1_055_000.0,
-                &[(1, "(root)", "", None), (2, "shoot", "", Some(1)), (3, "update", "", Some(1))],
+                &[
+                    (1, "(root)", "", None),
+                    (2, "shoot", "", Some(1)),
+                    (3, "update", "", Some(1)),
+                ],
                 &[2, 3, 2, 3, 2, 3, 2],
                 &[5000.0; 7],
             ),
@@ -1214,7 +1657,10 @@ mod tests {
         assert!(md.contains("Delta: PRE → SHOOT → POST"));
         let obj = json.as_object().unwrap();
         let metrics = obj["metrics"].as_array().unwrap();
-        let cpu = metrics.iter().find(|m| m["metric"] == "CPU samples").unwrap();
+        let cpu = metrics
+            .iter()
+            .find(|m| m["metric"] == "CPU samples")
+            .unwrap();
         assert_eq!(cpu["pre"], 0.0);
         assert_eq!(cpu["shoot"], 30.0); // ms in the delta table
         assert_eq!(cpu["delta_pre"], 30.0); // 30ms
@@ -1223,7 +1669,10 @@ mod tests {
     /// CSV escaping: commas, quotes and newlines inside fields.
     #[test]
     fn csv_escapes_fields() {
-        let rows = serde_json::from_str::<Vec<Value>>(r#"[{"a": "x,y", "b": 1}, {"a": "say \"hi\"", "b": 2}]"#).unwrap();
+        let rows = serde_json::from_str::<Vec<Value>>(
+            r#"[{"a": "x,y", "b": 1}, {"a": "say \"hi\"", "b": 2}]"#,
+        )
+        .unwrap();
         let csv = rows_to_csv(&rows);
         assert_eq!(csv, "a,b\n\"x,y\",1\n\"say \"\"hi\"\"\",2\n");
     }

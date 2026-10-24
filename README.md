@@ -222,6 +222,13 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--gaps` | Inter-event gap distribution, cadence (Hz), jitter & sequence (use with `--events`) |
 | `--frame-tree` | Browser frame & document hierarchy from `TracingStartedInBrowser` (iframes, SVGs, pids) |
 | `--async` | Async task timings (`s`/`f` paired by id): per-name percentiles + longest tasks |
+| `--loading` | Loading milestones: FCP/LCP candidates, navigation timings, user timing |
+| `--network` | Request lifecycle (Resource*/XHR): counts, cache hits, render-blocking, slowest |
+| `--raster` | Compositor/raster/GPU lanes + decode hotspots (`Decode Image`, `PaintImage`) |
+| `--coverage` | Trust diagnostics: parsed/skipped/malformed, recognized vs unrecognized events |
+| `--frame-budget <ms>` | Frame budget override (0/auto = detect refresh rate from frame cadence) |
+| `--full-on-miss` | Fall back to full trace when `--anchor`/`--worst` finds nothing (default: error) |
+| `--fail-on-regressed` | Exit 3 when a compare finding is `Regressed` (for CI) |
 | `--sort <m>` | Sort `--events`/`--names`: `ts` (default), `dur`, `name`, `count` |
 | `--tid <n\|main>` | Restrict to this thread (numeric tid or `main`) |
 | `--pid <n>` | Restrict to this process |
@@ -231,9 +238,25 @@ chperf trace.json --frames --csv | cut -d, -f1,2
 | `--window <ms>` | Half-width of the window (default 100) |
 | `--min-dur <us>` | Only events with duration ≥ this (microseconds) |
 | `--top <n>` | Limit rows (default 30) |
-| `--bucket <ms>` | Timeline bucket size (default auto ~40 buckets, 10–500ms) |
+| `--bucket <ms>` | Timeline bucket size (default auto ~40 buckets, 10–500ms); also sets the jank cluster bucket |
 
 ## Features
+
+### Trace Health
+
+Every full report opens with a trust block: events parsed / skipped / malformed,
+main thread, trace span, detected frame budget (60/90/120Hz from frame cadence),
+and throttles. `--coverage` adds the recognized-vs-unrecognized event split, so
+you can tell "no problem" apart from "not detected".
+
+### Machine-Readable Output
+
+`--json` with no inspect query emits the full report as JSON (summary, event
+stats with self-time, frame-blocking tasks, jank clusters, loading, network,
+raster, compare findings). Every inspect query also supports `--json`/`--csv`.
+Exit codes: `0` ok, `1` parse/IO errors (incl. per-file batch failures),
+`2` usage/scope errors (anchor miss, modifiers without a query), `3` compare
+regressions with `--fail-on-regressed`.
 
 ### Auto-detected Trace Metadata
 

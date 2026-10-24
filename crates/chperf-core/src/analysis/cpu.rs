@@ -38,11 +38,21 @@ pub struct FunctionTime {
     pub source_type: SourceType,
 }
 
+/// How a sampled function is attributed. Percentages derived from
+/// `CpuProfileResult` totals (`app_time_us` etc. over `total_sample_time_us`)
+/// are shares **of sampled time** — the denominator is profiler sample
+/// weight, not trace wall-clock time.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SourceType {
-    Runtime,  // framework/library
-    AppCode,  // user application code
-    Native,   // browser internals / no URL
+    /// Framework/library code: `node_modules` or a known framework package
+    /// (`svelte`, `react`, `vue`, `angular`, `polyfill`). Bundler output
+    /// (`chunk-*`, `.min.`, `vendor`) is NOT runtime — it is usually the
+    /// app's own code after bundling.
+    Runtime, // framework/library
+    /// User application code: anything with a URL that is not `Runtime`.
+    AppCode, // user application code
+    /// Browser internals: no URL at all.
+    Native, // browser internals / no URL
 }
 
 impl SourceType {
@@ -55,6 +65,10 @@ impl SourceType {
     }
 }
 
+/// Classify a script URL. Only `node_modules` and known framework packages
+/// count as `Runtime`; app bundles (`chunk-*`, `.min.js`, `vendor`, …) are
+/// the app's own code after bundling and classify as `AppCode`. Empty URL =
+/// `Native` (browser internals).
 fn classify_url(url: &str) -> SourceType {
     if url.is_empty() {
         return SourceType::Native;
@@ -66,9 +80,6 @@ fn classify_url(url: &str) -> SourceType {
         || lower.contains("vue")
         || lower.contains("angular")
         || lower.contains("polyfill")
-        || lower.contains("vendor")
-        || lower.contains("chunk-")
-        || lower.contains(".min.")
     {
         SourceType::Runtime
     } else {
@@ -79,9 +90,14 @@ fn classify_url(url: &str) -> SourceType {
 #[derive(Clone)]
 pub struct CpuProfileResult {
     pub functions: Vec<FunctionTime>,
+    /// Total profiler sample weight (µs). This is the denominator of every
+    /// "of sampled time" percentage — not trace wall-clock time.
     pub total_sample_time_us: f64,
+    /// Sample time attributed to `AppCode` functions (of sampled time).
     pub app_time_us: f64,
+    /// Sample time attributed to `Runtime` functions (of sampled time).
     pub runtime_time_us: f64,
+    /// Sample time attributed to `Native` functions (of sampled time).
     pub native_time_us: f64,
 }
 
@@ -193,12 +209,15 @@ fn scan_profile_chunks_core(
             .chunks(chunk)
             .enumerate()
             .map(|(ci, c)| {
-                s.spawn(move || scan_profile_chunk(c, ci * chunk, scope, bases, first_chunks, windows))
+                s.spawn(move || {
+                    scan_profile_chunk(c, ci * chunk, scope, bases, first_chunks, windows)
+                })
             })
             .collect();
         let mut nodes: ProfileNodes = ProfileNodes::default();
-        let mut times: Vec<ProfileSelfTimes> =
-            (0..windows.len()).map(|_| ProfileSelfTimes::default()).collect();
+        let mut times: Vec<ProfileSelfTimes> = (0..windows.len())
+            .map(|_| ProfileSelfTimes::default())
+            .collect();
         for h in handles {
             let (n, t) = h.join().unwrap();
             for (id, v) in n {
@@ -352,8 +371,9 @@ fn scan_profile_chunk(
     windows: &[Option<(f64, f64)>],
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     let mut node_map: ProfileNodes = ProfileNodes::default();
-    let mut self_times: Vec<ProfileSelfTimes> =
-        (0..windows.len()).map(|_| ProfileSelfTimes::default()).collect();
+    let mut self_times: Vec<ProfileSelfTimes> = (0..windows.len())
+        .map(|_| ProfileSelfTimes::default())
+        .collect();
 
     for (i, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
@@ -395,9 +415,10 @@ fn scan_profile_chunk(
         }
 
         if let Some(scope) = scope
-            && !scope.allows_chunk(e) {
-                continue;
-            }
+            && !scope.allows_chunk(e)
+        {
+            continue;
+        }
         let samples = cpu_profile.samples;
         let time_deltas = data.time_deltas;
 
@@ -454,9 +475,7 @@ fn scan_profile_chunk(
                 if weight > 0.0 {
                     for (wi, w) in windows.iter().enumerate() {
                         if w.is_none_or(|(lo, hi)| sample_ts >= lo && sample_ts <= hi) {
-                            *self_times[wi]
-                                .entry((sess.0, sess.1, node_id))
-                                .or_default() += weight;
+                            *self_times[wi].entry((sess.0, sess.1, node_id)).or_default() += weight;
                         }
                     }
                 }
@@ -482,10 +501,19 @@ pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
 pub fn analyze_cpu_profile_full(events: &[TraceEvent]) -> (CpuProfileResult, CpuProfileCache) {
     let (node_map, self_times) = scan_profile_chunks(events, None, 5);
     let result = build_cpu_profile_result(&node_map, &self_times);
-    (result, CpuProfileCache { nodes: Arc::new(node_map), self_times })
+    (
+        result,
+        CpuProfileCache {
+            nodes: Arc::new(node_map),
+            self_times,
+        },
+    )
 }
 
-fn build_cpu_profile_result(node_map: &ProfileNodes, self_times: &ProfileSelfTimes) -> CpuProfileResult {
+fn build_cpu_profile_result(
+    node_map: &ProfileNodes,
+    self_times: &ProfileSelfTimes,
+) -> CpuProfileResult {
     // Aggregate per node first, then merge into one row per (name, url): a
     // function sampled at several call sites (recursion) has one node per
     // frame, and per-node rows would split — or, after sorting, mislead
@@ -596,7 +624,12 @@ mod tests {
         }
     }
 
-    fn chunk_event(ts: f64, nodes: &[(u64, &str, Option<u64>)], samples: &[u64], deltas: &[f64]) -> TraceEvent {
+    fn chunk_event(
+        ts: f64,
+        nodes: &[(u64, &str, Option<u64>)],
+        samples: &[u64],
+        deltas: &[f64],
+    ) -> TraceEvent {
         let nodes_json: Vec<serde_json::Value> = nodes
             .iter()
             .map(|(id, name, parent)| {
@@ -637,8 +670,11 @@ mod tests {
         }
     }
 
-    const NODES_ABC: [(u64, &str, Option<u64>); 3] =
-        [(1, "(root)", None), (2, "shoot", Some(1)), (3, "update", Some(1))];
+    const NODES_ABC: [(u64, &str, Option<u64>); 3] = [
+        (1, "(root)", None),
+        (2, "shoot", Some(1)),
+        (3, "update", Some(1)),
+    ];
 
     /// Fixture mirroring tests/fixtures/tiny.json: profile starts at 1e6,
     /// chunk 1 = 7 samples of 5ms (shoot/update alternating), chunk 2 has a
@@ -647,7 +683,12 @@ mod tests {
     fn fixture_events() -> Vec<TraceEvent> {
         vec![
             profile_event(1_000_000.0),
-            chunk_event(1_055_000.0, &NODES_ABC, &[2, 3, 2, 3, 2, 3, 2], &[5000.0; 7]),
+            chunk_event(
+                1_055_000.0,
+                &NODES_ABC,
+                &[2, 3, 2, 3, 2, 3, 2],
+                &[5000.0; 7],
+            ),
             chunk_event(
                 1_095_000.0,
                 &[(1, "(root)", None), (4, "shoot", Some(1))],
@@ -690,7 +731,12 @@ mod tests {
         let nodes = &[(1, "(root)", None), (2, "spatialWebAudioUpdater", Some(1))];
         let events = vec![
             profile_event(0.0),
-            chunk_event(0.0, nodes, &[2, 2, 2, 2], &[360_000.0, 1_000.0, 1_000.0, 1_000.0]),
+            chunk_event(
+                0.0,
+                nodes,
+                &[2, 2, 2, 2],
+                &[360_000.0, 1_000.0, 1_000.0, 1_000.0],
+            ),
             chunk_event(1_000_000.0, nodes, &[2], &[50_000.0]),
         ];
         // Fast path: capped at the median of chunk 1's other deltas (1ms) →
@@ -768,10 +814,7 @@ mod tests {
         // Same node id 2, different sessions: both names survive; each keeps
         // its own self-time (A capped at 1ms interval; B at its own 500µs).
         assert_eq!(nodes.get(&nk(2)).map(|n| n.0.as_str()), Some("funcA"));
-        assert_eq!(
-            nodes.get(&(3, 65, 2)).map(|n| n.0.as_str()),
-            Some("funcB")
-        );
+        assert_eq!(nodes.get(&(3, 65, 2)).map(|n| n.0.as_str()), Some("funcB"));
         assert_eq!(*times.get(&nk(2)).unwrap_or(&0.0), 3_000.0);
         assert_eq!(*times.get(&(3, 65, 2)).unwrap_or(&0.0), 1_000.0);
         // Aggregated per (name, url): funcB is not folded into funcA.
@@ -852,7 +895,9 @@ mod tests {
         // occasional negative values.
         let mut state = 0x1234_5678_9abc_def0u64;
         let mut rng = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state >> 33
         };
         let mut events: Vec<TraceEvent> = Vec::new();
@@ -861,12 +906,20 @@ mod tests {
             let deltas: Vec<f64> = (0..8).map(|_| (rng() % 11) as f64 - 1.0).collect();
             events.push(chunk_event(
                 1_000_000.0 + i as f64 * 10_000.0,
-                &[(1, "(root)", None), (2, "a", Some(1)), (3, "b", Some(1)), (4, "c", Some(1))],
+                &[
+                    (1, "(root)", None),
+                    (2, "a", Some(1)),
+                    (3, "b", Some(1)),
+                    (4, "c", Some(1)),
+                ],
                 &samples,
                 &deltas,
             ));
             events.push(plain_event(1_000_000.0 + i as f64 * 10_000.0, "RunTask"));
-            events.push(plain_event(1_000_000.0 + i as f64 * 10_000.0 + 1.0, "Paint"));
+            events.push(plain_event(
+                1_000_000.0 + i as f64 * 10_000.0 + 1.0,
+                "Paint",
+            ));
         }
         assert!(events.len() >= 64_000);
 
@@ -878,7 +931,12 @@ mod tests {
         }
         assert_eq!(times_serial[0].len(), times_par[0].len());
         for (id, t) in &times_serial[0] {
-            assert_eq!(times_par[0].get(id), Some(t), "node {:?} self-time diverged", id);
+            assert_eq!(
+                times_par[0].get(id),
+                Some(t),
+                "node {:?} self-time diverged",
+                id
+            );
         }
     }
 
@@ -887,10 +945,20 @@ mod tests {
         // The REPL cache is only consulted for an empty scope; it must return
         // exactly what a fresh full-trace scan would.
         let events = fixture_events();
-        let empty = Scope { window: None, tid: None, pid: None, cat: None };
+        let empty = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (result, cache) = analyze_cpu_profile_full(&events);
         assert!(cache.serves(&empty));
-        assert!(!cache.serves(&Scope { window: Some((0.0, 1.0)), tid: None, pid: None, cat: None }));
+        assert!(!cache.serves(&Scope {
+            window: Some((0.0, 1.0)),
+            tid: None,
+            pid: None,
+            cat: None
+        }));
 
         let (cached_nodes, cached_times) = cpu_profile_for(&events, &empty, Some(&cache));
         let (fresh_nodes, fresh_times) = cpu_profile_for(&events, &empty, None);

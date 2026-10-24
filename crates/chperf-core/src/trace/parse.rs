@@ -1,15 +1,35 @@
 //! The hand-rolled, block-parallel `traceEvents` tokenizer and `parse_trace`.
 
+use super::event::{normalize_id_bytes, parse_tid_pid_str, take_serde_malformed};
 use super::{FrameInfo, TraceEvent, TraceFile, TraceMetadata, intern_name};
 use std::io::Read;
 use std::path::Path;
 
+/// Counters for how a trace parsed. Filled by `parse_trace` (fast path,
+/// parallel pipeline and serde fallbacks all fold into the same counters):
+/// `parsed` per successfully parsed event, `skipped` per event dropped
+/// (structurally unusable — never fails the file), `malformed` per event
+/// whose fields were usable only after coercion (numeric strings, clamped
+/// negative durations) or unusable (drops also count here).
+#[derive(Default, Clone, Debug, serde::Serialize)]
+pub struct ParseStats {
+    pub parsed: usize,
+    pub skipped: usize,
+    pub malformed: usize,
+}
+
 /// Fast path: parse all elements in a chunk's byte range [s, e) without
 /// serde. Elements are objects separated by commas (whitespace allowed).
 /// Returns Err when ANY element uses a construct the fast parser bails on
-/// (escaped strings, wrong-typed fields, malformed shapes) — the caller
-/// then falls back to the serde path on the pristine bytes.
-fn parse_events_fast(bytes: &[u8], s: usize, e: usize) -> Result<Vec<TraceEvent>, ()> {
+/// (escaped strings, unterminated input) — the caller then falls back to a
+/// tolerant per-element serde parse on the pristine bytes. Wrong-typed but
+/// salvageable fields never bail: they coerce (counted in `stats`).
+fn parse_events_fast(
+    bytes: &[u8],
+    s: usize,
+    e: usize,
+    stats: &mut ParseStats,
+) -> Result<Vec<TraceEvent>, ()> {
     // ~200 bytes per event on Chrome traces: reserve to skip reallocs.
     let mut events: Vec<TraceEvent> = Vec::with_capacity((e - s).max(1) / 200);
     let mut p = s;
@@ -26,14 +46,19 @@ fn parse_events_fast(bytes: &[u8], s: usize, e: usize) -> Result<Vec<TraceEvent>
             p += 1;
             continue;
         }
-        let (ev, next) = parse_event_fast(bytes, p)?;
+        let (ev, next) = parse_event_fast(bytes, p, stats)?;
         events.push(ev);
+        stats.parsed += 1;
         p = next;
     }
     Ok(events)
 }
 
-fn parse_events_array_fast(bytes: &[u8], s: usize) -> Result<(Vec<TraceEvent>, usize), ()> {
+fn parse_events_array_fast(
+    bytes: &[u8],
+    s: usize,
+    stats: &mut ParseStats,
+) -> Result<(Vec<TraceEvent>, usize), ()> {
     let len = bytes.len();
     let mut p = skip_ws(bytes, s);
     if p >= len || bytes[p] != b'[' {
@@ -53,8 +78,9 @@ fn parse_events_array_fast(bytes: &[u8], s: usize) -> Result<(Vec<TraceEvent>, u
             p += 1;
             continue;
         }
-        let (ev, next) = parse_event_fast(bytes, p)?;
+        let (ev, next) = parse_event_fast(bytes, p, stats)?;
         events.push(ev);
+        stats.parsed += 1;
         p = next;
     }
 }
@@ -68,6 +94,7 @@ fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
     p += 1;
     let mut trace_events: Option<Vec<TraceEvent>> = None;
     let mut metadata_span: Option<(usize, usize)> = None;
+    let mut stats = ParseStats::default();
 
     loop {
         p = skip_ws(bytes, p);
@@ -93,7 +120,7 @@ fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
             return Err(());
         }
         if key == b"traceEvents" {
-            let (evs, next_p) = parse_events_array_fast(bytes, p)?;
+            let (evs, next_p) = parse_events_array_fast(bytes, p, &mut stats)?;
             trace_events = Some(evs);
             p = next_p;
         } else if key == b"metadata" {
@@ -113,12 +140,20 @@ fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
     Ok(TraceFile {
         trace_events,
         metadata,
+        stats,
     })
 }
 
 /// Parse one event object starting at bytes[p] == b'{'. Returns the event
-/// and the position after its closing '}'.
-fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
+/// and the position after its closing '}'. Wrong-typed but salvageable
+/// fields coerce in place (numeric strings for ts/dur/pid/tid, clamped
+/// negative dur) and count `malformed`; only constructs the serde fallback
+/// handles (escaped strings, unterminated input) return Err.
+fn parse_event_fast(
+    bytes: &[u8],
+    p: usize,
+    stats: &mut ParseStats,
+) -> Result<(TraceEvent, usize), ()> {
     let len = bytes.len();
     let mut i = p;
     if i >= len || bytes[i] != b'{' {
@@ -171,45 +206,141 @@ fn parse_event_fast(bytes: &[u8], p: usize) -> Result<(TraceEvent, usize), ()> {
                 i = a;
             }
             b"id" => {
-                // Lenient: async ids are ints in practice, but a string /
-                // negative / float id must not fail the whole chunk — it just
-                // leaves `has_id` false and pairing skips the event.
-                match parse_num_u64(bytes, i) {
-                    Ok((v, a)) => {
+                // Integers pair directly. A string id normalizes the same
+                // way as `id2` (decimal/hex/hash) so `s`/`f` pairing by
+                // (pid, id) agrees with the serde fallback; negatives stay
+                // unpaired. An object is parsed leniently as `id2`.
+                if bytes[i] == b'"' {
+                    let (inner, a) = parse_quoted_inner(bytes, i)?;
+                    if let Some(v) = normalize_id_bytes(inner) {
                         ev.id = v;
                         ev.has_id = true;
-                        i = a;
                     }
-                    Err(_) => {
-                        i = skip_value(bytes, i)?;
+                    stats.malformed += 1;
+                    i = a;
+                } else if bytes[i] == b'{' {
+                    let (opt, a) = parse_id2_object(bytes, i)?;
+                    if let Some(v) = opt {
+                        ev.id = v;
+                        ev.has_id = true;
+                    }
+                    i = a;
+                } else {
+                    match parse_num_u64(bytes, i) {
+                        Ok((v, a)) => {
+                            ev.id = v;
+                            ev.has_id = true;
+                            i = a;
+                        }
+                        Err(_) => {
+                            i = skip_value(bytes, i)?;
+                        }
+                    }
+                }
+            }
+            b"id2" => {
+                // Chrome async ids: `{"local":"0x…","global":"…"}` (either
+                // field may be a string or a number). Prefer `local`; the
+                // normalization matches the serde fallback exactly.
+                if bytes[i] == b'{' {
+                    let (opt, a) = parse_id2_object(bytes, i)?;
+                    if let Some(v) = opt {
+                        ev.id = v;
+                        ev.has_id = true;
+                    }
+                    i = a;
+                } else if bytes[i] == b'"' {
+                    let (inner, a) = parse_quoted_inner(bytes, i)?;
+                    if let Some(v) = normalize_id_bytes(inner) {
+                        ev.id = v;
+                        ev.has_id = true;
+                    }
+                    i = a;
+                } else {
+                    match parse_num_u64(bytes, i) {
+                        Ok((v, a)) => {
+                            ev.id = v;
+                            ev.has_id = true;
+                            i = a;
+                        }
+                        Err(_) => {
+                            i = skip_value(bytes, i)?;
+                        }
                     }
                 }
             }
             b"ts" => {
-                let (v, a) = parse_num_f64(bytes, i)?;
-                ev.ts = v;
-                i = a;
+                // Numeric strings coerce (counted); explicit null reads as
+                // absent; other wrong types keep the event at 0.0 (counted).
+                if bytes[i] == b'n' {
+                    if !is_literal_null(bytes, i) {
+                        return Err(());
+                    }
+                    i = skip_value(bytes, i)?;
+                } else if bytes[i] == b'"' {
+                    let (inner, a) = parse_quoted_inner(bytes, i)?;
+                    let s = std::str::from_utf8(inner).map_err(|_| ())?;
+                    ev.ts = s.trim().parse::<f64>().map_err(|_| ())?;
+                    stats.malformed += 1;
+                    i = a;
+                } else {
+                    match parse_num_f64(bytes, i) {
+                        Ok((v, a)) => {
+                            ev.ts = v;
+                            i = a;
+                        }
+                        Err(_) => {
+                            i = skip_value(bytes, i)?;
+                            stats.malformed += 1;
+                        }
+                    }
+                }
             }
             b"dur" => {
+                // Numeric strings coerce and negatives clamp to 0.0 (both
+                // counted, event kept); other wrong types keep None (counted).
                 if bytes[i] == b'n' {
                     if !is_literal_null(bytes, i) {
                         return Err(());
                     }
                     i = skip_value(bytes, i)?;
                     ev.dur = None;
-                } else {
-                    let (v, a) = parse_num_f64(bytes, i)?;
-                    ev.dur = Some(v);
+                } else if bytes[i] == b'"' {
+                    let (inner, a) = parse_quoted_inner(bytes, i)?;
+                    let s = std::str::from_utf8(inner).map_err(|_| ())?;
+                    stats.malformed += 1;
+                    ev.dur = match s.trim().parse::<f64>() {
+                        Ok(f) if f < 0.0 => Some(0.0),
+                        Ok(f) => Some(f),
+                        Err(_) => None,
+                    };
                     i = a;
+                } else {
+                    match parse_num_f64(bytes, i) {
+                        Ok((v, a)) => {
+                            if v < 0.0 {
+                                stats.malformed += 1;
+                                ev.dur = Some(0.0);
+                            } else {
+                                ev.dur = Some(v);
+                            }
+                            i = a;
+                        }
+                        Err(_) => {
+                            i = skip_value(bytes, i)?;
+                            stats.malformed += 1;
+                            ev.dur = None;
+                        }
+                    }
                 }
             }
             b"tid" => {
-                let (v, a) = parse_num_i64(bytes, i)?;
+                let (v, a) = parse_tid_pid_fast(bytes, i, stats)?;
                 ev.tid = v;
                 i = a;
             }
             b"pid" => {
-                let (v, a) = parse_num_i64(bytes, i)?;
+                let (v, a) = parse_tid_pid_fast(bytes, i, stats)?;
                 ev.pid = v;
                 i = a;
             }
@@ -304,6 +435,149 @@ fn parse_string_intern(bytes: &[u8], p: usize) -> Result<(&'static str, usize), 
         }
         None => Err(()),
     }
+}
+
+/// Inner bytes of a quoted string value with no escapes. Escaped or
+/// unterminated strings bail to the serde fallback (same contract as
+/// `parse_string_intern`). Returns (inner bytes, pos after closing quote).
+fn parse_quoted_inner(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
+    let len = bytes.len();
+    if p >= len || bytes[p] != b'"' {
+        return Err(());
+    }
+    match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
+        Some(rel) => {
+            let q = p + 1 + rel;
+            if bytes[q] == b'\\' {
+                return Err(());
+            }
+            Ok((&bytes[p + 1..q], q + 1))
+        }
+        None => Err(()),
+    }
+}
+
+/// Parse an `id2` object (`{"local":"0x…","global":"…"}`), preferring
+/// `local`. String and number forms normalize exactly like `id`; anything
+/// else leaves "no id". Returns the id (if any) and the position after the
+/// object.
+fn parse_id2_object(bytes: &[u8], p: usize) -> Result<(Option<u64>, usize), ()> {
+    let end = skip_value(bytes, p)?;
+    let inner = &bytes[p..end];
+    Ok((
+        id2_field(inner, b"\"local\"").or_else(|| id2_field(inner, b"\"global\"")),
+        end,
+    ))
+}
+
+/// First `key` occurrence's value inside an `id2` object slice: quoted
+/// strings normalize (decimal/hex/hash), integers pass through, anything
+/// else (missing key, negative, nested value) is "no id".
+fn id2_field(inner: &[u8], key: &[u8]) -> Option<u64> {
+    let mut search = inner;
+    loop {
+        let rel = memchr::memmem::find(search, key)?;
+        let mut j = rel + key.len();
+        while j < search.len() && search[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= search.len() || search[j] != b':' {
+            search = &search[rel + 1..];
+            continue;
+        }
+        j += 1;
+        while j < search.len() && search[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= search.len() {
+            return None;
+        }
+        if search[j] == b'"' {
+            let (str_inner, _) = parse_quoted_inner(search, j).ok()?;
+            return normalize_id_bytes(str_inner);
+        }
+        if search[j].is_ascii_digit() {
+            return parse_num_u64(search, j).ok().map(|(v, _)| v);
+        }
+        return None;
+    }
+}
+
+/// tid/pid: integers (wrapping negatives), numeric strings, float truncation
+/// — the same coercions as the serde fallback. Wrong types become 0
+/// (counted); only structurally broken input bails out.
+fn parse_tid_pid_fast(bytes: &[u8], p: usize, stats: &mut ParseStats) -> Result<(u64, usize), ()> {
+    if p < bytes.len() && bytes[p] == b'"' {
+        let (inner, a) = parse_quoted_inner(bytes, p)?;
+        let s = std::str::from_utf8(inner).map_err(|_| ())?;
+        stats.malformed += 1;
+        return Ok((parse_tid_pid_str(s), a));
+    }
+    if let Ok((v, a)) = parse_num_i64(bytes, p) {
+        return Ok((v, a));
+    }
+    // Float (1.5 → 1, matching the serde `as u64` cast) or wrong type.
+    if let Ok((v, a)) = parse_num_f64(bytes, p) {
+        stats.malformed += 1;
+        return Ok((v as u64, a));
+    }
+    let end = skip_value(bytes, p)?;
+    stats.malformed += 1;
+    Ok((0, end))
+}
+
+/// Tolerant per-element parse of a slice known to hold `{…}` elements
+/// (separator commas optional). Each element is parsed from its own
+/// zero-copy slice: successes count `parsed` (plus any serde-fallback field
+/// coercions drained into `malformed`), structural failures count
+/// `skipped`/`malformed` and the walk continues — one bad event never fails
+/// the file.
+fn parse_slice_tolerant(bytes: &[u8], s: usize, e: usize) -> (Vec<TraceEvent>, ParseStats) {
+    let mut stats = ParseStats::default();
+    let mut events = Vec::new();
+    let mut i = s;
+    while i < e {
+        i = skip_ws(bytes, i);
+        if i >= e {
+            break;
+        }
+        if bytes[i] == b',' || bytes[i] == b']' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'{' {
+            // Non-object element (number, string, …): drop, keep going.
+            match skip_value(bytes, i) {
+                Ok(n) if n > i => {
+                    i = n;
+                    stats.skipped += 1;
+                    stats.malformed += 1;
+                }
+                _ => break,
+            }
+            continue;
+        }
+        match skip_value(bytes, i) {
+            Ok(end) if end > i => {
+                let slice = &bytes[i..end.min(e)];
+                match serde_json::from_slice::<TraceEvent>(slice) {
+                    Ok(ev) => {
+                        stats.parsed += 1;
+                        stats.malformed += take_serde_malformed();
+                        events.push(ev);
+                    }
+                    Err(_) => {
+                        take_serde_malformed();
+                        stats.skipped += 1;
+                        stats.malformed += 1;
+                    }
+                }
+                i = end;
+            }
+            _ => break,
+        }
+    }
+    (events, stats)
 }
 
 /// Event phase: the first byte of a quoted, unescaped string (`0` when the
@@ -411,7 +685,14 @@ fn parse_num_i64(bytes: &[u8], p: usize) -> Result<(u64, usize), ()> {
         false
     };
     let (v, next) = parse_num_u64(bytes, i)?;
-    Ok((if neg { (v as i64).wrapping_neg() as u64 } else { v }, next))
+    Ok((
+        if neg {
+            (v as i64).wrapping_neg() as u64
+        } else {
+            v
+        },
+        next,
+    ))
 }
 
 /// The value starting at p is exactly the literal `null` (not `nullx`).
@@ -420,7 +701,11 @@ fn is_literal_null(bytes: &[u8], p: usize) -> bool {
     if p + 4 > len || &bytes[p..p + 4] != b"null" {
         return false;
     }
-    p + 4 == len || matches!(bytes[p + 4], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+    p + 4 == len
+        || matches!(
+            bytes[p + 4],
+            b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'
+        )
 }
 
 /// Skip one JSON value starting at p (string, object, array, or number /
@@ -500,7 +785,8 @@ fn skip_value(bytes: &[u8], p: usize) -> Result<usize, ()> {
         }
         _ => {
             let mut i = p;
-            while i < len && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+            while i < len && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
                 i += 1;
             }
             if i == p {
@@ -604,8 +890,12 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
                     let mut prev_trail = prev_trail;
                     for (k, chunk) in seg.chunks(BLOCK).enumerate() {
                         let (nq, trail) = count_unescaped_quotes(chunk, prev_trail);
-                        unsafe { *ptr_q.add(lo + k) = nq % 2 == 1; }
-                        unsafe { *ptr_t.add(lo + k) = trail; }
+                        unsafe {
+                            *ptr_q.add(lo + k) = nq % 2 == 1;
+                        }
+                        unsafe {
+                            *ptr_t.add(lo + k) = trail;
+                        }
                         prev_trail = trail;
                     }
                 }));
@@ -664,7 +954,9 @@ fn build_blocks(bytes: &[u8]) -> Blocks {
                         let mut st = states[k];
                         let mut esc = escs[k];
                         walk_range(chunk, &mut dd, &mut st, &mut esc);
-                        unsafe { *ptr_d.add(lo + k) = dd; }
+                        unsafe {
+                            *ptr_d.add(lo + k) = dd;
+                        }
                     }
                 }));
             }
@@ -899,29 +1191,33 @@ fn parse_thread_count(n: &usize) -> usize {
         .max(1)
 }
 
-/// One thread's parse result: events plus the separator-comma positions it
-/// replaced (for restore on failure).
-type ChunkResult = Result<(Vec<TraceEvent>, Vec<usize>), String>;
+/// One thread's parse result: events plus this chunk's parse counters.
+type ChunkResult = Result<(Vec<TraceEvent>, ParseStats), String>;
+
+/// Whole parallel parse result: events, top-level metadata, parse counters.
+type ParallelResult =
+    Result<(Vec<TraceEvent>, Option<TraceMetadata>, ParseStats), Box<dyn std::error::Error>>;
 
 /// Parse the `traceEvents` array in parallel. Each thread walks its own byte
 /// range (starting from a block boundary with known exact state), finds the
-/// element ranges, replaces their separator commas with spaces in-place
-/// (StreamDeserializer rejects commas), then parses the slice directly from
-/// the original buffer — zero copying. On failure all commas are restored
-/// and the caller falls back to a whole-buffer parse.
+/// element ranges, then parses its slice directly from the buffer —
+/// zero-copy. Chunks never mutate the buffer: the fast tokenizer runs on the
+/// pristine bytes, and any slice it bails on goes through a tolerant
+/// per-element serde parse that skips structurally broken events (counted in
+/// `ParseStats`) instead of failing the chunk.
 fn parse_parallel(
     bytes: &mut [u8],
     layout: &Layout,
     blocks: &Blocks,
     threads: usize,
-) -> Result<(Vec<TraceEvent>, Option<TraceMetadata>), Box<dyn std::error::Error>> {
+) -> ParallelResult {
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let threads = threads.max(1);
     let span = layout.arr_close - layout.arr_open;
 
     let t_scope = std::time::Instant::now();
 
-    // Per-unit: (unit index, events, comma positions for restore).
+    // Per-unit: (unit index, chunk parse result).
     let results: Vec<(usize, ChunkResult)> = if threads <= 1 {
         let r = chunk_work(bytes, blocks, layout.arr_open, layout.arr_close);
         vec![(0, r)]
@@ -959,11 +1255,10 @@ fn parse_parallel(
                             let from = arr_open + idx * unit;
                             let to = (from + unit).min(arr_close);
                             let t0 = std::time::Instant::now();
-                            // Units are disjoint, so the serde-fallback comma
-                            // mutation is safe despite the shared raw pointer.
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts_mut(ptr as *mut u8, total_len)
-                            };
+                            // Units are disjoint read-only slices sharing the
+                            // buffer through a raw pointer (scope-confined).
+                            let bytes =
+                                unsafe { std::slice::from_raw_parts(ptr as *const u8, total_len) };
                             let r = chunk_work(bytes, blocks, from, to);
                             if debug {
                                 eprintln!(
@@ -987,20 +1282,22 @@ fn parse_parallel(
     let mut results = results;
     results.sort_by_key(|(idx, _)| *idx);
 
-    // Unwrap chunk results; on any failure restore commas and propagate.
+    // Unwrap chunk results and fold their stats.
     let mut parsed: Vec<Vec<TraceEvent>> = Vec::with_capacity(results.len());
-    let mut replaced: Vec<usize> = Vec::new();
+    let mut stats = ParseStats::default();
     for (_, r) in results {
         match r {
-            Ok((events, commas)) => {
+            Ok((events, chunk_stats)) => {
+                stats.parsed += chunk_stats.parsed;
+                stats.skipped += chunk_stats.skipped;
+                stats.malformed += chunk_stats.malformed;
                 parsed.push(events);
-                replaced.extend(commas);
             }
             Err(e) => {
-                for j in replaced {
-                    bytes[j] = b',';
-                }
-                return Err(Box::<dyn std::error::Error>::from(format!("chunk parse failed: {}", e)));
+                return Err(Box::<dyn std::error::Error>::from(format!(
+                    "chunk parse failed: {}",
+                    e
+                )));
             }
         }
     }
@@ -1021,32 +1318,33 @@ fn parse_parallel(
         events.append(&mut p);
     }
     if debug {
-        eprintln!("  [parse] merge: {:.1}ms", t_merge.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "  [parse] merge: {:.1}ms",
+            t_merge.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     let metadata = match layout.metadata {
         Some((s, e)) => serde_json::from_slice::<TraceMetadata>(&bytes[s..e]).ok(),
         None => None,
     };
-    Ok((events, metadata))
+    Ok((events, metadata, stats))
 }
 
 /// Walk `[from_block_start, to)` (extended to finish the element containing
-/// `to`), collecting element ranges starting ≥ `from`, mutating their
-/// separator commas, and parsing the slice. Returns the events and the
-/// mutated comma positions. The walk visits only structural positions
-/// (memchr-accelerated), not every byte.
+/// `to`), collecting the owned element range, and parsing the slice. The
+/// walk visits only structural positions (memchr-accelerated), not every
+/// byte. The buffer is never mutated; owned ranges are disjoint per chunk.
 fn chunk_work(
-    bytes: &mut [u8],
+    bytes: &[u8],
     blocks: &Blocks,
     from: usize,
     to: usize,
-) -> Result<(Vec<TraceEvent>, Vec<usize>), String> {
+) -> Result<(Vec<TraceEvent>, ParseStats), String> {
     let block = from / BLOCK;
     let start = block * BLOCK;
     let mut d = blocks.depth_at[block];
     let mut in_string = blocks.in_string_at[block];
-    let mut replaced: Vec<usize> = Vec::new();
 
     let mut first_start: Option<usize> = None;
     let mut last_end: usize = 0;
@@ -1119,16 +1417,6 @@ fn chunk_work(
                             first_start = Some(e);
                         }
                         last_end = i + 1;
-                        // Record the separator comma (skip whitespace);
-                        // mutation happens after the walk (the memchr
-                        // iterators hold an immutable borrow).
-                        let mut j = i + 1;
-                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                            j += 1;
-                        }
-                        if j < bytes.len() && bytes[j] == b',' && j < to {
-                            replaced.push(j);
-                        }
                         // Stop at the first element boundary at/after `to`
                         // even when the element *containing* `to` started
                         // before `from` (it belongs to the previous chunk):
@@ -1155,48 +1443,40 @@ fn chunk_work(
 
     let (s, e) = match (first_start, last_end) {
         (Some(s), e) if e > s => (s, e),
-        _ => return Ok((Vec::new(), replaced)),
+        _ => return Ok((Vec::new(), ParseStats::default())),
     };
 
-    // Fast path: hand-rolled tokenizer on the pristine bytes (separator commas
-    // intact). Any failure falls back to the serde stream path below.
+    // Fast path: hand-rolled tokenizer on the pristine bytes. Field
+    // coercions are counted in a temp (discarded when the fast path bails).
     let t_fast = std::time::Instant::now();
-    let fast = parse_events_fast(bytes, s, e);
-    if let Ok(events) = fast {
+    let mut fast_stats = ParseStats::default();
+    if let Ok(events) = parse_events_fast(bytes, s, e, &mut fast_stats) {
         if std::env::var("CHPERF_DEBUG").is_ok() {
-            eprintln!("  [parse] fast {}..{}: {:.1}ms, {} events", s, e, t_fast.elapsed().as_secs_f64() * 1000.0, events.len());
+            eprintln!(
+                "  [parse] fast {}..{}: {:.1}ms, {} events",
+                s,
+                e,
+                t_fast.elapsed().as_secs_f64() * 1000.0,
+                events.len()
+            );
         }
-        return Ok((events, Vec::new()));
+        return Ok((events, fast_stats));
     }
 
-    // Separator commas → spaces, in place (disjoint per chunk).
-    for j in &replaced {
-        bytes[*j] = b' ';
+    // Tolerant per-element serde parse on the pristine slice (no comma
+    // mutation): structurally broken events are skipped and counted, the
+    // rest are kept — a single bad event never fails the chunk.
+    if std::env::var("CHPERF_DEBUG").is_ok() {
+        eprintln!("  [parse] fast {}..{} failed, tolerant fallback", s, e);
     }
-
-    let events = serde_json::Deserializer::from_slice(&bytes[s..e])
-        .into_iter()
-        .collect::<Result<Vec<TraceEvent>, _>>()
-        .map_err(|err| {
-            // Restore this chunk's commas before returning: parse_parallel's
-            // Err arm only restores chunks that finished BEFORE this one, so
-            // a `?` here would leave the buffer corrupted for the
-            // whole-buffer fallback — its error would then point at spaces
-            // instead of the real defect.
-            for j in &replaced {
-                bytes[*j] = b',';
-            }
-            if std::env::var("CHPERF_DEBUG").is_ok() {
-                eprintln!("  [dbg] slice [{s}..{e}): {}", String::from_utf8_lossy(&bytes[s..e]));
-            }
-            format!("{}", err)
-        })?;
-    Ok((events, replaced))
+    Ok(parse_slice_tolerant(bytes, s, e))
 }
 
-
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
-    let mut file = std::fs::File::open(path)?;
+    // Drop any stale serde-fallback counts (unit tests deserialize events
+    // directly without draining).
+    take_serde_malformed();
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
     // Decompress (if .gz) and parse from an in-memory slice. This is far
     // faster than streaming serde_json through the gzip decoder: zlib-rs
     // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
@@ -1220,11 +1500,15 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             Some(isize.min(1 << 30))
         })();
         let mut out = Vec::with_capacity(hint.map(|h| h + 32).unwrap_or(0));
-        flate2::read::GzDecoder::new(file).read_to_end(&mut out)?;
+        flate2::read::GzDecoder::new(file)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
         out
     } else {
         let mut out = Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
-        file.take(u64::MAX).read_to_end(&mut out)?;
+        file.take(u64::MAX)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
         out
     };
     let bytes: &'static mut [u8] = Box::leak(bytes.into_boxed_slice());
@@ -1235,7 +1519,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     let mut trace: Option<TraceFile> = None;
     let mut scan_none = false;
     let t_fast = std::time::Instant::now();
-    if let Ok(tf) = parse_trace_fast(&bytes) {
+    if let Ok(tf) = parse_trace_fast(bytes) {
         if debug {
             eprintln!(
                 "  [parse] fast single-pass {:.1}ms: {} events",
@@ -1246,7 +1530,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         trace = Some(tf);
     } else {
         let t_scan = std::time::Instant::now();
-        if let Some((layout, blocks)) = scan_layout(&bytes) {
+        if let Some((layout, blocks)) = scan_layout(bytes) {
             if debug {
                 eprintln!(
                     "  [parse] scan {:.1}ms: array {}..{}, metadata={}",
@@ -1262,7 +1546,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
                 eprintln!("  [parse] threads: {}", threads);
             }
             match parse_parallel(bytes, &layout, &blocks, threads) {
-                Ok((trace_events, metadata)) => {
+                Ok((trace_events, metadata, stats)) => {
                     if debug {
                         eprintln!(
                             "  [parse] parallel {:.1}ms: {} events",
@@ -1273,6 +1557,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
                     trace = Some(TraceFile {
                         trace_events,
                         metadata,
+                        stats,
                     });
                 }
                 Err(e) if debug => eprintln!("  [parse] parallel failed: {}", e),
@@ -1285,31 +1570,45 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             }
         }
     }
-    // Fallback: whole-buffer parse (unusual layout, non-object elements, …).
-    // Note: must NOT use unwrap_or — its argument is evaluated eagerly and
-    // would re-parse the comma-mutated buffer on the happy path.
+    // Fallback: whole-buffer parse. First a direct decode (covers unusual but
+    // valid layouts); if any single event breaks it, a tolerant per-element
+    // pass keeps the good events and counts the bad ones — only a missing
+    // top-level "traceEvents" still fails the file.
     let mut trace = match trace {
         Some(t) => t,
         None => {
-            if scan_none
-                && memchr::memmem::find(&bytes, b"traceEvents").is_none()
-            {
+            if scan_none && memchr::memmem::find(bytes, b"traceEvents").is_none() {
                 return Err(format!(
                     "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
                     path.display()
                 )
                 .into());
             }
-            serde_json::from_slice(&bytes).map_err(|e| {
-                format!("{}: failed to parse trace: {}", path.display(), e)
-            })?
+            match serde_json::from_slice::<TraceFile>(bytes) {
+                Ok(mut t) => {
+                    t.stats.parsed = t.trace_events.len();
+                    t.stats.malformed += take_serde_malformed();
+                    t
+                }
+                Err(_) => parse_trace_tolerant(bytes, path)?,
+            }
         }
     };
     if debug {
         eprintln!("  [parse] trace ready: {} events", trace.trace_events.len());
     }
 
-    // Extract page URL and frames from TracingStartedInBrowser event
+    // An empty trace has no time base (downstream would compute -inf), so it
+    // is an error rather than a valid empty TraceFile.
+    if trace.trace_events.is_empty() {
+        return Err(format!("{}: trace has no events", path.display()).into());
+    }
+
+    // Extract page URL and frames from TracingStartedInBrowser events.
+    // Frames accumulate across ALL such events, merged by frame id (later
+    // events refresh url/name/process_id); page_url is the outermost main
+    // frame's URL, with a legacy `isMainFrame` fallback and a final
+    // first-non-blank fallback when no frame carries a main marker.
     {
         let meta = trace.metadata.get_or_insert(TraceMetadata {
             cpu_throttling: None,
@@ -1322,42 +1621,164 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             frames: Vec::new(),
         });
         if meta.page_url.is_none() || meta.frames.is_empty() {
+            let mut index: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for e in &trace.trace_events {
-                if e.name == "TracingStartedInBrowser" {
-                    if let Some(args) = e.args_value()
-                        && let Some(frames) = args
-                            .get("data")
-                            .and_then(|d| d.get("frames"))
-                            .and_then(|f| f.as_array())
-                        {
-                            for frame in frames {
-                                let id = frame.get("frame").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let parent_id = frame.get("parent").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                let process_id = frame.get("processId").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let is_main_frame = frame.get("isInPrimaryMainFrame").and_then(|v| v.as_bool()).unwrap_or(false)
-                                    || frame.get("isOutermostMainFrame").and_then(|v| v.as_bool()).unwrap_or(false);
-                                if meta.page_url.is_none() && !url.is_empty() && url != "about:blank" {
-                                    meta.page_url = Some(url.clone());
-                                }
-                                meta.frames.push(FrameInfo {
-                                    id,
-                                    parent_id,
-                                    process_id,
-                                    url,
-                                    name,
-                                    is_main_frame,
-                                });
-                            }
+                if e.name != "TracingStartedInBrowser" {
+                    continue;
+                }
+                let Some(args) = e.args_value() else {
+                    continue;
+                };
+                let Some(frames) = args
+                    .get("data")
+                    .and_then(|d| d.get("frames"))
+                    .and_then(|f| f.as_array())
+                else {
+                    continue;
+                };
+                for frame in frames {
+                    let Some(id) = frame.get("frame").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let parent_id = frame
+                        .get("parent")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let process_id = frame.get("processId").map(frame_process_id).unwrap_or(0);
+                    let url = frame
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = frame
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_main_frame = [
+                        "isInPrimaryMainFrame",
+                        "isOutermostMainFrame",
+                        "isMainFrame",
+                    ]
+                    .iter()
+                    .any(|k| frame.get(k).and_then(|v| v.as_bool()).unwrap_or(false));
+                    if let Some(&k) = index.get(id) {
+                        let f = &mut meta.frames[k];
+                        if !url.is_empty() {
+                            f.url = url;
                         }
-                    break;
+                        if !name.is_empty() {
+                            f.name = name;
+                        }
+                        if process_id != 0 {
+                            f.process_id = process_id;
+                        }
+                        if parent_id.is_some() {
+                            f.parent_id = parent_id;
+                        }
+                        f.is_main_frame |= is_main_frame;
+                    } else {
+                        index.insert(id.to_string(), meta.frames.len());
+                        meta.frames.push(FrameInfo {
+                            id: id.to_string(),
+                            parent_id,
+                            process_id,
+                            url,
+                            name,
+                            is_main_frame,
+                        });
+                    }
+                }
+            }
+            if meta.page_url.is_none() && !meta.frames.is_empty() {
+                let ids: std::collections::HashSet<&str> =
+                    meta.frames.iter().map(|f| f.id.as_str()).collect();
+                // Outermost main frame: a main frame whose parent is unknown.
+                let mut chosen = meta.frames.iter().position(|f| {
+                    f.is_main_frame && f.parent_id.as_deref().is_none_or(|p| !ids.contains(p))
+                });
+                // Any main frame (legacy markers included).
+                if chosen.is_none() {
+                    chosen = meta.frames.iter().position(|f| f.is_main_frame);
+                }
+                if let Some(k) = chosen {
+                    let url = meta.frames[k].url.clone();
+                    if !url.is_empty() && url != "about:blank" {
+                        meta.page_url = Some(url);
+                    }
+                }
+                // No main marker at all: first non-blank URL.
+                if meta.page_url.is_none()
+                    && let Some(url) = meta
+                        .frames
+                        .iter()
+                        .find(|f| !f.url.is_empty() && f.url != "about:blank")
+                        .map(|f| f.url.clone())
+                {
+                    meta.page_url = Some(url);
                 }
             }
         }
     }
 
     Ok(trace)
+}
+
+/// Whole-buffer tolerant fallback: decode the top-level value, then parse
+/// `traceEvents` element by element. Good events are kept, broken ones are
+/// skipped and counted (`skipped`/`malformed`) — only a missing/non-array
+/// `traceEvents` still fails the file (with path context).
+fn parse_trace_tolerant(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<TraceFile, Box<dyn std::error::Error>> {
+    take_serde_malformed();
+    let root: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("{}: failed to parse trace: {}", path.display(), e))?;
+    let arr = root
+        .get("traceEvents")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            Box::<dyn std::error::Error>::from(format!(
+                "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
+                path.display()
+            ))
+        })?;
+    let mut trace_events = Vec::with_capacity(arr.len());
+    let mut stats = ParseStats::default();
+    for item in arr {
+        match serde_json::from_value::<TraceEvent>(item.clone()) {
+            Ok(ev) => {
+                stats.parsed += 1;
+                stats.malformed += take_serde_malformed();
+                trace_events.push(ev);
+            }
+            Err(_) => {
+                take_serde_malformed();
+                stats.skipped += 1;
+                stats.malformed += 1;
+            }
+        }
+    }
+    let metadata = root
+        .get("metadata")
+        .and_then(|m| serde_json::from_value::<TraceMetadata>(m.clone()).ok());
+    Ok(TraceFile {
+        trace_events,
+        metadata,
+        stats,
+    })
+}
+
+/// `processId`: integer or numeric string, else 0.
+fn frame_process_id(v: &serde_json::Value) -> u64 {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1371,9 +1792,8 @@ mod tests {
     /// string was silently dropped. The block-start escape state must carry.
     #[test]
     fn escape_split_across_block_boundary_does_not_truncate() {
-        let mut json = String::from(
-            r#"{"traceEvents":[{"name":"trap","ph":"X","ts":1,"dur":1,"args":{"s":""#,
-        );
+        let mut json =
+            String::from(r#"{"traceEvents":[{"name":"trap","ph":"X","ts":1,"dur":1,"args":{"s":""#);
         // 16 (prefix) + 52 (trap event head) puts the next byte at 68.
         json.push_str(&"x".repeat(65_467));
         // Backslash now at byte 65535 (last of block 0), quote at 65536.
@@ -1395,7 +1815,8 @@ mod tests {
         assert_eq!(b[65_536], b'"');
         assert_eq!(b[65_537], b'y');
 
-        let path = std::env::temp_dir().join(format!("chperf-esc-split-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("chperf-esc-split-{}.json", std::process::id()));
         std::fs::write(&path, json).unwrap();
         let trace = parse_trace(&path).expect("parse must succeed");
         std::fs::remove_file(&path).ok();
@@ -1405,9 +1826,9 @@ mod tests {
         assert_eq!(trace.trace_events[300].name, "tail299");
     }
 
-    /// The fast tokenizer must capture async `id`s (integer) for s/f pairing,
-    /// leave `has_id` false when the field is absent, and not bail the chunk
-    /// on a string / negative id (those are simply left unpaired).
+    /// The fast tokenizer must capture async `id`s (integer and string) for
+    /// s/f pairing, leave `has_id` false when the field is absent or
+    /// negative, and not bail the chunk on either.
     #[test]
     fn fast_path_parses_async_ids_leniently() {
         let json = serde_json::json!({
@@ -1416,24 +1837,30 @@ mod tests {
                 {"name": "AnimationFrame", "ph": "f", "ts": 5_000.0, "pid": 1, "tid": 1, "id": 42},
                 {"name": "AnimationFrame", "ph": "s", "ts": 2_000.0, "pid": 1, "tid": 1},
                 {"name": "AnimationFrame", "ph": "s", "ts": 3_000.0, "pid": 1, "tid": 1, "id": "x7"},
+                {"name": "AnimationFrame", "ph": "f", "ts": 3_500.0, "pid": 1, "tid": 1, "id": "x7"},
                 {"name": "AnimationFrame", "ph": "s", "ts": 4_000.0, "pid": 1, "tid": 1, "id": -3}
             ]
         });
-        let path = std::env::temp_dir().join(format!("chperf-async-id-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("chperf-async-id-{}.json", std::process::id()));
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let trace = parse_trace(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
         let evs = &trace.trace_events;
-        assert_eq!(evs.len(), 5);
+        assert_eq!(evs.len(), 6);
         assert_eq!(evs[0].id, 42);
         assert!(evs[0].has_id);
         assert_eq!(evs[1].id, 42);
         assert!(evs[1].has_id);
-        // Absent / string / negative ids: present event, no id.
-        for (k, e) in evs.iter().enumerate().skip(2) {
-            assert!(!e.has_id, "event {} should have no id", k);
-        }
+        // Absent id: present event, no id.
+        assert!(!evs[2].has_id);
+        // String ids hash to a stable u64, so s/f with the same string pair.
+        assert!(evs[3].has_id);
+        assert!(evs[4].has_id);
+        assert_eq!(evs[3].id, evs[4].id);
+        // Negative ids stay unpaired.
+        assert!(!evs[5].has_id);
     }
 
     fn tiny_event(ts: f64) -> String {
@@ -1475,19 +1902,26 @@ mod tests {
             giant_end > to + BLOCK,
             "giant must close well beyond to + BLOCK"
         );
-        let mut buf = bytes.clone();
-        let (first, _) = chunk_work(&mut buf, &blocks, layout.arr_open, to).expect("chunk 1");
+        let buf = bytes.clone();
+        let (first, _) = chunk_work(&buf, &blocks, layout.arr_open, to).expect("chunk 1");
         assert_eq!(first.len(), 2, "first chunk owns tiny + giant");
         assert_eq!(first[0].name, "Tiny");
         assert_eq!(first[1].name, "BigEvent");
         let args_len = first[1].args_raw().map(|s| s.len()).unwrap_or(0);
         assert!(args_len > BLOCK, "giant args preserved, got {args_len}");
-        let (second, _) = chunk_work(&mut buf, &blocks, to, layout.arr_close).expect("chunk 2");
+        let (second, _) = chunk_work(&buf, &blocks, to, layout.arr_close).expect("chunk 2");
         assert_eq!(second.len(), 1, "second chunk owns only the trailing tiny");
         assert_eq!(second[0].name, "Tiny");
         assert_eq!(second[0].ts, 3.0);
-        let big_total = first.iter().chain(&second).filter(|e| e.name == "BigEvent").count();
-        assert_eq!(big_total, 1, "giant event exactly once across adjacent ranges");
+        let big_total = first
+            .iter()
+            .chain(&second)
+            .filter(|e| e.name == "BigEvent")
+            .count();
+        assert_eq!(
+            big_total, 1,
+            "giant event exactly once across adjacent ranges"
+        );
         assert_eq!(first.len() + second.len(), 3);
     }
 
@@ -1511,7 +1945,8 @@ mod tests {
         let mut all: Vec<Vec<super::super::TraceEvent>> = Vec::new();
         for threads in [1usize, 3, 4] {
             let mut buf = bytes.clone();
-            let (evs, _) = parse_parallel(&mut buf, &layout, &blocks, threads).expect("parallel");
+            let (evs, _, _) =
+                parse_parallel(&mut buf, &layout, &blocks, threads).expect("parallel");
             assert_eq!(evs.len(), 1000, "threads={threads}");
             all.push(evs);
         }
@@ -1525,5 +1960,281 @@ mod tests {
             let tsk: Vec<f64> = evs.iter().map(|e| e.ts).collect();
             assert_eq!(tsk, ts0, "event order differs for run {k}");
         }
+    }
+
+    fn write_trace(name: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("chperf-{}-{}.json", name, std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// `id2` objects pair like `id`: `local` (string or number) wins,
+    /// `global` is the fallback, and numeric locals equal plain integer ids.
+    #[test]
+    fn id2_pairs_like_id() {
+        let body = r#"{"traceEvents":[
+            {"name":"A","ph":"s","ts":1,"pid":1,"tid":1,"id2":{"local":"0xABC","global":"0xDEF"}},
+            {"name":"A","ph":"f","ts":5,"pid":1,"tid":1,"id2":{"local":"0xABC"}},
+            {"name":"B","ph":"s","ts":2,"pid":1,"tid":1,"id2":{"global":"g1"}},
+            {"name":"B","ph":"f","ts":6,"pid":1,"tid":1,"id2":{"global":"g1"}},
+            {"name":"C","ph":"s","ts":3,"pid":1,"tid":1,"id2":{"local":42}},
+            {"name":"C","ph":"f","ts":7,"pid":1,"tid":1,"id":42}
+        ]}"#;
+        let path = write_trace("id2", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let evs = &trace.trace_events;
+        assert_eq!(evs.len(), 6);
+        for e in evs {
+            assert!(e.has_id, "id2 event must carry an id");
+        }
+        assert_eq!(evs[0].id, evs[1].id, "same local string must pair");
+        assert_eq!(evs[2].id, evs[3].id, "same global string must pair");
+        assert_ne!(evs[0].id, evs[2].id, "local must win over global");
+        assert_eq!(evs[4].id, 42, "numeric local must equal the integer");
+        assert_eq!(
+            evs[4].id, evs[5].id,
+            "numeric id2 local must pair with plain id"
+        );
+        assert_eq!(trace.stats.parsed, 6);
+    }
+
+    /// `id2` ids are identical whether the event went through the fast
+    /// tokenizer or the serde fallback (forced here with an escaped name).
+    #[test]
+    fn id2_consistent_across_fallback() {
+        let fast_body = r#"{"traceEvents":[
+            {"name":"A","ph":"s","ts":1,"pid":1,"tid":1,"id2":{"local":"0xABC"}}
+        ]}"#;
+        // The escaped quote bails the fast single-pass into the parallel +
+        // tolerant-serde pipeline; the id2 event itself has no escapes.
+        let slow_body = r#"{"traceEvents":[
+            {"name":"A \"quoted\"","ph":"X","ts":0,"pid":1,"tid":1},
+            {"name":"A","ph":"s","ts":1,"pid":1,"tid":1,"id2":{"local":"0xABC"}}
+        ]}"#;
+        let fast_path = write_trace("id2-fast", fast_body);
+        let slow_path = write_trace("id2-slow", slow_body);
+        let fast = parse_trace(&fast_path).unwrap();
+        let slow = parse_trace(&slow_path).unwrap();
+        let _ = std::fs::remove_file(&fast_path);
+        let _ = std::fs::remove_file(&slow_path);
+        assert_eq!(fast.trace_events.len(), 1);
+        assert_eq!(slow.trace_events.len(), 2);
+        assert!(fast.trace_events[0].has_id);
+        assert!(slow.trace_events[1].has_id);
+        assert_eq!(
+            fast.trace_events[0].id, slow.trace_events[1].id,
+            "id2 must normalize identically on both parse paths"
+        );
+    }
+
+    /// Numeric strings for ts/dur/pid/tid coerce on both parse paths.
+    #[test]
+    fn string_numbers_accepted_for_ts_dur_pid_tid() {
+        let body = r#"{"traceEvents":[
+            {"name":"A","ph":"X","ts":"456.5","dur":"123","pid":"7","tid":"8"}
+        ]}"#;
+        let path = write_trace("strnum", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 1);
+        let e = &trace.trace_events[0];
+        assert_eq!(e.ts, 456.5);
+        assert_eq!(e.dur, Some(123.0));
+        assert_eq!(e.pid, 7);
+        assert_eq!(e.tid, 8);
+        assert!(
+            trace.stats.malformed >= 1,
+            "wrong-typed fields count as malformed"
+        );
+    }
+
+    /// Negative durations clamp to 0.0, count as malformed, keep the event.
+    #[test]
+    fn negative_dur_clamps_to_zero_and_counts_malformed() {
+        let body = r#"{"traceEvents":[
+            {"name":"A","ph":"X","ts":1,"pid":1,"tid":1,"dur":-5},
+            {"name":"B","ph":"X","ts":2,"pid":1,"tid":1,"dur":"-3"}
+        ]}"#;
+        let path = write_trace("negdur", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 2);
+        assert_eq!(trace.trace_events[0].dur, Some(0.0));
+        assert_eq!(trace.trace_events[1].dur, Some(0.0));
+        assert_eq!(trace.stats.parsed, 2);
+        assert!(trace.stats.malformed >= 2);
+        assert_eq!(trace.stats.skipped, 0);
+    }
+
+    /// One structurally broken event is skipped and counted; the file still
+    /// parses and the good events keep their order.
+    #[test]
+    fn single_bad_event_skipped_not_fatal() {
+        let body = r#"{"traceEvents":[
+            {"name":"A","ph":"X","ts":1,"pid":1,"tid":1},
+            {"name": },
+            {"name":"B","ph":"X","ts":2,"pid":1,"tid":1},
+            42,
+            {"name":"C","ph":"X","ts":3,"pid":1,"tid":1}
+        ]}"#;
+        let path = write_trace("badevent", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let names: Vec<&str> = trace.trace_events.iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["A", "B", "C"]);
+        assert_eq!(trace.stats.parsed, 3);
+        assert_eq!(trace.stats.skipped, 2);
+        assert!(trace.stats.malformed >= 2);
+    }
+
+    /// Frames from every TracingStartedInBrowser event merge by frame id;
+    /// later events refresh url/name/process_id, and page_url is the
+    /// outermost main frame's URL (string processId coerces).
+    #[test]
+    fn multi_tracing_started_in_browser_merges() {
+        let body = r#"{"traceEvents":[
+            {"name":"TracingStartedInBrowser","ph":"I","ts":1,"pid":1,"tid":1,"args":{"data":{"frames":[
+                {"frame":"F1","url":"about:blank","name":"","processId":11,"isInPrimaryMainFrame":true},
+                {"frame":"F2","parent":"F1","url":"https://child.example/","name":"c","processId":11}
+            ]}}},
+            {"name":"TracingStartedInBrowser","ph":"I","ts":2,"pid":1,"tid":1,"args":{"data":{"frames":[
+                {"frame":"F1","url":"https://app.example/","name":"main","processId":"11","isOutermostMainFrame":true}
+            ]}}},
+            {"name":"RunTask","ph":"X","ts":3,"pid":1,"tid":1,"dur":5}
+        ]}"#;
+        let path = write_trace("frames", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let meta = trace.metadata.as_ref().expect("metadata must exist");
+        assert_eq!(meta.frames.len(), 2, "frames merge by id across events");
+        let main = meta.frames.iter().find(|f| f.id == "F1").unwrap();
+        assert_eq!(main.url, "https://app.example/");
+        assert_eq!(main.name, "main");
+        assert_eq!(main.process_id, 11);
+        assert!(main.is_main_frame);
+        assert_eq!(meta.page_url.as_deref(), Some("https://app.example/"));
+    }
+
+    /// The legacy `isMainFrame` field marks the main frame when the newer
+    /// markers are absent.
+    #[test]
+    fn legacy_is_main_frame_marks_main() {
+        let body = r#"{"traceEvents":[
+            {"name":"TracingStartedInBrowser","ph":"I","ts":1,"pid":1,"tid":1,"args":{"data":{"frames":[
+                {"frame":"OLD","url":"https://old.example/","processId":9,"isMainFrame":true}
+            ]}}}
+        ]}"#;
+        let path = write_trace("legacyframe", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let meta = trace.metadata.as_ref().expect("metadata must exist");
+        assert_eq!(meta.frames.len(), 1);
+        assert!(meta.frames[0].is_main_frame);
+        assert_eq!(meta.page_url.as_deref(), Some("https://old.example/"));
+    }
+
+    /// An empty trace is an error, not a valid empty TraceFile.
+    #[test]
+    fn empty_trace_is_error() {
+        let path = write_trace("empty", r#"{"traceEvents":[]}"#);
+        let err = match parse_trace(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("empty trace must fail"),
+        };
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.to_string().contains("no events"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A clean trace reports parsed == events with no skips or malformed.
+    #[test]
+    fn clean_parse_stats_are_zero_except_parsed() {
+        let body = r#"{"traceEvents":[
+            {"name":"A","ph":"X","ts":1,"pid":1,"tid":1,"dur":2},
+            {"name":"B","ph":"X","ts":2,"pid":1,"tid":1}
+        ]}"#;
+        let path = write_trace("cleanstats", body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.stats.parsed, 2);
+        assert_eq!(trace.stats.skipped, 0);
+        assert_eq!(trace.stats.malformed, 0);
+    }
+
+    /// Lenient fields (string ts/dur/pid/tid, negative-dur clamp, string
+    /// id) agree field-for-field between the fast tokenizer and the serde
+    /// fallback — including the malformed counts.
+    #[test]
+    fn lenient_fields_consistent_across_fallback() {
+        let target =
+            r#"{"name":"A","ph":"X","ts":"456.5","dur":"-3","pid":"7","tid":"8.9","id":"x7"}"#;
+        let fast_body = format!(r#"{{"traceEvents":[{target}]}}"#);
+        // The escaped quote bails the fast single-pass into the parallel +
+        // tolerant-serde pipeline; the target event itself has no escapes.
+        let slow_body = format!(
+            r#"{{"traceEvents":[{{"name":"A \"quoted\"","ph":"X","ts":0,"pid":1,"tid":1}},{target}]}}"#
+        );
+        let fast_path = write_trace("lenient-fast", &fast_body);
+        let slow_path = write_trace("lenient-slow", &slow_body);
+        let fast = parse_trace(&fast_path).unwrap();
+        let slow = parse_trace(&slow_path).unwrap();
+        let _ = std::fs::remove_file(&fast_path);
+        let _ = std::fs::remove_file(&slow_path);
+        assert_eq!(fast.trace_events.len(), 1);
+        assert_eq!(slow.trace_events.len(), 2);
+        let (f, s) = (&fast.trace_events[0], &slow.trace_events[1]);
+        assert_eq!(f.ts, 456.5);
+        assert_eq!((f.ts, f.dur, f.pid, f.tid), (s.ts, s.dur, s.pid, s.tid));
+        assert_eq!(f.dur, Some(0.0), "negative string dur clamps to 0");
+        assert_eq!((f.pid, f.tid), (7, 8));
+        assert!(f.has_id && s.has_id);
+        assert_eq!(f.id, s.id, "string id must hash identically");
+        assert_eq!(fast.stats.parsed, 1);
+        assert_eq!(slow.stats.parsed, 2);
+        // id + ts + dur + pid + tid coercions on both paths.
+        assert_eq!(fast.stats.malformed, slow.stats.malformed);
+        assert!(fast.stats.malformed >= 5, "got {}", fast.stats.malformed);
+        assert_eq!(fast.stats.skipped, 0);
+        assert_eq!(slow.stats.skipped, 0);
+    }
+
+    /// Mixed fast + tolerant chunks account every input element exactly
+    /// once: ~135KB body forces 2 chunks at 64KB units; the first 64KB are
+    /// all plain events (fast path) while escaped names in the tail push
+    /// chunk 2 through the tolerant path. No event is double-counted on
+    /// fallback, no serde thread-local count is lost across worker threads,
+    /// and every string-ts coercion is counted wherever it lands.
+    #[test]
+    fn mixed_chunk_stats_account_every_element_once() {
+        let mut parts: Vec<String> = Vec::with_capacity(2000);
+        for i in 0..2000 {
+            if i == 1999 {
+                parts.push(r#"{"name": }"#.to_string()); // broken: skip
+            } else if i >= 1300 {
+                parts.push(format!(
+                    r#"{{"name":"Ev \"q{i}\"","ph":"X","ts":{i},"pid":1,"tid":1}}"#
+                ));
+            } else {
+                parts.push(format!(
+                    r#"{{"name":"Ev{i}","ph":"X","ts":"{i}","pid":1,"tid":1}}"#
+                ));
+            }
+        }
+        let body = format!("{{\"traceEvents\":[{}]}}", parts.join(","));
+        // Two 64KB chunks; the 1300 plain events (~70KB) cover chunk 1 so
+        // it stays on the fast path, escapes land in chunk 2 (tolerant).
+        assert!(body.len() > 64 * 1024, "need 2 chunks, got {}", body.len());
+        let path = write_trace("mixedstats", &body);
+        let trace = parse_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.stats.parsed + trace.stats.skipped, 2000);
+        assert_eq!(trace.stats.parsed, 1999);
+        assert_eq!(trace.stats.skipped, 1);
+        // 1300 string-ts coercions (fast or tolerant chunk alike) + 1 skip.
+        assert_eq!(trace.stats.malformed, 1301);
     }
 }

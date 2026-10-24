@@ -36,7 +36,7 @@
 //! - delta metrics: MajorGC+MinorGC+V8.GCScavenger only, counted on any tid; RunTask /
 //!   FunctionCall restricted to the main tid
 //! - long tasks: RunTask on the main tid with dur > threshold
-//! - percentiles: sorted ascending, idx = round(p/100 * (n-1)) clamped
+//! - percentiles: sorted ascending, rank = q/100*(n-1) with linear interpolation
 
 use flate2::read::GzDecoder;
 use serde_json::Value;
@@ -88,12 +88,28 @@ fn load_trace(path: &Path) -> Vec<Event> {
     let mut events = Vec::with_capacity(items.len());
     for it in items {
         events.push(Event {
-            name: it.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            ph: it.get("ph").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: it
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            ph: it
+                .get("ph")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             ts: it.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0),
             dur: it.get("dur").and_then(|v| v.as_f64()),
-            tid: it.get("tid").and_then(|v| v.as_i64()).map(|v| v as u64).unwrap_or(0),
-            pid: it.get("pid").and_then(|v| v.as_i64()).map(|v| v as u64).unwrap_or(0),
+            tid: it
+                .get("tid")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as u64)
+                .unwrap_or(0),
+            pid: it
+                .get("pid")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as u64)
+                .unwrap_or(0),
             // as_u64 is None for string ids ("0x2") and negatives — both leave
             // has_id false in the binary's lenient parser.
             id: it.get("id").and_then(|v| v.as_u64()),
@@ -145,13 +161,18 @@ fn detect_main_tid(events: &[Event]) -> u64 {
         .iter()
         .filter(|(_, (name, n))| *n > 0 && (*name).is_some_and(|n| main_name_priority(n) > 0))
         .max_by_key(|(tid, (name, n))| {
-            (main_name_priority((*name).unwrap()), *n, std::cmp::Reverse(*tid))
+            (
+                main_name_priority((*name).unwrap()),
+                *n,
+                std::cmp::Reverse(*tid),
+            )
         })
     {
         return *tid;
     }
     for e in events {
-        if e.name == "RunTask" && e.ph == "X"
+        if e.name == "RunTask"
+            && e.ph == "X"
             && let Some(dur) = e.dur
             && dur > 500_000.0
             && !threads
@@ -224,26 +245,29 @@ fn cpu_scan(events: &[Event]) -> CpuScan {
             continue;
         }
         let Some(args) = &e.args else { continue };
-        let Some(data) = args.get("data") else { continue };
+        let Some(data) = args.get("data") else {
+            continue;
+        };
         let sess = session_of(e);
         if let Some(cp) = data.get("cpuProfile")
-            && let Some(list) = cp.get("nodes").and_then(|n| n.as_array()) {
-                for node in list {
-                    let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let cf = node.get("callFrame");
-                    let name = cf
-                        .and_then(|c| c.get("functionName"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(anonymous)")
-                        .to_string();
-                    let url = cf
-                        .and_then(|c| c.get("url"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    nodes.entry((sess.0, sess.1, id)).or_insert((name, url));
-                }
+            && let Some(list) = cp.get("nodes").and_then(|n| n.as_array())
+        {
+            for node in list {
+                let id = node.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cf = node.get("callFrame");
+                let name = cf
+                    .and_then(|c| c.get("functionName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(anonymous)")
+                    .to_string();
+                let url = cf
+                    .and_then(|c| c.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                nodes.entry((sess.0, sess.1, id)).or_insert((name, url));
             }
+        }
         let Some(deltas) = data.get("timeDeltas").and_then(|t| t.as_array()) else {
             continue;
         };
@@ -258,41 +282,43 @@ fn cpu_scan(events: &[Event]) -> CpuScan {
         // attach (the Profile event's ts), cap its sample weight.
         let first_chunk = !prev_last.contains_key(&sess);
         if let Some(cp) = data.get("cpuProfile")
-            && let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array()) {
-                let n = samples_arr.len().min(deltas.len());
-                let attach_cap: f64 = if first_chunk {
-                    let mut rest: Vec<f64> = deltas[..n]
-                        .iter()
-                        .skip(1)
-                        .filter_map(|v| v.as_f64())
-                        .filter(|d| *d > 0.0)
-                        .collect();
-                    if rest.is_empty() {
-                        0.0
-                    } else {
-                        rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        rest[rest.len() / 2]
-                    }
+            && let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array())
+        {
+            let n = samples_arr.len().min(deltas.len());
+            let attach_cap: f64 = if first_chunk {
+                let mut rest: Vec<f64> = deltas[..n]
+                    .iter()
+                    .skip(1)
+                    .filter_map(|v| v.as_f64())
+                    .filter(|d| *d > 0.0)
+                    .collect();
+                if rest.is_empty() {
+                    0.0
                 } else {
-                    f64::INFINITY
+                    rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    rest[rest.len() / 2]
+                }
+            } else {
+                f64::INFINITY
+            };
+            let mut cur = pl + first;
+            for (si, d) in deltas.iter().take(n).enumerate() {
+                let d = d.as_f64().unwrap_or(0.0);
+                let weight = if si == 0 {
+                    d.max(0.0).min(attach_cap)
+                } else {
+                    d.max(0.0)
                 };
-                let mut cur = pl + first;
-                for (si, d) in deltas.iter().take(n).enumerate() {
-                    let d = d.as_f64().unwrap_or(0.0);
-                    let weight = if si == 0 { d.max(0.0).min(attach_cap) } else { d.max(0.0) };
-                    samples.push(Sample {
-                        ts: cur,
-                        weight,
-                    });
-                    // Advance with the NEXT delta: base already includes
-                    // deltas[0], so sample i sits at base + sum(deltas[1..=i])
-                    // (matches the binary's windowed walk and the anchor walk
-                    // even for non-uniform deltas).
-                    if let Some(next) = deltas.get(si + 1) {
-                        cur += next.as_f64().unwrap_or(0.0);
-                    }
+                samples.push(Sample { ts: cur, weight });
+                // Advance with the NEXT delta: base already includes
+                // deltas[0], so sample i sits at base + sum(deltas[1..=i])
+                // (matches the binary's windowed walk and the anchor walk
+                // even for non-uniform deltas).
+                if let Some(next) = deltas.get(si + 1) {
+                    cur += next.as_f64().unwrap_or(0.0);
                 }
             }
+        }
         let sum: f64 = deltas.iter().filter_map(|v| v.as_f64()).sum();
         prev_last.insert(sess, pl + sum);
     }
@@ -343,10 +369,18 @@ fn anchor_node_first(
             continue;
         }
         let Some(args) = &e.args else { continue };
-        let Some(data) = args.get("data") else { continue };
-        let Some(cp) = data.get("cpuProfile") else { continue };
-        let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array()) else { continue };
-        let Some(deltas) = data.get("timeDeltas").and_then(|t| t.as_array()) else { continue };
+        let Some(data) = args.get("data") else {
+            continue;
+        };
+        let Some(cp) = data.get("cpuProfile") else {
+            continue;
+        };
+        let Some(samples_arr) = cp.get("samples").and_then(|s| s.as_array()) else {
+            continue;
+        };
+        let Some(deltas) = data.get("timeDeltas").and_then(|t| t.as_array()) else {
+            continue;
+        };
         let n = samples_arr.len().min(deltas.len());
         let sess = session_of(e);
         let mut cur = prev_last
@@ -391,7 +425,11 @@ fn find_anchor(events: &[Event], scan: &CpuScan, pattern: &str) -> Option<Anchor
         }
     }
     if let Some((ts, label)) = best {
-        return Some(AnchorHit { ts, kind: AnchorKind::FunctionCall, label });
+        return Some(AnchorHit {
+            ts,
+            kind: AnchorKind::FunctionCall,
+            label,
+        });
     }
 
     let mut starts: HashMap<(u64, u64), f64> = HashMap::new();
@@ -408,7 +446,9 @@ fn find_anchor(events: &[Event], scan: &CpuScan, pattern: &str) -> Option<Anchor
             if *t == f64::INFINITY {
                 continue;
             }
-            let Some((n, u)) = scan.nodes.get(key) else { continue };
+            let Some((n, u)) = scan.nodes.get(key) else {
+                continue;
+            };
             let hay = if name == "functionName" { n } else { u };
             if matches_ignore_case(hay, pattern) && b.as_ref().is_none_or(|old| *t < old.0) {
                 b = Some((*t, hay.clone()));
@@ -417,18 +457,27 @@ fn find_anchor(events: &[Event], scan: &CpuScan, pattern: &str) -> Option<Anchor
         b
     };
     if let Some((ts, label)) = pick("functionName").or_else(|| pick("url")) {
-        return Some(AnchorHit { ts, kind: AnchorKind::CpuProfile, label });
+        return Some(AnchorHit {
+            ts,
+            kind: AnchorKind::CpuProfile,
+            label,
+        });
     }
 
     let mut best: Option<(f64, String)> = None;
     for e in events {
         let Some(args) = &e.args else { continue };
         if let Some(text) = value_match_text(args, pattern)
-            && best.as_ref().is_none_or(|b| e.ts < b.0) {
-                best = Some((e.ts, text));
-            }
+            && best.as_ref().is_none_or(|b| e.ts < b.0)
+        {
+            best = Some((e.ts, text));
+        }
     }
-    best.map(|(ts, label)| AnchorHit { ts, kind: AnchorKind::Args, label })
+    best.map(|(ts, label)| AnchorHit {
+        ts,
+        kind: AnchorKind::Args,
+        label,
+    })
 }
 
 fn value_match_text(v: &Value, pattern: &str) -> Option<String> {
@@ -463,17 +512,19 @@ fn paired_durations(events: &[Event], name: &str, window: Option<(f64, f64)>) ->
             continue;
         }
         if let Some((lo, hi)) = window
-            && (e.ts < lo || e.ts > hi) {
-                continue;
-            }
+            && (e.ts < lo || e.ts > hi)
+        {
+            continue;
+        }
         match e.ph.as_str() {
             "b" => stacks.entry(e.tid).or_default().push(e.ts),
             "e" => {
                 if let Some(st) = stacks.get_mut(&e.tid)
                     && let Some(t) = st.pop()
-                    && e.ts > t {
-                        durs.push(e.ts - t);
-                    }
+                    && e.ts > t
+                {
+                    durs.push(e.ts - t);
+                }
             }
             _ => {}
         }
@@ -481,14 +532,19 @@ fn paired_durations(events: &[Event], name: &str, window: Option<(f64, f64)>) ->
     durs
 }
 
-/// Nearest-rank percentiles on a sorted-ascending slice: (p50, p90, p99, max).
+/// Linear-interpolated percentiles on a sorted-ascending slice: (p50, p90, p99, max).
+/// rank = q/100*(n-1), value interpolated between bracketing samples.
 fn percentiles(sorted_asc: &[f64]) -> (f64, f64, f64, f64) {
     if sorted_asc.is_empty() {
         return (0.0, 0.0, 0.0, 0.0);
     }
+    let n = sorted_asc.len();
     let p = |q: f64| -> f64 {
-        let idx = ((q / 100.0) * (sorted_asc.len() - 1) as f64).round() as usize;
-        sorted_asc[idx.min(sorted_asc.len() - 1)]
+        let rank = q / 100.0 * (n - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        let frac = rank - lo as f64;
+        sorted_asc[lo] + (sorted_asc[hi] - sorted_asc[lo]) * frac
     };
     (p(50.0), p(90.0), p(99.0), *sorted_asc.last().unwrap())
 }
@@ -649,7 +705,9 @@ fn check_close(what: &str, got: f64, want: f64, tol: f64) {
 }
 
 fn win_pair(v: &Value) -> (f64, f64) {
-    let a = v.as_array().unwrap_or_else(|| panic!("window is not an array"));
+    let a = v
+        .as_array()
+        .unwrap_or_else(|| panic!("window is not an array"));
     (a[0].as_f64().unwrap(), a[1].as_f64().unwrap())
 }
 
@@ -697,23 +755,37 @@ fn verify_trace(path: &Path, pattern: &str) -> Verify {
     let anchor = find_anchor(&events, &scan, pattern);
     println!(
         "reference anchor = {:?}",
-        anchor.as_ref().map(|a| (a.kind.clone(), a.ts, a.label.as_str()))
+        anchor
+            .as_ref()
+            .map(|a| (a.kind.clone(), a.ts, a.label.as_str()))
     );
-    let path_s = path.to_str().unwrap_or_else(|| panic!("non-UTF8 path {}", path.display()));
+    let path_s = path
+        .to_str()
+        .unwrap_or_else(|| panic!("non-UTF8 path {}", path.display()));
 
     // Check 1: full-trace CPU total via --calltree --top 1 --json.
     let root1 = run_bin(&[path_s, "--calltree", "--top", "1", "--json"]);
     let ct = root1["sections"]["calltree"]
         .as_array()
         .unwrap_or_else(|| panic!("calltree is not an array"));
-    assert!(!ct.is_empty(), "--calltree --top 1 produced no rows on {}", path.display());
+    assert!(
+        !ct.is_empty(),
+        "--calltree --top 1 produced no rows on {}",
+        path.display()
+    );
     let tool_inc = ct[0]["inclusive_us"]
         .as_f64()
         .expect("calltree row missing inclusive_us");
-    check_eq("check1 calltree[0].inclusive_us", tool_inc, cpu_total.round());
+    check_eq(
+        "check1 calltree[0].inclusive_us",
+        tool_inc,
+        cpu_total.round(),
+    );
 
     // Check 2: --anchor --delta --frames --gc --json.
-    let root2 = run_bin(&[path_s, "--anchor", pattern, "--delta", "--frames", "--gc", "--json"]);
+    let root2 = run_bin(&[
+        path_s, "--anchor", pattern, "--delta", "--frames", "--gc", "--json",
+    ]);
     match root2.get("anchor").and_then(|a| a.as_str()) {
         Some(note) => {
             println!("anchor note: {note}");
@@ -832,12 +904,36 @@ fn verify_trace(path: &Path, pattern: &str) -> Verify {
     full_durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let (p50, p90, p99, max) = percentiles(&full_durs);
     let full_dropped = events.iter().filter(|e| e.name == "DroppedFrame").count();
-    check_eq("check3 frames count", f0["count"].as_f64().unwrap(), full_durs.len() as f64);
-    check_eq("check3 frames p50_us", f0["p50_us"].as_f64().unwrap(), p50.round());
-    check_eq("check3 frames p90_us", f0["p90_us"].as_f64().unwrap(), p90.round());
-    check_eq("check3 frames p99_us", f0["p99_us"].as_f64().unwrap(), p99.round());
-    check_eq("check3 frames max_us", f0["max_us"].as_f64().unwrap(), max.round());
-    check_eq("check3 dropped_frames", f0["dropped_frames"].as_f64().unwrap(), full_dropped as f64);
+    check_eq(
+        "check3 frames count",
+        f0["count"].as_f64().unwrap(),
+        full_durs.len() as f64,
+    );
+    check_eq(
+        "check3 frames p50_us",
+        f0["p50_us"].as_f64().unwrap(),
+        p50.round(),
+    );
+    check_eq(
+        "check3 frames p90_us",
+        f0["p90_us"].as_f64().unwrap(),
+        p90.round(),
+    );
+    check_eq(
+        "check3 frames p99_us",
+        f0["p99_us"].as_f64().unwrap(),
+        p99.round(),
+    );
+    check_eq(
+        "check3 frames max_us",
+        f0["max_us"].as_f64().unwrap(),
+        max.round(),
+    );
+    check_eq(
+        "check3 dropped_frames",
+        f0["dropped_frames"].as_f64().unwrap(),
+        full_dropped as f64,
+    );
 
     // GC section from check 2 (scoped to the SHOOT window).
     let gc = gc_stats(&events, shoot, main_tid, threshold_us);
@@ -845,7 +941,9 @@ fn verify_trace(path: &Path, pattern: &str) -> Verify {
         .as_array()
         .expect("gc section missing groups");
     for (i, name) in ["major", "minor", "other"].iter().enumerate() {
-        let row = g0[i].as_object().unwrap_or_else(|| panic!("gc group {i} missing"));
+        let row = g0[i]
+            .as_object()
+            .unwrap_or_else(|| panic!("gc group {i} missing"));
         check_eq(
             &format!("check2 gc {name} count"),
             row["count"].as_f64().unwrap(),
@@ -858,8 +956,16 @@ fn verify_trace(path: &Path, pattern: &str) -> Verify {
         );
     }
     let lt = &root2["sections"]["gc"][0]["long_tasks"];
-    check_eq("check2 long_tasks count", lt["count"].as_f64().unwrap(), gc.lt_count as f64);
-    check_eq("check2 long_tasks total_us", lt["total_us"].as_f64().unwrap(), gc.lt_total.round());
+    check_eq(
+        "check2 long_tasks count",
+        lt["count"].as_f64().unwrap(),
+        gc.lt_count as f64,
+    );
+    check_eq(
+        "check2 long_tasks total_us",
+        lt["total_us"].as_f64().unwrap(),
+        gc.lt_total.round(),
+    );
 
     Verify {
         cpu_total,
@@ -923,14 +1029,34 @@ fn reference_medium_fixture() {
     check_eq("fixture POST GC count", q.gc_count as f64, 1.0);
 
     check_eq("fixture full frames count", v.full_frames.len() as f64, 5.0);
-    check_eq("fixture full frames max (ms)", v.full_frames.last().unwrap() / 1000.0, 50.0);
+    check_eq(
+        "fixture full frames max (ms)",
+        v.full_frames.last().unwrap() / 1000.0,
+        50.0,
+    );
     check_eq("fixture full dropped frames", v.full_dropped as f64, 2.0);
 
     let g = &v.gc;
-    check_eq_debug("fixture gc major", (g.groups[0] as f64, g.totals[0]), (1.0, 5_000.0));
-    check_eq_debug("fixture gc minor", (g.groups[1] as f64, g.totals[1]), (2.0, 1_500.0));
-    check_eq_debug("fixture gc other", (g.groups[2] as f64, g.totals[2]), (0.0, 0.0));
-    check_eq_debug("fixture long_tasks", (g.lt_count as f64, g.lt_total), (2.0, 660_000.0));
+    check_eq_debug(
+        "fixture gc major",
+        (g.groups[0] as f64, g.totals[0]),
+        (1.0, 5_000.0),
+    );
+    check_eq_debug(
+        "fixture gc minor",
+        (g.groups[1] as f64, g.totals[1]),
+        (2.0, 1_500.0),
+    );
+    check_eq_debug(
+        "fixture gc other",
+        (g.groups[2] as f64, g.totals[2]),
+        (0.0, 0.0),
+    );
+    check_eq_debug(
+        "fixture long_tasks",
+        (g.lt_count as f64, g.lt_total),
+        (2.0, 660_000.0),
+    );
 }
 
 /// Reads CHPERF_TEST_TRACE; skipped (with a message) when unset. Supports

@@ -46,6 +46,21 @@ const BARE: &[(&str, &str)] = &[
     ("async", "--async"),
     ("gaps", "--gaps"),
     ("frame-tree", "--frame-tree"),
+    ("anchor", "--anchor"),
+    ("delta", "--delta"),
+    ("gc", "--gc"),
+    ("frames", "--frames"),
+    ("calltree", "--calltree"),
+    ("url", "--url"),
+    ("lt", "--lt"),
+    ("pre", "--pre"),
+    ("post", "--post"),
+    ("csv", "--csv"),
+    ("loading", "--loading"),
+    ("network", "--network"),
+    ("raster", "--raster"),
+    ("coverage", "--coverage"),
+    ("frame-budget", "--frame-budget"),
 ];
 
 struct Session {
@@ -53,6 +68,7 @@ struct Session {
     name_a: String,
     app: App,
     compare_name: Option<String>,
+    pending_window: Option<(f64, f64)>,
 }
 
 enum Cmd {
@@ -91,6 +107,7 @@ pub fn run_repl(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>
         name_a,
         app,
         compare_name: None,
+        pending_window: None,
     };
 
     loop {
@@ -174,10 +191,11 @@ fn map_bare(tokens: &mut Vec<String>) {
         return;
     }
     if let Some((name, val)) = t.split_once('=')
-        && let Some((_, flag)) = BARE.iter().find(|(n, _)| *n == name) {
-            tokens[0] = format!("{}={}", flag, val);
-            return;
-        }
+        && let Some((_, flag)) = BARE.iter().find(|(n, _)| *n == name)
+    {
+        tokens[0] = format!("{}={}", flag, val);
+        return;
+    }
     if let Some((_, flag)) = BARE.iter().find(|(n, _)| *n == t) {
         tokens[0] = flag.to_string();
     }
@@ -204,17 +222,44 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
         }
         _ => {}
     }
+    // `task 3`: expand the 3rd heaviest RunTask (same output as --task row expansion).
+    if tokens[0] == "task"
+        && tokens.len() == 2
+        && let Ok(n) = tokens[1].parse::<usize>()
+    {
+        return run_task_n(session, n);
+    }
+    // `jank 3`: set the window around jank cluster #3's span.
+    if tokens[0] == "jank"
+        && tokens.len() == 2
+        && let Ok(n) = tokens[1].parse::<usize>()
+    {
+        return run_jank_n(session, n);
+    }
     map_bare(&mut tokens);
 
     let mut argv = vec!["chperf".to_string()];
     argv.extend(tokens);
-    let cmd = match Cli::try_parse_from(&argv) {
+    let mut cmd = match Cli::try_parse_from(&argv) {
         Ok(c) => c,
         Err(e) => {
             println!("{}", e.to_string().lines().next().unwrap_or("bad command"));
             return Ok(Cmd::Done);
         }
     };
+    // Apply the REPL's pending window (set by `jank N`) when the command
+    // carries no explicit anchor.
+    if let Some((lo, hi)) = session.pending_window
+        && cmd.around.is_none()
+        && cmd.anchor.is_none()
+        && !cmd.worst
+        && cmd.window.is_none()
+    {
+        let center = (lo + hi) / 2.0;
+        let half_ms = (hi - lo) / 2.0 / 1000.0;
+        cmd.around = Some((center - session.analyzed.min_ts) / 1000.0);
+        cmd.window = Some(half_ms);
+    }
 
     // Inspect queries run against the session data (no re-parse), unless a
     // compare was requested in the same command: `compare b.json --gc` must
@@ -253,6 +298,7 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
             &session.name_a,
             &cmd,
             Some(&session.analyzed.cpu_cache),
+            &session.analyzed.trace.stats,
         )?;
         return Ok(Cmd::Done);
     }
@@ -275,6 +321,9 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
     // Self-contained HTML report (trace A only; the compared trace's raw
     // events are dropped after `compare` rebuilds the app).
     if let Some(target) = &cmd.html {
+        if session.compare_name.is_some() {
+            eprintln!("warning: HTML export renders trace A only (compare B dropped)");
+        }
         let doc = crate::html::export_html(
             &session.app,
             &session.analyzed.trace.trace_events,
@@ -310,16 +359,72 @@ fn run_command(session: &mut Session, line: &str) -> Result<Cmd, Box<dyn std::er
     Ok(Cmd::Done)
 }
 
+fn run_task_n(session: &mut Session, n: usize) -> Result<Cmd, Box<dyn std::error::Error>> {
+    if n == 0 {
+        println!("usage: task <rank>=1..");
+        return Ok(Cmd::Done);
+    }
+    let scope = chperf_core::inspect::Scope {
+        window: None,
+        tid: None,
+        pid: None,
+        cat: None,
+    };
+    let (md, _) = chperf_core::inspect::task_section(
+        &session.analyzed.trace.trace_events,
+        &scope,
+        n,
+        session.analyzed.min_ts,
+    );
+    // Print only the Nth `### #N` block (same output as --task row expansion).
+    let blocks: Vec<&str> = md.split("### #").collect();
+    if n < blocks.len() {
+        print!("### #{}", blocks[n]);
+    } else {
+        println!(
+            "no task #{} (only {} tasks)",
+            n,
+            blocks.len().saturating_sub(1)
+        );
+    }
+    Ok(Cmd::Done)
+}
+
+fn run_jank_n(session: &mut Session, n: usize) -> Result<Cmd, Box<dyn std::error::Error>> {
+    if n == 0 {
+        println!("usage: jank <cluster#>=1..");
+        return Ok(Cmd::Done);
+    }
+    let events = &session.analyzed.trace.trace_events;
+    let main_tid = chperf_core::trace::detect_main_thread(events);
+    let res = chperf_core::analysis::analyze_jank(events, main_tid, None);
+    if n > res.clusters.len() {
+        println!(
+            "no jank cluster #{} (only {} clusters)",
+            n,
+            res.clusters.len()
+        );
+        return Ok(Cmd::Done);
+    }
+    let c = &res.clusters[n - 1];
+    session.pending_window = Some((c.start_us, c.end_us));
+    println!(
+        "# window set around jank cluster #{}: {:.2}ms … {:.2}ms from trace start (span {:.2}ms, {} dropped)",
+        n,
+        (c.start_us - session.analyzed.min_ts) / 1000.0,
+        (c.end_us - session.analyzed.min_ts) / 1000.0,
+        (c.end_us - c.start_us) / 1000.0,
+        c.dropped_frames,
+    );
+    Ok(Cmd::Done)
+}
+
 fn print_status(s: &Session) {
     let ev = s.analyzed.trace.trace_events.len();
     let busy = s.app.summary.main_thread_busy_us / 1e6;
     println!(
         "# `{}`: {} events, main thread busy {:.1}s, long tasks {}, throttle {}x",
-        s.name_a,
-        ev,
-        busy,
-        s.app.summary.long_task_count,
-        s.app.throttle_factor
+        s.name_a, ev, busy, s.app.summary.long_task_count, s.app.throttle_factor
     );
     if let Some(b) = &s.compare_name {
         println!("  compare: `{}`", b);
@@ -327,18 +432,33 @@ fn print_status(s: &Session) {
 }
 
 fn print_help() {
-    println!(
-        "Commands (flags compose like the CLI, `--around/--window` anchor queries):"
-    );
+    println!("Commands (flags compose like the CLI, `--around/--window` anchor queries):");
     println!("  events <name[,name]> [--sort dur|ts|name|count] [--top N] [--min-dur US]");
-    println!("      [--tid TID|main] [--pid N] [--cat S] [--around MS] [--window MS] [--regex] [--full-args] [--json]");
-    println!("  names [--top N] | threads [--top N] | timeline [--around MS] [--window MS] [--bucket MS]");
-    println!("  stats <names> | gaps <names> | function <pat> [--regex] | find <pat> [--regex] [--full-args] | jank [--top N]");
-    println!("  worst [--task] [--stacks] [--top N] | task [--top N] | stacks [--function P] [--top N] | flame [--function P]");
-    println!("  anchor <pat> [--delta] [--pre MS] [--post MS] [--window MS] | delta | calltree [--url P] [--function P]");
-    println!("  gc [--lt MS] | frames [--frame-event NAME] | frame-tree | csv (add --csv to any query)");
+    println!(
+        "      [--tid TID|main] [--pid N] [--cat S] [--around MS] [--window MS] [--regex] [--full-args] [--json]"
+    );
+    println!(
+        "  names [--top N] | threads [--top N] | timeline [--around MS] [--window MS] [--bucket MS]"
+    );
+    println!(
+        "  stats <names> | gaps <names> | function <pat> [--regex] | find <pat> [--regex] [--full-args] | jank [--top N] | jank N (window around cluster N)"
+    );
+    println!(
+        "  worst [--task] [--stacks] [--top N] | task [--top N] | task N (expand Nth RunTask) | stacks [--function P] [--top N] | flame [--function P]"
+    );
+    println!(
+        "  anchor <pat> [--delta] [--pre MS] [--post MS] [--window MS] | delta [--frame-budget MS] | calltree [--url P] [--function P]"
+    );
+    println!(
+        "  gc [--lt MS] | frames [--frame-event NAME] [--frame-budget MS] | frame-tree | csv (add --csv to any query)"
+    );
     println!("  memory [--around MS] [--window MS] | input [--top N] | async [--top N]");
-    println!("  compare <file2> | export [file] | html [file] | summary | throttle N | status | clear | help | quit");
+    println!(
+        "  loading | network | raster | coverage | frame-budget MS | bucket MS | url P | lt MS | pre MS | post MS"
+    );
+    println!(
+        "  compare <file2> | export [file] | html [file] | summary | throttle N | status | clear | help | quit"
+    );
     println!("  every query also accepts [--json] for jq/pipelines");
     println!();
 }

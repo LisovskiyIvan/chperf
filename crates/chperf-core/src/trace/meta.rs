@@ -2,6 +2,7 @@
 //! directory listing helpers.
 
 use super::TraceEvent;
+use super::parse::ParseStats;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,10 @@ pub struct TraceFile {
     pub trace_events: Vec<TraceEvent>,
     #[serde(default)]
     pub metadata: Option<TraceMetadata>,
+    /// Parse counters (parsed/skipped/malformed). Skipped by serde: only
+    /// `parse_trace` fills them; deserialized traces default to zeros.
+    #[serde(skip)]
+    pub stats: ParseStats,
 }
 
 /// Metadata events (`thread_name`/`process_name`/…, cat `__metadata`) carry
@@ -61,25 +66,38 @@ pub fn is_metadata_event(e: &TraceEvent) -> bool {
 /// analysis. `Chrome_IOThread` regularly blocks for >500ms and, when its
 /// events come first in the file, used to win the long-task heuristic below —
 /// reporting IO/GPU/compositor busy time as main-thread busy.
+/// Matching is case-insensitive; lanes are excluded only when the name
+/// clearly identifies them (none of these match real main threads).
 fn is_known_non_main(name: &str) -> bool {
-    name.contains("IOThread")
-        || name == "CrGpuMain"
-        || name.contains("Compositor") // VizCompositorThread, renderer Compositor
-        || name.starts_with("ThreadPool")
-        || name.contains("Worker") // DedicatedWorker/ServiceWorker threads
-        || name == "AudioThread"
-        || name == "MemoryInfra"
+    let lower = name.to_ascii_lowercase();
+    lower.contains("iothread")
+        || lower == "crgpumain"
+        || lower.contains("compositor") // VizCompositorThread, renderer CompositorTileWorker
+        || lower.starts_with("threadpool")
+        || lower.contains("worker") // DedicatedWorker, RasterWorker, TileWorker, …
+        || lower.contains("audio") // AudioThread, AudioOutput
+        || lower == "memoryinfra"
+        || lower.contains("inprocgpu") // Chrome_InProcGpuThread
+        || lower.contains("gpu") // GPU Process
+        || lower.contains("media") // Media pipeline threads
 }
 
 /// Detection priority for thread names seen in Chrome traces; 0 = no opinion.
 /// The renderer main is where scroll/jank/script live, so it outranks the
-/// browser main.
+/// browser main. Matching is case-insensitive.
 fn main_name_priority(name: &str) -> u8 {
-    match name {
-        "CrRendererMain" | "RendererMain" => 3,
-        "Renderer" => 2, // legacy renderer main
-        "CrBrowserMain" | "Main" => 1,
-        _ => 0,
+    if name.eq_ignore_ascii_case("CrRendererMain") {
+        4
+    } else if name.eq_ignore_ascii_case("RendererMain")
+        || name.eq_ignore_ascii_case("Renderer Main")
+        || name.eq_ignore_ascii_case("CrRendererMainThread")
+        || name.eq_ignore_ascii_case("Renderer")
+    {
+        3
+    } else if name.eq_ignore_ascii_case("CrBrowserMain") || name.eq_ignore_ascii_case("Main") {
+        1
+    } else {
+        0
     }
 }
 
@@ -114,7 +132,11 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
         .iter()
         .filter(|(_, (name, n))| *n > 0 && (*name).is_some_and(|n| main_name_priority(n) > 0))
         .max_by_key(|(tid, (name, n))| {
-            (main_name_priority((*name).unwrap()), *n, std::cmp::Reverse(*tid))
+            (
+                main_name_priority((*name).unwrap()),
+                *n,
+                std::cmp::Reverse(*tid),
+            )
         })
     {
         return *tid;
@@ -150,22 +172,40 @@ pub fn detect_main_thread(events: &[TraceEvent]) -> u64 {
     0
 }
 
-/// Stable stem for a trace file: strips both `.json` and `.json.gz`.
+/// Stable stem for a trace file: strips both `.json` and `.json.gz`
+/// (case-insensitive: `Trace-….JSON.GZ` -> `Trace-…`).
 /// `Trace-20260731T180758.json.gz` -> `Trace-20260731T180758`.
 pub fn trace_stem(path: &Path) -> String {
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    let name = name.strip_suffix(".json").unwrap_or(name);
-    name.to_string()
+    if name.len() >= ".json".len()
+        && name[name.len() - ".json".len()..].eq_ignore_ascii_case(".json")
+    {
+        name[..name.len() - ".json".len()].to_string()
+    } else {
+        name.to_string()
+    }
 }
 
-/// Scan a directory for Chrome trace files (`*.json`, `*.json.gz`).
-/// When both `.json` and `.json.gz` exist for the same stem, keep only the
-/// `.json.gz` (smaller I/O). Sorted by name.
+/// Scan a directory for Chrome trace files (`*.json`, `*.json.gz`,
+/// case-insensitive). Non-trace files are skipped (counted — see
+/// `list_traces_with_skipped`).
 pub fn list_traces(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let mut by_stem: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    Ok(list_traces_with_skipped(dir)?.0)
+}
+
+/// Scan a directory for Chrome trace files (`*.json`, `*.json.gz`,
+/// case-insensitive). When both `.json` and `.json.gz` exist for the same
+/// stem, keep only the `.json.gz` (smaller I/O). Sorted by name. Returns the
+/// traces plus the count of skipped non-trace files.
+pub fn list_traces_with_skipped(
+    dir: &Path,
+) -> Result<(Vec<PathBuf>, usize), Box<dyn std::error::Error>> {
+    let mut by_stem: std::collections::BTreeMap<String, PathBuf> =
+        std::collections::BTreeMap::new();
+    let mut skipped = 0usize;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -176,21 +216,27 @@ pub fn list_traces(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error
             Some(n) => n,
             None => continue,
         };
-        let is_gz = name.ends_with(".json.gz");
-        let is_plain = !is_gz && name.ends_with(".json");
+        let lower = name.to_ascii_lowercase();
+        let is_gz = lower.ends_with(".json.gz");
+        let is_plain = !is_gz && lower.ends_with(".json");
         if !is_gz && !is_plain {
+            skipped += 1;
             continue;
         }
         let stem = trace_stem(&path);
         match by_stem.get(&stem) {
             // Prefer .gz: replace a plain entry when we meet its gz twin.
-            Some(existing) if existing.extension().and_then(|e| e.to_str()) == Some("gz") => {}
+            Some(existing)
+                if existing
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gz")) => {}
             _ => {
                 by_stem.insert(stem, path);
             }
         }
     }
-    Ok(by_stem.into_values().collect())
+    Ok((by_stem.into_values().collect(), skipped))
 }
 
 #[cfg(test)]
@@ -214,7 +260,13 @@ mod tests {
     }
 
     fn thread_name(tid: u64, name: &str) -> TraceEvent {
-        ev("thread_name", b'M', tid, None, Some(format!(r#"{{"name":"{name}"}}"#)))
+        ev(
+            "thread_name",
+            b'M',
+            tid,
+            None,
+            Some(format!(r#"{{"name":"{name}"}}"#)),
+        )
     }
 
     /// Regression: Chrome_IOThread's long RunTask appearing first in the file
@@ -276,5 +328,96 @@ mod tests {
             ev("RunTask", b'X', 2, Some(100.0), None),
         ];
         assert_eq!(detect_main_thread(&events), 2);
+    }
+
+    /// Thread-name matching is case-insensitive and covers the renderer-main
+    /// aliases; CrRendererMain stays the highest priority.
+    #[test]
+    fn main_detection_is_case_insensitive_with_aliases() {
+        for alias in [
+            "Renderer Main",
+            "CrRendererMainThread",
+            "renderer",
+            "RENDERERMAIN",
+        ] {
+            let events = vec![
+                thread_name(1, "CrBrowserMain"),
+                thread_name(2, alias),
+                ev("RunTask", b'X', 1, Some(100.0), None),
+                ev("RunTask", b'X', 2, Some(100.0), None),
+            ];
+            assert_eq!(detect_main_thread(&events), 2, "alias {alias} must win");
+        }
+        // CrRendererMain outranks a same-count RendererMain alias.
+        let events = vec![
+            thread_name(1, "crrenderermain"),
+            thread_name(2, "RendererMain"),
+            ev("RunTask", b'X', 1, Some(100.0), None),
+            ev("RunTask", b'X', 2, Some(100.0), None),
+        ];
+        assert_eq!(detect_main_thread(&events), 1);
+    }
+
+    /// GPU/compositor/raster/audio/media lanes never win the long-task
+    /// fallback, and never shadow a real main thread.
+    #[test]
+    fn known_non_main_covers_gpu_audio_media_workers() {
+        for lane in [
+            "Chrome_InProcGpuThread",
+            "VizCompositorThread",
+            "CompositorTileWorker",
+            "RasterWorker",
+            "TileWorker",
+            "GPU Process",
+            "AudioOutput",
+            "Media",
+            "audiooutput",
+        ] {
+            let events = vec![
+                thread_name(100, lane),
+                ev("RunTask", b'X', 100, Some(600_000.0), None),
+                ev("RunTask", b'X', 300, Some(550_000.0), None),
+            ];
+            assert_eq!(detect_main_thread(&events), 300, "lane {lane} must lose");
+        }
+        // Real main threads are not excluded.
+        for main in ["CrRendererMain", "RendererMain", "CrBrowserMain"] {
+            let events = vec![
+                thread_name(1, main),
+                ev("RunTask", b'X', 1, Some(600_000.0), None),
+                ev("RunTask", b'X', 2, Some(100.0), None),
+            ];
+            assert_eq!(detect_main_thread(&events), 1, "main {main} must win");
+        }
+    }
+
+    /// Extension matching is case-insensitive and non-trace files are
+    /// skipped but counted.
+    #[test]
+    fn list_traces_matches_case_insensitively_and_counts_skipped() {
+        let dir = std::env::temp_dir().join(format!("chperf-list-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.JSON"), "{}").unwrap();
+        std::fs::write(dir.join("b.Json.GZ"), "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(dir.join("data.csv"), "x").unwrap();
+        let (traces, skipped) = super::list_traces_with_skipped(&dir).unwrap();
+        assert_eq!(traces.len(), 2);
+        assert_eq!(skipped, 2);
+        assert!(traces.iter().all(|p| {
+            let n = p
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase();
+            n.ends_with(".json") || n.ends_with(".json.gz")
+        }));
+        // The plain helper agrees.
+        let plain = super::list_traces(&dir).unwrap();
+        assert_eq!(plain.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(super::trace_stem(std::path::Path::new("T.JSON.GZ")), "T");
     }
 }

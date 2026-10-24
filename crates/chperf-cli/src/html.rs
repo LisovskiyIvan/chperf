@@ -2,9 +2,9 @@
 //! charts (no external assets, no JS). Renders the full analysis plus the
 //! memory / input / async sections for one or two (compared) traces.
 
+use crate::app::App;
 use chperf_core::analysis::*;
 use chperf_core::{inspect, trace};
-use crate::app::App;
 use serde_json::Value;
 
 // ── Formatting helpers ──
@@ -36,7 +36,10 @@ fn ji(v: &Value, key: &str) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
 }
 fn js(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 // ── HTML building blocks ──
@@ -59,7 +62,10 @@ fn table(out: &mut String, headers: &[&str], rows: Vec<Vec<String>>) {
 }
 
 fn section(out: &mut String, title: &str) {
-    out.push_str(&format!("<section class=\"section\"><h2>{}</h2>", esc(title)));
+    out.push_str(&format!(
+        "<section class=\"section\"><h2>{}</h2>",
+        esc(title)
+    ));
 }
 
 fn metric(out: &mut String, label: &str, value: &str, sub: &str) {
@@ -72,21 +78,31 @@ fn metric(out: &mut String, label: &str, value: &str, sub: &str) {
     out.push_str("</div>");
 }
 
-fn change_cell(a: f64, b: f64) -> String {
-    if a <= 0.0 && b <= 0.0 {
-        return "<span class=\"muted\">—</span>".to_string();
+fn change_cell_fmt(a: f64, b: f64, fmt: &dyn Fn(f64) -> String) -> String {
+    let s = chperf_core::analysis::fmt_change(a, b, fmt);
+    if s.contains('→') {
+        return format!("<span class=\"pos\">{}</span>", esc(&s));
     }
-    if a <= 0.0 {
-        return "<span class=\"pos\">new</span>".to_string();
-    }
-    let d = (b - a) / a * 100.0;
-    if d > 5.0 {
-        format!("<span class=\"neg\">+{:.0}%</span>", d)
-    } else if d < -5.0 {
-        format!("<span class=\"pos\">{:.0}%</span>", d)
+    let v: f64 = s
+        .trim_end_matches('%')
+        .trim_start_matches('+')
+        .parse()
+        .unwrap_or(0.0);
+    if s.starts_with('+') && v > 0.5 {
+        format!("<span class=\"neg\">{}</span>", esc(&s))
+    } else if s.starts_with('-') && v < -5.0 {
+        format!("<span class=\"pos\">{}</span>", esc(&s))
     } else {
-        format!("<span class=\"muted\">{:+.0}%</span>", d)
+        format!("<span class=\"muted\">{}</span>", esc(&s))
     }
+}
+
+fn change_cell_us(a: f64, b: f64) -> String {
+    change_cell_fmt(a, b, &dur)
+}
+
+fn change_cell_n(a: f64, b: f64) -> String {
+    change_cell_fmt(a, b, &|v| format!("{:.0}", v))
 }
 
 // ── SVG line chart ──
@@ -110,10 +126,7 @@ fn line_chart(title: &str, points: &[(f64, f64)], y_fmt: &str, color: &str) -> S
     const PT: f64 = 14.0;
     const PB: f64 = 30.0;
     let mut s = String::new();
-    s.push_str(&format!(
-        "<div class=\"chart-title\">{}</div>",
-        esc(title)
-    ));
+    s.push_str(&format!("<div class=\"chart-title\">{}</div>", esc(title)));
     if points.len() < 2 {
         return format!("{s}<div class=\"muted\">No data.</div>");
     }
@@ -138,7 +151,10 @@ fn line_chart(title: &str, points: &[(f64, f64)], y_fmt: &str, color: &str) -> S
         let yy = sy(y);
         s.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" class=\"grid\"/>",
-            PL, yy, W - PR, yy
+            PL,
+            yy,
+            W - PR,
+            yy
         ));
         let label = format!("{:.1}{}", y, y_fmt);
         s.push_str(&format!(
@@ -153,11 +169,17 @@ fn line_chart(title: &str, points: &[(f64, f64)], y_fmt: &str, color: &str) -> S
     let xu = if x_unit > 1.0 { "s" } else { "ms" };
     s.push_str(&format!(
         "<text x=\"{:.1}\" y=\"{:.0}\" class=\"axis\">{:.1}{}</text>",
-        PL, H - 8.0, x0 / x_unit, xu
+        PL,
+        H - 8.0,
+        x0 / x_unit,
+        xu
     ));
     s.push_str(&format!(
         "<text x=\"{:.1}\" y=\"{:.0}\" class=\"axis\" text-anchor=\"end\">{:.1}{}</text>",
-        W - PR, H - 8.0, x1 / x_unit, xu
+        W - PR,
+        H - 8.0,
+        x1 / x_unit,
+        xu
     ));
 
     // Area + line.
@@ -177,7 +199,10 @@ fn line_chart(title: &str, points: &[(f64, f64)], y_fmt: &str, color: &str) -> S
         sx(pts[0].0),
         sy(ymin)
     );
-    s.push_str(&format!("<path d=\"{}\" class=\"area\" style=\"fill:{}\"/>", area, color));
+    s.push_str(&format!(
+        "<path d=\"{}\" class=\"area\" style=\"fill:{}\"/>",
+        area, color
+    ));
     s.push_str(&format!(
         "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.8\"/>",
         d, color
@@ -230,18 +255,30 @@ pub fn export_html(
     let mut o = String::new();
     o.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     o.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-    o.push_str(&format!("<title>chperf: {}</title>", esc(&app.trace_name_a)));
+    o.push_str(&format!(
+        "<title>chperf: {}</title>",
+        esc(&app.trace_name_a)
+    ));
     o.push_str(CSS);
     o.push_str("</head><body><div class=\"container\">");
 
     // ── Header ──
-    o.push_str(&format!("<h1>Chrome Trace Analysis: <span class=\"muted\">{}</span></h1>", esc(&app.trace_name_a)));
+    o.push_str(&format!(
+        "<h1>Chrome Trace Analysis: <span class=\"muted\">{}</span></h1>",
+        esc(&app.trace_name_a)
+    ));
     if let Some(ref meta) = app.metadata {
         if let Some(ref url) = meta.page_url {
-            o.push_str(&format!("<div class=\"meta\">URL: <code>{}</code></div>", esc(url)));
+            o.push_str(&format!(
+                "<div class=\"meta\">URL: <code>{}</code></div>",
+                esc(url)
+            ));
         }
         if let Some(ref start) = meta.start_time {
-            o.push_str(&format!("<div class=\"meta\">Recorded: {}</div>", esc(start)));
+            o.push_str(&format!(
+                "<div class=\"meta\">Recorded: {}</div>",
+                esc(start)
+            ));
         }
         if let Some(dpr) = meta.host_dpr {
             o.push_str(&format!("<div class=\"meta\">DPR: {:.2}</div>", dpr));
@@ -254,17 +291,58 @@ pub fn export_html(
         ));
     }
 
+    // ── Trace health (always first) ──
+    section(&mut o, "Trace health");
+    o.push_str(&format!(
+        "<p class=\"muted\">Events: {} parsed / {} skipped / {} malformed · main tid {} · {} threads · span {} · frame budget {} · CPU throttle {} · network {}</p>",
+        app.trace_stats.parsed,
+        app.trace_stats.skipped,
+        app.trace_stats.malformed,
+        app.main_tid,
+        app.thread_count,
+        dur(app.trace_span_us),
+        match app.frame_budget_us.round() as i64 {
+            8333 => "8.33ms (120Hz detected)",
+            11111 => "11.11ms (90Hz detected)",
+            16667 => "16.67ms (60Hz detected)",
+            _ => "custom",
+        },
+        app.metadata.as_ref().and_then(|m| m.cpu_throttling).map(|v| format!("{:.0}x", v)).unwrap_or_else(|| "1x".to_string()),
+        app.metadata.as_ref().and_then(|m| m.network_throttling.clone()).unwrap_or_else(|| "—".to_string()),
+    ));
+    o.push_str("</section>");
+
     // ── Overview cards ──
     o.push_str("<div class=\"metrics\">");
-    metric(&mut o, "Duration", &dur(app.summary.total_trace_duration_us), "");
+    metric(
+        &mut o,
+        "Duration",
+        &dur(app.summary.total_trace_duration_us),
+        "",
+    );
     let busy = if app.summary.total_trace_duration_us > 0.0 {
         app.summary.main_thread_busy_us / app.summary.total_trace_duration_us * 100.0
     } else {
         0.0
     };
-    metric(&mut o, "Main thread busy", &format!("{:.1}%", busy), &dur(app.summary.main_thread_busy_us));
-    metric(&mut o, "Long tasks (>50ms)", &format!("{}", app.summary.long_task_count), "");
-    metric(&mut o, "Dropped frames", &format!("{}", app.jank.total_dropped), "");
+    metric(
+        &mut o,
+        "Main thread busy",
+        &format!("{:.1}%", busy),
+        &dur(app.summary.main_thread_busy_us),
+    );
+    metric(
+        &mut o,
+        "Long tasks (>50ms)",
+        &format!("{}", app.summary.long_task_count),
+        "",
+    );
+    metric(
+        &mut o,
+        "Dropped frames",
+        &format!("{}", app.jank.total_dropped),
+        "",
+    );
     o.push_str("</div>");
 
     // ── Memory ──
@@ -274,37 +352,72 @@ pub fn export_html(
     if jf(summary, "samples") > 0.0 {
         section(&mut o, "Memory timeline");
         o.push_str("<div class=\"metrics\">");
-        metric(&mut o, "JS heap (start → end)", &format!("{:.1} MB", jf(summary, "first_heap_mb")), "");
+        metric(
+            &mut o,
+            "JS heap (start → end)",
+            &format!("{:.1} MB", jf(summary, "first_heap_mb")),
+            "",
+        );
         metric(
             &mut o,
             "Heap growth",
             &format!("{:+.1} MB", jf(summary, "growth_mb")),
             &format!("peak {:.1} MB", jf(summary, "peak_heap_mb")),
         );
-        metric(&mut o, "DOM nodes (peak)", &format!("{:.0}", jf(summary, "peak_nodes")), "");
+        metric(
+            &mut o,
+            "DOM nodes (peak)",
+            &format!("{:.0}", jf(summary, "peak_nodes")),
+            "",
+        );
         metric(
             &mut o,
             "Listeners / documents",
-            &format!("{:.0} / {:.0}", jf(summary, "peak_listeners"), jf(summary, "peak_documents")),
+            &format!(
+                "{:.0} / {:.0}",
+                jf(summary, "peak_listeners"),
+                jf(summary, "peak_documents")
+            ),
             "",
         );
         o.push_str("</div>");
-        o.push_str(&line_chart("JS heap (MB)", &memory_points(&mem["samples"]), "", "#3b82f6"));
-        o.push_str(&line_chart("DOM nodes", &nodes_points(&mem["samples"]), "", "#10b981"));
+        o.push_str(&line_chart(
+            "JS heap (MB)",
+            &memory_points(&mem["samples"]),
+            "",
+            "#3b82f6",
+        ));
+        o.push_str(&line_chart(
+            "DOM nodes",
+            &nodes_points(&mem["samples"]),
+            "",
+            "#10b981",
+        ));
         o.push_str("</section>");
     }
 
     // ── CPU top functions ──
     let cp = &app.cpu_profile;
-    if !cp.functions.is_empty() {
-        section(&mut o, "CPU profile — top functions by self time");
+    section(&mut o, "CPU profile — top functions by self time");
+    if cp.functions.is_empty() {
+        o.push_str("<p class=\"muted\">none found (0 functions).</p>");
+        o.push_str("</section>");
+    } else {
         let total = cp.total_sample_time_us;
         let mut rows = Vec::new();
         let mut cum = 0.0;
         for f in cp.functions.iter().take(30) {
-            let pct = if total > 0.0 { f.self_time_us / total * 100.0 } else { 0.0 };
+            let pct = if total > 0.0 {
+                f.self_time_us / total * 100.0
+            } else {
+                0.0
+            };
             cum += pct;
-            let name = if f.function_name.is_empty() { "(anonymous)" } else { &f.function_name };
+            let name = if f.function_name.is_empty() {
+                "(anonymous)"
+            } else {
+                &f.function_name
+            };
             let short = f.url.rfind('/').map(|i| &f.url[i + 1..]).unwrap_or(&f.url);
             rows.push(vec![
                 format!("{:.1}%", pct),
@@ -315,171 +428,542 @@ pub fn export_html(
                 esc(short),
             ]);
         }
-        table(&mut o, &["self %", "source", "function", "self time", "cum %", "file"], rows);
+        table(
+            &mut o,
+            &[
+                "self % of sampled time",
+                "source",
+                "function",
+                "self time",
+                "cum % of sampled time",
+                "file",
+            ],
+            rows,
+        );
         o.push_str("</section>");
     }
 
-    // ── Event breakdown ──
-    if !app.summary.event_stats.is_empty() {
-        section(&mut o, "Event breakdown");
+    // ── Event breakdown (top 30) ──
+    section(&mut o, "Event breakdown");
+    if app.summary.event_stats.is_empty() {
+        o.push_str("<p class=\"muted\">none found (0 event types).</p>");
+    } else {
         let rows = app
             .summary
             .event_stats
             .iter()
+            .take(30)
             .map(|s| {
                 vec![
                     esc(s.name),
                     format!("{}", s.count),
                     dur(s.total_time_us),
+                    dur(s.self_time_us),
                     dur(s.avg_time_us),
                     format!("{:.1}%", s.pct_of_trace),
+                    format!("{:.1}%", s.self_pct_of_trace),
                 ]
             })
             .collect();
-        table(&mut o, &["event", "count", "total", "avg", "% of trace"], rows);
-        o.push_str("</section>");
+        table(
+            &mut o,
+            &[
+                "event",
+                "count",
+                "total",
+                "self",
+                "avg",
+                "% of trace",
+                "self % of trace",
+            ],
+            rows,
+        );
+        if app.summary.event_stats.len() > 30 {
+            o.push_str(&format!(
+                "<p class=\"muted\">{} more, use --events/--stats for the full list.</p>",
+                app.summary.event_stats.len() - 30
+            ));
+        }
     }
+    o.push_str("</section>");
 
     // ── Input latency ──
     let (_, inp) = inspect::input_section(events_a, &scope, 30, min_ts_a);
     if let Some(types) = inp["types"].as_array()
-        && !types.is_empty() {
-            section(&mut o, "Input latency by type");
-            let rows = types
+        && !types.is_empty()
+    {
+        section(&mut o, "Input latency by type");
+        let rows = types
+            .iter()
+            .map(|t| {
+                vec![
+                    esc(&js(t, "type")),
+                    format!("{}", ji(t, "count")),
+                    dur(jf(t, "total_us")),
+                    dur(jf(t, "avg_us")),
+                    dur(jf(t, "p50_us")),
+                    dur(jf(t, "p99_us")),
+                    dur(jf(t, "max_us")),
+                ]
+            })
+            .collect();
+        table(
+            &mut o,
+            &["type", "count", "total", "avg", "p50", "p99", "max"],
+            rows,
+        );
+        if let Some(worst) = inp["worst"].as_array()
+            && !worst.is_empty()
+        {
+            o.push_str("<h3>Worst inputs</h3>");
+            let rows = worst
                 .iter()
-                .map(|t| {
+                .take(20)
+                .map(|w| {
                     vec![
-                        esc(&js(t, "type")),
-                        format!("{}", ji(t, "count")),
-                        dur(jf(t, "total_us")),
-                        dur(jf(t, "avg_us")),
-                        dur(jf(t, "p50_us")),
-                        dur(jf(t, "p99_us")),
-                        dur(jf(t, "max_us")),
+                        format!("{:.2}ms", jf(w, "t_us") / 1000.0),
+                        dur(jf(w, "dur_us")),
+                        esc(&js(w, "type")),
                     ]
                 })
                 .collect();
-            table(&mut o, &["type", "count", "total", "avg", "p50", "p99", "max"], rows);
-            if let Some(worst) = inp["worst"].as_array()
-                && !worst.is_empty() {
-                    o.push_str("<h3>Worst inputs</h3>");
-                    let rows = worst
-                        .iter()
-                        .take(20)
-                        .map(|w| {
-                            vec![
-                                format!("{:.2}ms", jf(w, "t_us") / 1000.0),
-                                dur(jf(w, "dur_us")),
-                                esc(&js(w, "type")),
-                            ]
-                        })
-                        .collect();
-                    table(&mut o, &["t", "duration", "type"], rows);
-                }
-            o.push_str("</section>");
+            table(&mut o, &["t", "duration", "type"], rows);
         }
+        o.push_str("</section>");
+    }
 
     // ── Async tasks ──
     let (_, asy) = inspect::async_section(events_a, &scope, 30, min_ts_a);
     if let Some(tasks) = asy["tasks"].as_array()
-        && !tasks.is_empty() {
-            section(&mut o, "Async tasks (s/f paired)");
-            let rows = tasks
+        && !tasks.is_empty()
+    {
+        section(&mut o, "Async tasks (s/f paired)");
+        let rows = tasks
+            .iter()
+            .map(|t| {
+                vec![
+                    esc(&js(t, "name")),
+                    format!("{}", ji(t, "count")),
+                    dur(jf(t, "total_us")),
+                    dur(jf(t, "avg_us")),
+                    dur(jf(t, "p50_us")),
+                    dur(jf(t, "p99_us")),
+                    dur(jf(t, "max_us")),
+                ]
+            })
+            .collect();
+        table(
+            &mut o,
+            &["name", "count", "total", "avg", "p50", "p99", "max"],
+            rows,
+        );
+        if let Some(longest) = asy["longest"].as_array()
+            && !longest.is_empty()
+        {
+            o.push_str("<h3>Longest tasks</h3>");
+            let rows = longest
                 .iter()
-                .map(|t| {
+                .take(20)
+                .map(|w| {
                     vec![
-                        esc(&js(t, "name")),
-                        format!("{}", ji(t, "count")),
-                        dur(jf(t, "total_us")),
-                        dur(jf(t, "avg_us")),
-                        dur(jf(t, "p50_us")),
-                        dur(jf(t, "p99_us")),
-                        dur(jf(t, "max_us")),
+                        format!("{:.2}ms", jf(w, "t_us") / 1000.0),
+                        dur(jf(w, "dur_us")),
+                        esc(&js(w, "name")),
                     ]
                 })
                 .collect();
-            table(&mut o, &["name", "count", "total", "avg", "p50", "p99", "max"], rows);
-            if let Some(longest) = asy["longest"].as_array()
-                && !longest.is_empty() {
-                    o.push_str("<h3>Longest tasks</h3>");
-                    let rows = longest
-                        .iter()
-                        .take(20)
-                        .map(|w| {
-                            vec![
-                                format!("{:.2}ms", jf(w, "t_us") / 1000.0),
-                                dur(jf(w, "dur_us")),
-                                esc(&js(w, "name")),
-                            ]
-                        })
-                        .collect();
-                    table(&mut o, &["t", "duration", "name"], rows);
-                }
-            o.push_str("</section>");
+            table(&mut o, &["t", "duration", "name"], rows);
         }
-
-    // ── Jank clusters ──
-    if !app.jank.clusters.is_empty() || app.jank.total_dropped > 0 {
-        section(&mut o, "Jank clusters");
-        o.push_str(&format!(
-            "<p class=\"muted\">Bucket {}ms — dropped frames and ≥16.7ms spikes below the Long Task threshold.</p>",
-            app.jank.bucket_ms.round() as i64
-        ));
-        let rows = app
-            .jank
-            .clusters
-            .iter()
-            .map(|c| {
-                let calls = c
-                    .top_calls
-                    .iter()
-                    .map(|(n, d)| format!("{} ({})", n, dur(*d)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                vec![
-                    dur(c.start_us),
-                    dur(c.end_us - c.start_us),
-                    dur(c.busy_us),
-                    dur(c.max_run_us),
-                    format!("{}", c.dropped_frames),
-                    esc(&calls),
-                ]
-            })
-            .collect();
-        table(&mut o, &["start", "span", "busy", "max RunTask", "dropped", "what happened"], rows);
         o.push_str("</section>");
     }
 
-    // ── Scroll frames ──
-    if !app.scroll_frames.tasks.is_empty() {
-        section(&mut o, "Scroll frame analysis");
+    // ── Jank clusters (explicit empty) ──
+    section(&mut o, "Jank clusters");
+    {
+        let budget_label = match app.frame_budget_us.round() as i64 {
+            8333 => "8.33ms (120Hz detected)",
+            11111 => "11.11ms (90Hz detected)",
+            16667 => "16.67ms (60Hz detected)",
+            _ => "custom",
+        };
+        o.push_str(&format!(
+            "<p class=\"muted\">Bucket {}ms · frame budget {} — dropped frames and over-budget spikes below the Long Task threshold.</p>",
+            app.jank.bucket_ms.round() as i64, budget_label
+        ));
+        if app.jank.clusters.is_empty() && app.jank.total_dropped == 0 {
+            o.push_str("<p class=\"muted\">none found (0 clusters, 0 dropped frames).</p>");
+            o.push_str("</section>");
+        } else {
+            let rows = app
+                .jank
+                .clusters
+                .iter()
+                .map(|c| {
+                    let calls = c
+                        .top_calls
+                        .iter()
+                        .map(|(n, d)| format!("{} ({})", n, dur(*d)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    vec![
+                        dur(c.start_us),
+                        dur(c.end_us - c.start_us),
+                        dur(c.busy_us),
+                        dur(c.max_run_us),
+                        format!("{}", c.dropped_frames),
+                        esc(&calls),
+                    ]
+                })
+                .collect();
+            table(
+                &mut o,
+                &[
+                    "start",
+                    "span",
+                    "busy",
+                    "max RunTask",
+                    "dropped",
+                    "what happened",
+                ],
+                rows,
+            );
+            o.push_str("</section>");
+        }
+    }
+
+    // ── Frame-blocking tasks (explicit empty) ──
+    section(&mut o, "Frame-blocking main-thread tasks");
+    {
         let sf = &app.scroll_frames;
+        if sf.heuristic_fallback {
+            o.push_str("<p class=\"muted\">Heuristic fallback active: no scroll/input evidence in trace.</p>");
+        }
+        if sf.tasks.is_empty() {
+            o.push_str("<p class=\"muted\">none found (0 frame-blocking tasks).</p>");
+            o.push_str("</section>");
+        } else {
+            o.push_str("<div class=\"metrics\">");
+            metric(
+                &mut o,
+                "Frame-blocking tasks",
+                &format!("{}", sf.tasks.len()),
+                "",
+            );
+            metric(
+                &mut o,
+                "Avg duration",
+                &dur(sf.avg.dur_us),
+                &format!("bottleneck: {}", sf.avg.bottleneck()),
+            );
+            metric(
+                &mut o,
+                "P50 / P90 / P99",
+                &format!(
+                    "{} / {} / {}",
+                    dur(sf.percentiles.p50_us),
+                    dur(sf.percentiles.p90_us),
+                    dur(sf.percentiles.p99_us)
+                ),
+                "",
+            );
+            o.push_str("</div>");
+            let rows = sf
+                .tasks
+                .iter()
+                .take(15)
+                .map(|t| {
+                    vec![
+                        dur(t.dur_us),
+                        t.bottleneck().to_string(),
+                        dur(t.js_us),
+                        dur(t.ult_us),
+                        dur(t.layout_us),
+                        dur(t.paint_us),
+                    ]
+                })
+                .collect();
+            table(
+                &mut o,
+                &["duration", "bottleneck", "JS", "style", "layout", "paint"],
+                rows,
+            );
+            o.push_str("</section>");
+        }
+    }
+
+    // ── Loading ──
+    section(&mut o, "Loading");
+    {
+        let ld = &app.loading;
         o.push_str("<div class=\"metrics\">");
-        metric(&mut o, "Scroll tasks", &format!("{}", sf.tasks.len()), "");
-        metric(&mut o, "Avg duration", &dur(sf.avg.dur_us), &format!("bottleneck: {}", sf.avg.bottleneck()));
         metric(
             &mut o,
-            "P50 / P90 / P99",
-            &format!("{} / {} / {}", dur(sf.percentiles.p50_us), dur(sf.percentiles.p90_us), dur(sf.percentiles.p99_us)),
+            "FCP",
+            &ld.first_contentful_paint_us
+                .map(dur)
+                .unwrap_or_else(|| "none".to_string()),
             "",
         );
+        metric(
+            &mut o,
+            "LCP",
+            &ld.largest_contentful_paint_us
+                .map(dur)
+                .unwrap_or_else(|| "none".to_string()),
+            "",
+        );
+        metric(
+            &mut o,
+            "User timing",
+            &format!("{}", ld.user_timing.len()),
+            "",
+        );
+        metric(&mut o, "LCP candidates", &format!("{}", ld.lcp.len()), "");
         o.push_str("</div>");
-        let rows = sf
-            .tasks
+        if ld.lcp.is_empty() {
+            o.push_str("<p class=\"muted\">No LCP candidates found.</p>");
+        } else {
+            let rows = ld
+                .lcp
+                .iter()
+                .take(10)
+                .map(|c| {
+                    vec![
+                        dur(c.ts_us),
+                        c.size
+                            .map(|v| format!("{:.0}", v))
+                            .unwrap_or_else(|| "—".to_string()),
+                        esc(c.node.as_deref().unwrap_or("—")),
+                        esc(c.url.as_deref().unwrap_or("—")),
+                    ]
+                })
+                .collect();
+            table(&mut o, &["t", "size", "node", "url"], rows);
+        }
+        if !ld.user_timing.is_empty() {
+            let rows = ld
+                .user_timing
+                .iter()
+                .take(10)
+                .map(|u| {
+                    vec![
+                        dur(u.ts_us),
+                        u.dur_us.map(dur).unwrap_or_else(|| "—".to_string()),
+                        esc(&u.name),
+                    ]
+                })
+                .collect();
+            table(&mut o, &["t", "dur", "name"], rows);
+        } else {
+            o.push_str("<p class=\"muted\">No user timing entries found.</p>");
+        }
+        o.push_str("</section>");
+    }
+
+    // ── Network ──
+    section(&mut o, "Network");
+    {
+        let nw = &app.network;
+        o.push_str("<div class=\"metrics\">");
+        metric(&mut o, "Requests", &format!("{}", nw.request_count), "");
+        metric(&mut o, "Cache hits", &format!("{}", nw.cache_hits), "");
+        metric(
+            &mut o,
+            "Render-blocking",
+            &format!("{}", nw.render_blocking_count),
+            "",
+        );
+        metric(&mut o, "Total wall", &dur(nw.total_wall_us), "");
+        o.push_str("</div>");
+        if nw.requests.is_empty() {
+            o.push_str("<p class=\"muted\">none found (0 requests).</p>");
+        } else {
+            let rows = nw
+                .slowest(10)
+                .iter()
+                .map(|q| {
+                    vec![
+                        q.total_us.map(dur).unwrap_or_else(|| "—".to_string()),
+                        esc(&q.url),
+                        esc(q.priority.as_deref().unwrap_or("—")),
+                        if q.from_cache {
+                            "yes".to_string()
+                        } else {
+                            "no".to_string()
+                        },
+                    ]
+                })
+                .collect();
+            table(&mut o, &["total", "url", "priority", "cached"], rows);
+        }
+        o.push_str("</section>");
+    }
+
+    // ── Raster / Compositor ──
+    section(&mut o, "Raster / Compositor");
+    {
+        let rs = &app.raster;
+        o.push_str("<div class=\"metrics\">");
+        metric(&mut o, "Raster", &dur(rs.total_raster_us), "");
+        metric(
+            &mut o,
+            "Decode",
+            &dur(rs.total_decode_us),
+            &format!("max {}", dur(rs.max_decode_us)),
+        );
+        metric(&mut o, "Composite", &dur(rs.total_composite_us), "");
+        metric(&mut o, "GPU", &dur(rs.gpu_task_us), "");
+        o.push_str("</div>");
+        if rs.lanes.is_empty() {
+            o.push_str("<p class=\"muted\">none found (0 lanes).</p>");
+        } else {
+            let rows = rs
+                .lanes
+                .iter()
+                .take(15)
+                .map(|l| {
+                    vec![
+                        format!("{}", l.tid),
+                        esc(if l.thread_name.is_empty() {
+                            "—"
+                        } else {
+                            &l.thread_name
+                        }),
+                        esc(&l.name),
+                        format!("{}", l.count),
+                        dur(l.total_us),
+                        dur(l.max_us),
+                    ]
+                })
+                .collect();
+            table(
+                &mut o,
+                &["tid", "thread", "event", "count", "total", "max"],
+                rows,
+            );
+        }
+        if rs.decode_hotspots.is_empty() {
+            o.push_str("<p class=\"muted\">No decode hotspots found.</p>");
+        } else {
+            let rows = rs
+                .decode_hotspots
+                .iter()
+                .take(10)
+                .map(|h| {
+                    vec![
+                        dur(h.dur_us),
+                        esc(if h.url_or_node.is_empty() {
+                            "—"
+                        } else {
+                            &h.url_or_node
+                        }),
+                    ]
+                })
+                .collect();
+            table(&mut o, &["dur", "source"], rows);
+        }
+        o.push_str("</section>");
+    }
+
+    // ── Style / Reflow / Layout (explicit empty) ──
+    section(&mut o, "Style Recalc (UpdateLayoutTree)");
+    {
+        let sr = &app.style_recalc;
+        if sr.entries.is_empty() {
+            o.push_str("<p class=\"muted\">none found (0 events).</p>");
+        } else {
+            o.push_str(&format!(
+                "<p class=\"muted\">{} events · avg {:.0} · max {}</p>",
+                sr.total_count, sr.avg_elements, sr.max_elements
+            ));
+            let rows = sr
+                .entries
+                .iter()
+                .take(10)
+                .map(|e| vec![dur(e.dur_us), format!("{}", e.element_count)])
+                .collect();
+            table(&mut o, &["duration", "elements"], rows);
+        }
+        o.push_str("</section>");
+    }
+    section(&mut o, "Forced Reflow (Layout Thrashing)");
+    {
+        let fr = &app.forced_reflows;
+        if fr.entries.is_empty() {
+            o.push_str("<p class=\"muted\">none found (0 tasks with thrashing).</p>");
+        } else {
+            o.push_str(&format!(
+                "<p class=\"muted\">{} tasks · {} reflows · {}</p>",
+                fr.entries.len(),
+                fr.total_reflows,
+                dur(fr.total_layout_time_us)
+            ));
+            let rows = fr
+                .entries
+                .iter()
+                .take(10)
+                .map(|e| {
+                    vec![
+                        dur(e.task_dur_us),
+                        format!("{}", e.reflow_count),
+                        dur(e.layout_time_us),
+                    ]
+                })
+                .collect();
+            table(&mut o, &["task", "reflows", "layout"], rows);
+        }
+        o.push_str("</section>");
+    }
+    section(&mut o, "Layout Dirty Objects");
+    {
+        let ld = &app.layout_dirty;
+        if ld.entries.is_empty() {
+            o.push_str("<p class=\"muted\">none found (0 layout events).</p>");
+        } else {
+            o.push_str(&format!(
+                "<p class=\"muted\">{} events · avg {:.0} · max {}</p>",
+                ld.entries.len(),
+                ld.avg_dirty,
+                ld.max_dirty
+            ));
+            let rows = ld
+                .entries
+                .iter()
+                .take(10)
+                .map(|e| {
+                    vec![
+                        dur(e.dur_us),
+                        format!("{}", e.dirty_count),
+                        format!("{}", e.total_count),
+                    ]
+                })
+                .collect();
+            table(&mut o, &["duration", "dirty", "total"], rows);
+        }
+        o.push_str("</section>");
+    }
+
+    // ── Official responsiveness (only if non-empty) ──
+    if !app.official_long_tasks.is_empty() {
+        section(&mut o, "Official responsiveness signals (EventTiming)");
+        let rows = app
+            .official_long_tasks
             .iter()
-            .take(15)
-            .map(|t| {
+            .take(20)
+            .map(|l| {
                 vec![
-                    dur(t.dur_us),
-                    t.bottleneck().to_string(),
-                    dur(t.js_us),
-                    dur(t.ult_us),
-                    dur(t.layout_us),
-                    dur(t.paint_us),
+                    dur(l.ts_us),
+                    l.dur_us.map(dur).unwrap_or_else(|| "—".to_string()),
+                    esc(&l.name),
+                    esc(if l.interaction_type.is_empty() {
+                        "—"
+                    } else {
+                        &l.interaction_type
+                    }),
                 ]
             })
             .collect();
-        table(&mut o, &["duration", "bottleneck", "JS", "style", "layout", "paint"], rows);
+        table(&mut o, &["t", "dur", "name", "interaction"], rows);
         o.push_str("</section>");
     }
 
@@ -516,20 +1000,67 @@ pub fn export_html(
         let sa = &cmp.summary_a;
         let sb = &cmp.summary_b;
         let mut rows: Vec<Vec<String>> = vec![
-            vec!["Total Blocking Time (TBT)".into(), dur(sa.total_blocking_time_us), dur(sb.total_blocking_time_us), change_cell(sa.total_blocking_time_us, sb.total_blocking_time_us)],
-            vec!["Long tasks".into(), format!("{}", sa.long_task_count), format!("{}", sb.long_task_count), change_cell(sa.long_task_count as f64, sb.long_task_count as f64)],
-            vec!["Worst task".into(), dur(sa.long_tasks_top.first().copied().unwrap_or(0.0)), dur(sb.long_tasks_top.first().copied().unwrap_or(0.0)), change_cell(sa.long_tasks_top.first().copied().unwrap_or(0.0), sb.long_tasks_top.first().copied().unwrap_or(0.0))],
-            vec!["Dropped frames".into(), format!("{}", cmp.jank_a.total_dropped), format!("{}", cmp.jank_b.total_dropped), change_cell(cmp.jank_a.total_dropped as f64, cmp.jank_b.total_dropped as f64)],
-            vec!["Forced reflows".into(), format!("{}", cmp.forced_reflow_a.total_reflows), format!("{}", cmp.forced_reflow_b.total_reflows), change_cell(cmp.forced_reflow_a.total_reflows as f64, cmp.forced_reflow_b.total_reflows as f64)],
-            vec!["Main thread busy".into(), dur(sa.main_thread_busy_us), dur(sb.main_thread_busy_us), change_cell(sa.main_thread_busy_us, sb.main_thread_busy_us)],
-            vec!["Layout dirty (avg)".into(), format!("{:.0}", cmp.layout_a.avg_dirty), format!("{:.0}", cmp.layout_b.avg_dirty), change_cell(cmp.layout_a.avg_dirty, cmp.layout_b.avg_dirty)],
+            vec![
+                "Total Blocking Time (TBT)".into(),
+                dur(sa.total_blocking_time_us),
+                dur(sb.total_blocking_time_us),
+                change_cell_us(sa.total_blocking_time_us, sb.total_blocking_time_us),
+            ],
+            vec![
+                "Long tasks".into(),
+                format!("{}", sa.long_task_count),
+                format!("{}", sb.long_task_count),
+                change_cell_n(sa.long_task_count as f64, sb.long_task_count as f64),
+            ],
+            vec![
+                "Worst task".into(),
+                dur(sa.long_tasks_top.first().copied().unwrap_or(0.0)),
+                dur(sb.long_tasks_top.first().copied().unwrap_or(0.0)),
+                change_cell_us(
+                    sa.long_tasks_top.first().copied().unwrap_or(0.0),
+                    sb.long_tasks_top.first().copied().unwrap_or(0.0),
+                ),
+            ],
+            vec![
+                "Dropped frames".into(),
+                format!("{}", cmp.jank_a.total_dropped),
+                format!("{}", cmp.jank_b.total_dropped),
+                change_cell_n(
+                    cmp.jank_a.total_dropped as f64,
+                    cmp.jank_b.total_dropped as f64,
+                ),
+            ],
+            vec![
+                "Forced reflows".into(),
+                format!("{}", cmp.forced_reflow_a.total_reflows),
+                format!("{}", cmp.forced_reflow_b.total_reflows),
+                change_cell_n(
+                    cmp.forced_reflow_a.total_reflows as f64,
+                    cmp.forced_reflow_b.total_reflows as f64,
+                ),
+            ],
+            vec![
+                "Main thread busy".into(),
+                dur(sa.main_thread_busy_us),
+                dur(sb.main_thread_busy_us),
+                change_cell_us(sa.main_thread_busy_us, sb.main_thread_busy_us),
+            ],
+            vec![
+                "Layout dirty (avg)".into(),
+                format!("{:.0}", cmp.layout_a.avg_dirty),
+                format!("{:.0}", cmp.layout_b.avg_dirty),
+                change_cell_n(cmp.layout_a.avg_dirty, cmp.layout_b.avg_dirty),
+            ],
         ];
         if cmp.style_recalc_a.total_count > 0 || cmp.style_recalc_b.total_count > 0 {
             rows.push(vec![
                 "Style elements (avg)".into(),
                 format!("{:.0}", cmp.style_recalc_a.avg_elements),
                 format!("{:.0}", cmp.style_recalc_b.avg_elements),
-                change_cell(cmp.style_recalc_a.avg_elements, cmp.style_recalc_b.avg_elements),
+                change_cell_n(
+                    cmp.style_recalc_a.avg_elements,
+                    cmp.style_recalc_b.avg_elements,
+                ),
             ]);
         }
         table(&mut o, &["metric", "A", "B", "change"], rows);
@@ -548,7 +1079,7 @@ pub fn export_html(
             ];
             let rows = cats
                 .iter()
-                .map(|(n, a, b)| vec![(*n).to_string(), dur(*a), dur(*b), change_cell(*a, *b)])
+                .map(|(n, a, b)| vec![(*n).to_string(), dur(*a), dur(*b), change_cell_us(*a, *b)])
                 .collect();
             table(&mut o, &["category", "A", "B", "change"], rows);
         }
@@ -561,7 +1092,11 @@ pub fn export_html(
                 .iter()
                 .take(20)
                 .map(|d| {
-                    let name = if d.function_name.is_empty() { "(anonymous)" } else { &d.function_name };
+                    let name = if d.function_name.is_empty() {
+                        "(anonymous)"
+                    } else {
+                        &d.function_name
+                    };
                     let pp = d.pct_b - d.pct_a;
                     let diff_time_str = if d.diff_time_us > 0.0 {
                         format!("+{}", dur(d.diff_time_us))
@@ -580,7 +1115,13 @@ pub fn export_html(
                     ]
                 })
                 .collect();
-            table(&mut o, &["A time", "B time", "Δ time", "A %", "B %", "Δ pp", "source", "function"], rows);
+            table(
+                &mut o,
+                &[
+                    "A time", "B time", "Δ time", "A %", "B %", "Δ pp", "source", "function",
+                ],
+                rows,
+            );
         }
         o.push_str("</section>");
 
@@ -590,13 +1131,43 @@ pub fn export_html(
         if jf(summary, "samples") > 0.0 || jf(sum_b, "samples") > 0.0 {
             section(&mut o, "Memory comparison");
             o.push_str("<div class=\"metrics\">");
-            metric(&mut o, "Heap growth A", &format!("{:+.1} MB", jf(summary, "growth_mb")), "");
-            metric(&mut o, "Heap growth B", &format!("{:+.1} MB", jf(sum_b, "growth_mb")), "");
-            metric(&mut o, "Peak heap A", &format!("{:.1} MB", jf(summary, "peak_heap_mb")), "");
-            metric(&mut o, "Peak heap B", &format!("{:.1} MB", jf(sum_b, "peak_heap_mb")), "");
+            metric(
+                &mut o,
+                "Heap growth A",
+                &format!("{:+.1} MB", jf(summary, "growth_mb")),
+                "",
+            );
+            metric(
+                &mut o,
+                "Heap growth B",
+                &format!("{:+.1} MB", jf(sum_b, "growth_mb")),
+                "",
+            );
+            metric(
+                &mut o,
+                "Peak heap A",
+                &format!("{:.1} MB", jf(summary, "peak_heap_mb")),
+                "",
+            );
+            metric(
+                &mut o,
+                "Peak heap B",
+                &format!("{:.1} MB", jf(sum_b, "peak_heap_mb")),
+                "",
+            );
             o.push_str("</div>");
-            o.push_str(&line_chart("JS heap — A (MB)", &memory_points(&mem["samples"]), "", "#3b82f6"));
-            o.push_str(&line_chart("JS heap — B (MB)", &memory_points(&mem_b["samples"]), "", "#f59e0b"));
+            o.push_str(&line_chart(
+                "JS heap — A (MB)",
+                &memory_points(&mem["samples"]),
+                "",
+                "#3b82f6",
+            ));
+            o.push_str(&line_chart(
+                "JS heap — B (MB)",
+                &memory_points(&mem_b["samples"]),
+                "",
+                "#f59e0b",
+            ));
             o.push_str("</section>");
         }
     }

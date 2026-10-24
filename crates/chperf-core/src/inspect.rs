@@ -50,7 +50,11 @@ fn truncate(s: &str, n: usize) -> String {
 fn args_compact(raw: Option<&str>, full: bool) -> String {
     match raw {
         Some(s) => {
-            if full { truncate(s, 2000) } else { truncate(s, 160) }
+            if full {
+                truncate(s, 2000)
+            } else {
+                truncate(s, 160)
+            }
         }
         None => String::new(),
     }
@@ -67,8 +71,37 @@ fn percentile(sorted_asc: &[f64], p: f64) -> f64 {
     if sorted_asc.is_empty() {
         return 0.0;
     }
-    let idx = ((p / 100.0) * (sorted_asc.len() - 1) as f64).round() as usize;
-    sorted_asc[idx.min(sorted_asc.len() - 1)]
+    let n = sorted_asc.len();
+    let rank = p / 100.0 * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    sorted_asc[lo] + (sorted_asc[hi] - sorted_asc[lo]) * frac
+}
+
+/// Human-readable frame-budget label with detected refresh rate:
+/// 8333µs → "8.33ms (120Hz detected)", 11111µs → "11.11ms (90Hz detected)",
+/// 16667µs → "16.67ms (60Hz detected)", else "X.XXms".
+pub fn frame_budget_label(budget_us: f64) -> String {
+    let ms = budget_us / 1000.0;
+    let rate = if (budget_us - 8_333.0).abs() < 1.0 {
+        "120Hz detected"
+    } else if (budget_us - 11_111.0).abs() < 1.0 {
+        "90Hz detected"
+    } else if (budget_us - 16_667.0).abs() < 1.0 {
+        "60Hz detected"
+    } else {
+        "custom"
+    };
+    format!("{:.2}ms ({})", ms, rate)
+}
+
+/// Resolve an optional `--frame-budget` ms override (None/<=0 = auto-detect).
+pub fn resolve_frame_budget_us(events: &[TraceEvent], override_ms: Option<f64>) -> f64 {
+    match override_ms {
+        Some(ms) if ms.is_finite() && ms > 0.0 => ms * 1000.0,
+        _ => crate::windowed::detect_frame_budget_us(events),
+    }
 }
 
 // ── Filters ──
@@ -237,8 +270,15 @@ pub fn events_section(
         .collect();
     match sort {
         Sort::Ts => rows.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap()),
-        Sort::Dur => rows.sort_by(|a, b| b.dur.unwrap_or(0.0).partial_cmp(&a.dur.unwrap_or(0.0)).unwrap()),
-        Sort::Name => rows.sort_by(|a, b| a.name.cmp(b.name).then(a.ts.partial_cmp(&b.ts).unwrap())),
+        Sort::Dur => rows.sort_by(|a, b| {
+            b.dur
+                .unwrap_or(0.0)
+                .partial_cmp(&a.dur.unwrap_or(0.0))
+                .unwrap()
+        }),
+        Sort::Name => {
+            rows.sort_by(|a, b| a.name.cmp(b.name).then(a.ts.partial_cmp(&b.ts).unwrap()))
+        }
         Sort::Count => {}
     }
 
@@ -451,10 +491,15 @@ pub fn gaps_section(
     let p99_gap_ms = percentile(&sorted_gaps, 99.0) / 1000.0;
     let total_gap_us: f64 = gaps_us.iter().sum();
     let avg_gap_ms = (total_gap_us / gaps_us.len() as f64) / 1000.0;
-    let cadence_hz = if p50_gap_ms > 0.0 { 1000.0 / p50_gap_ms } else { 0.0 };
+    let cadence_hz = if p50_gap_ms > 0.0 {
+        1000.0 / p50_gap_ms
+    } else {
+        0.0
+    };
 
     let mean_us = total_gap_us / gaps_us.len() as f64;
-    let variance_us = gaps_us.iter().map(|g| (g - mean_us).powi(2)).sum::<f64>() / gaps_us.len() as f64;
+    let variance_us =
+        gaps_us.iter().map(|g| (g - mean_us).powi(2)).sum::<f64>() / gaps_us.len() as f64;
     let jitter_ms = variance_us.sqrt() / 1000.0;
 
     out.push_str(&format!(
@@ -486,13 +531,48 @@ pub fn gaps_section(
         count: usize,
     }
     let mut buckets = vec![
-        GapBucket { label: "< 16.7ms (>60Hz)", min_ms: 0.0, max_ms: 16.7, count: 0 },
-        GapBucket { label: "16.7–33.3ms (30–60Hz)", min_ms: 16.7, max_ms: 33.3, count: 0 },
-        GapBucket { label: "33.3–66.7ms (15–30Hz)", min_ms: 33.3, max_ms: 66.7, count: 0 },
-        GapBucket { label: "66.7–100ms (10–15Hz)", min_ms: 66.7, max_ms: 100.0, count: 0 },
-        GapBucket { label: "100–300ms (3.3–10Hz)", min_ms: 100.0, max_ms: 300.0, count: 0 },
-        GapBucket { label: "300–1000ms (1–3.3Hz)", min_ms: 300.0, max_ms: 1000.0, count: 0 },
-        GapBucket { label: "> 1000ms (<1Hz)", min_ms: 1000.0, max_ms: f64::INFINITY, count: 0 },
+        GapBucket {
+            label: "< 16.7ms (>60Hz)",
+            min_ms: 0.0,
+            max_ms: 16.7,
+            count: 0,
+        },
+        GapBucket {
+            label: "16.7–33.3ms (30–60Hz)",
+            min_ms: 16.7,
+            max_ms: 33.3,
+            count: 0,
+        },
+        GapBucket {
+            label: "33.3–66.7ms (15–30Hz)",
+            min_ms: 33.3,
+            max_ms: 66.7,
+            count: 0,
+        },
+        GapBucket {
+            label: "66.7–100ms (10–15Hz)",
+            min_ms: 66.7,
+            max_ms: 100.0,
+            count: 0,
+        },
+        GapBucket {
+            label: "100–300ms (3.3–10Hz)",
+            min_ms: 100.0,
+            max_ms: 300.0,
+            count: 0,
+        },
+        GapBucket {
+            label: "300–1000ms (1–3.3Hz)",
+            min_ms: 300.0,
+            max_ms: 1000.0,
+            count: 0,
+        },
+        GapBucket {
+            label: "> 1000ms (<1Hz)",
+            min_ms: 1000.0,
+            max_ms: f64::INFINITY,
+            count: 0,
+        },
     ];
     for &g_us in &gaps_us {
         let ms = g_us / 1000.0;
@@ -510,7 +590,11 @@ pub fn gaps_section(
     let total_gaps = gaps_us.len() as f64;
     let mut json_buckets = Vec::new();
     for b in &buckets {
-        let pct = if total_gaps > 0.0 { (b.count as f64 / total_gaps) * 100.0 } else { 0.0 };
+        let pct = if total_gaps > 0.0 {
+            (b.count as f64 / total_gaps) * 100.0
+        } else {
+            0.0
+        };
         let bar_len = ((pct / 5.0).round() as usize).min(20);
         let bar = "█".repeat(bar_len);
         out.push_str(&format!(
@@ -550,7 +634,9 @@ pub fn gaps_section(
     for (lbl, ts_list) in by_label_ts {
         let count = ts_list.len();
         if count >= 2 {
-            let mut l_gaps: Vec<f64> = (1..count).map(|i| (ts_list[i] - ts_list[i - 1]).max(0.0)).collect();
+            let mut l_gaps: Vec<f64> = (1..count)
+                .map(|i| (ts_list[i] - ts_list[i - 1]).max(0.0))
+                .collect();
             l_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let l_min = l_gaps[0] / 1000.0;
             let l_p50 = percentile(&l_gaps, 50.0) / 1000.0;
@@ -558,7 +644,8 @@ pub fn gaps_section(
             let l_max = *l_gaps.last().unwrap() / 1000.0;
             let l_hz = if l_p50 > 0.0 { 1000.0 / l_p50 } else { 0.0 };
             let l_mean: f64 = l_gaps.iter().sum::<f64>() / l_gaps.len() as f64;
-            let l_var = l_gaps.iter().map(|g| (g - l_mean).powi(2)).sum::<f64>() / l_gaps.len() as f64;
+            let l_var =
+                l_gaps.iter().map(|g| (g - l_mean).powi(2)).sum::<f64>() / l_gaps.len() as f64;
             let l_jitter = l_var.sqrt() / 1000.0;
             label_stats.push((lbl, count, l_p50, l_hz, l_min, l_p90, l_max, l_jitter));
         } else {
@@ -572,12 +659,38 @@ pub fn gaps_section(
     out.push_str("|--------------|-------|----------------|---------|---------|---------|---------|------------|\n");
     let mut json_by_type = Vec::new();
     for (lbl, count, p50, hz, min, p90, max, jitter) in &label_stats {
-        let cad_str = if *hz >= 0.5 { format!("{:.1} Hz", hz) } else if *p50 > 0.0 { format!("{:.0} ms", p50) } else { "—".to_string() };
-        let p50_str = if *p50 > 0.0 { fmt_ms(*p50 * 1000.0) } else { "—".to_string() };
-        let min_str = if *p50 > 0.0 { fmt_ms(*min * 1000.0) } else { "—".to_string() };
-        let p90_str = if *p90 > 0.0 { fmt_ms(*p90 * 1000.0) } else { "—".to_string() };
-        let max_str = if *p50 > 0.0 { fmt_ms(*max * 1000.0) } else { "—".to_string() };
-        let jit_str = if *p50 > 0.0 { fmt_ms(*jitter * 1000.0) } else { "—".to_string() };
+        let cad_str = if *hz >= 0.5 {
+            format!("{:.1} Hz", hz)
+        } else if *p50 > 0.0 {
+            format!("{:.0} ms", p50)
+        } else {
+            "—".to_string()
+        };
+        let p50_str = if *p50 > 0.0 {
+            fmt_ms(*p50 * 1000.0)
+        } else {
+            "—".to_string()
+        };
+        let min_str = if *p50 > 0.0 {
+            fmt_ms(*min * 1000.0)
+        } else {
+            "—".to_string()
+        };
+        let p90_str = if *p90 > 0.0 {
+            fmt_ms(*p90 * 1000.0)
+        } else {
+            "—".to_string()
+        };
+        let max_str = if *p50 > 0.0 {
+            fmt_ms(*max * 1000.0)
+        } else {
+            "—".to_string()
+        };
+        let jit_str = if *p50 > 0.0 {
+            fmt_ms(*jitter * 1000.0)
+        } else {
+            "—".to_string()
+        };
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             lbl, count, p50_str, cad_str, min_str, p90_str, max_str, jit_str
@@ -597,13 +710,20 @@ pub fn gaps_section(
 
     // Sample sequence (first `top`)
     let shown = top.min(n).max(1);
-    out.push_str(&format!("### Event sequence (first {} of {})\n\n", shown, n));
+    out.push_str(&format!(
+        "### Event sequence (first {} of {})\n\n",
+        shown, n
+    ));
     out.push_str("| # | t(ms) | gap(ms) | event / type | dur(ms) |\n");
     out.push_str("|---|-------|---------|--------------|---------|\n");
     let mut json_sequence = Vec::new();
     for i in 0..shown {
         let e = matched[i];
-        let gap_str = if i == 0 { "—".to_string() } else { fmt_ms(gaps_us[i - 1]) };
+        let gap_str = if i == 0 {
+            "—".to_string()
+        } else {
+            fmt_ms(gaps_us[i - 1])
+        };
         let lbl = get_label(e);
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
@@ -622,7 +742,10 @@ pub fn gaps_section(
         }));
     }
     if n > shown {
-        out.push_str(&format!("\n_Showing {} of {} events (use --top to see more)._\n", shown, n));
+        out.push_str(&format!(
+            "\n_Showing {} of {} events (use --top to see more)._\n",
+            shown, n
+        ));
     }
     out.push('\n');
 
@@ -659,7 +782,11 @@ pub fn functions_section(
 
     let mut funcs: Vec<(&str, &str, f64)> = self_times
         .iter()
-        .filter_map(|(id, t)| node_map.get(id).map(|(n, u, _)| (n.as_str(), u.as_str(), *t)))
+        .filter_map(|(id, t)| {
+            node_map
+                .get(id)
+                .map(|(n, u, _)| (n.as_str(), u.as_str(), *t))
+        })
         .filter(|(n, _, _)| matcher.matches(n))
         .collect();
     funcs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
@@ -676,7 +803,10 @@ pub fn functions_section(
     if let Some(line) = scope.window_line(min_ts) {
         out.push_str(&line);
     }
-    out.push_str(&format!("- **Matched self-time**: {}ms\n\n", fmt_ms(matched_total)));
+    out.push_str(&format!(
+        "- **Matched self-time**: {}ms\n\n",
+        fmt_ms(matched_total)
+    ));
 
     let mut json_rows: Vec<Value> = Vec::new();
     if funcs.is_empty() {
@@ -687,9 +817,17 @@ pub fn functions_section(
     out.push_str("| # | function | self | % in scope | file |\n");
     out.push_str("|---|----------|------|------------|------|\n");
     for (i, (name, url, t)) in funcs.iter().take(top).enumerate() {
-        let pct = if total_in_scope > 0.0 { t / total_in_scope * 100.0 } else { 0.0 };
+        let pct = if total_in_scope > 0.0 {
+            t / total_in_scope * 100.0
+        } else {
+            0.0
+        };
         let short_url = url.rfind('/').map(|i| &url[i + 1..]).unwrap_or(url);
-        let label = if name.is_empty() { "(anonymous)" } else { *name };
+        let label = if name.is_empty() {
+            "(anonymous)"
+        } else {
+            *name
+        };
         out.push_str(&format!(
             "| {} | {} | {}ms | {:.1}% | {} |\n",
             i + 1,
@@ -729,16 +867,16 @@ pub fn collect_cpu_profile(
     CpuProfile { nodes, leaf_time }
 }
 
-fn node_chain_names(nodes: &crate::analysis::ProfileNodes, leaf: crate::analysis::NodeKey) -> Vec<String> {
+fn node_chain_names(
+    nodes: &crate::analysis::ProfileNodes,
+    leaf: crate::analysis::NodeKey,
+) -> Vec<String> {
     // Parent ids resolve within the leaf's own (pid, session).
     let mut keys: Vec<crate::analysis::NodeKey> = Vec::new();
     let mut cur = Some(leaf);
     while let Some(key) = cur {
         keys.push(key);
-        cur = nodes
-            .get(&key)
-            .and_then(|n| n.2)
-            .map(|p| (key.0, key.1, p));
+        cur = nodes.get(&key).and_then(|n| n.2).map(|p| (key.0, key.1, p));
     }
     keys.reverse();
     keys.iter()
@@ -746,7 +884,11 @@ fn node_chain_names(nodes: &crate::analysis::ProfileNodes, leaf: crate::analysis
             nodes
                 .get(key)
                 .map(|(n, _, _)| {
-                    if n.is_empty() { "(anonymous)".to_string() } else { n.clone() }
+                    if n.is_empty() {
+                        "(anonymous)".to_string()
+                    } else {
+                        n.clone()
+                    }
                 })
                 .unwrap_or_else(|| "(unknown)".to_string())
         })
@@ -770,7 +912,10 @@ pub fn stacks_section(
     let mut leaves: Vec<(crate::analysis::NodeKey, f64)> = leaf_time
         .into_iter()
         .filter(|(id, _)| match matcher {
-            Some(m) => node_map.get(id).map(|(n, _, _)| m.matches(n)).unwrap_or(false),
+            Some(m) => node_map
+                .get(id)
+                .map(|(n, _, _)| m.matches(n))
+                .unwrap_or(false),
             None => true,
         })
         .collect();
@@ -805,7 +950,11 @@ pub fn stacks_section(
         };
         let chain = node_chain_names(&node_map, *id);
         let depth = chain.len();
-        let pct = if grand_total > 0.0 { t / grand_total * 100.0 } else { 0.0 };
+        let pct = if grand_total > 0.0 {
+            t / grand_total * 100.0
+        } else {
+            0.0
+        };
         let display_chain = if depth > 14 {
             let head: Vec<&str> = chain[..2].iter().map(|s| s.as_str()).collect();
             let tail: Vec<&str> = chain[depth - 10..].iter().map(|s| s.as_str()).collect();
@@ -814,8 +963,16 @@ pub fn stacks_section(
             chain.join(" → ")
         };
 
-        let short_url = url.rfind('/').map(|i| &url[i + 1..]).unwrap_or(&url).to_string();
-        let leaf_label = if name.is_empty() { "(anonymous)" } else { &name };
+        let short_url = url
+            .rfind('/')
+            .map(|i| &url[i + 1..])
+            .unwrap_or(&url)
+            .to_string();
+        let leaf_label = if name.is_empty() {
+            "(anonymous)"
+        } else {
+            &name
+        };
 
         out.push_str(&format!(
             "### #{}  {}ms ({:.1}% of matched)  depth {}\n",
@@ -853,7 +1010,11 @@ pub fn stacks_folded(
         .leaf_time
         .iter()
         .filter(|(id, _)| match matcher {
-            Some(m) => cpu.nodes.get(id).map(|(n, _, _)| m.matches(n)).unwrap_or(false),
+            Some(m) => cpu
+                .nodes
+                .get(id)
+                .map(|(n, _, _)| m.matches(n))
+                .unwrap_or(false),
             None => true,
         })
         .map(|(id, t)| (*id, *t))
@@ -874,10 +1035,9 @@ fn value_matches(v: &Value, matcher: &Matcher) -> bool {
     match v {
         Value::String(s) => matcher.matches(s),
         Value::Array(a) => a.iter().any(|v| value_matches(v, matcher)),
-        Value::Object(m) => {
-            m.iter()
-                .any(|(k, v)| matcher.matches(k) || value_matches(v, matcher))
-        }
+        Value::Object(m) => m
+            .iter()
+            .any(|(k, v)| matcher.matches(k) || value_matches(v, matcher)),
         Value::Number(n) => matcher.matches(&n.to_string()),
         Value::Bool(b) => matcher.matches(if *b { "true" } else { "false" }),
         Value::Null => matcher.matches("null"),
@@ -905,9 +1065,10 @@ pub fn find_section(
         // match an event whose raw args don't contain them, so skip the
         // parse (and the cache fill) entirely.
         if let Matcher::Substr(p) = matcher
-            && !contains_ignore_case(raw, p) {
-                continue;
-            }
+            && !contains_ignore_case(raw, p)
+        {
+            continue;
+        }
         let args = match e.args_value() {
             Some(v) => v,
             None => continue,
@@ -1124,7 +1285,8 @@ pub fn threads_section(
     min_ts: f64,
 ) -> (String, Value) {
     let overheads = find_profiler_overhead(events);
-    let mut tids: rustc_hash::FxHashMap<u64, (usize, f64, rustc_hash::FxHashMap<&str, usize>)> = rustc_hash::FxHashMap::default();
+    let mut tids: rustc_hash::FxHashMap<u64, (usize, f64, rustc_hash::FxHashMap<&str, usize>)> =
+        rustc_hash::FxHashMap::default();
     for e in events {
         if !scope.allows_event(e) {
             continue;
@@ -1237,7 +1399,6 @@ pub fn timeline_section(
         }
     }
 
-
     out.push_str(&format!(
         "## Timeline ({} buckets × {:.0}ms, {})\n\n",
         n_buckets,
@@ -1310,7 +1471,11 @@ pub fn task_section(
             (e, eff)
         })
         .collect();
-    tasks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| b.0.dur.unwrap().partial_cmp(&a.0.dur.unwrap()).unwrap()));
+    tasks.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap()
+            .then_with(|| b.0.dur.unwrap().partial_cmp(&a.0.dur.unwrap()).unwrap())
+    });
     let total = tasks.len();
 
     let mut out = String::new();
@@ -1332,7 +1497,8 @@ pub fn task_section(
         let rt_dur = rt.dur.unwrap();
         let overhead = (rt_dur - eff_dur).max(0.0);
 
-        let mut groups: rustc_hash::FxHashMap<String, (usize, f64)> = rustc_hash::FxHashMap::default();
+        let mut groups: rustc_hash::FxHashMap<String, (usize, f64)> =
+            rustc_hash::FxHashMap::default();
         let mut top_fc: Option<(String, f64)> = None;
         for e in events {
             if e.tid != rt.tid || e.name == "RunTask" || e.ts < rt_ts || e.ts > rt_end {
@@ -1355,11 +1521,17 @@ pub fn task_section(
             }
         }
 
-        let mut children: Vec<(String, usize, f64)> = groups.into_iter().map(|(n, (c, d))| (n, c, d)).collect();
+        let mut children: Vec<(String, usize, f64)> =
+            groups.into_iter().map(|(n, (c, d))| (n, c, d)).collect();
         children.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0)));
 
         let dur_str = if overhead > 0.0 {
-            format!("{}ms (raw {}ms, profiler overhead {}ms)", fmt_ms(eff_dur), fmt_ms(rt_dur), fmt_ms(overhead))
+            format!(
+                "{}ms (raw {}ms, profiler overhead {}ms)",
+                fmt_ms(eff_dur),
+                fmt_ms(rt_dur),
+                fmt_ms(overhead)
+            )
         } else {
             format!("{}ms", fmt_ms(rt_dur))
         };
@@ -1376,7 +1548,11 @@ pub fn task_section(
             out.push_str("| child | count | total(ms) | % of task |\n");
             out.push_str("|-------|-------|-----------|-----------|\n");
             for (name, count, dur) in &children {
-                let pct = if rt_dur > 0.0 { dur / rt_dur * 100.0 } else { 0.0 };
+                let pct = if rt_dur > 0.0 {
+                    dur / rt_dur * 100.0
+                } else {
+                    0.0
+                };
                 out.push_str(&format!(
                     "| {} | {} | {} | {:.1}% |\n",
                     name,
@@ -1386,15 +1562,25 @@ pub fn task_section(
                 ));
             }
             if let Some((fn_name, d)) = &top_fc {
-                let label = if fn_name.is_empty() { "(anonymous)" } else { fn_name };
-                out.push_str(&format!("\n- **top FunctionCall**: `{}` ({})\n", label, fmt_ms(*d)));
+                let label = if fn_name.is_empty() {
+                    "(anonymous)"
+                } else {
+                    fn_name
+                };
+                out.push_str(&format!(
+                    "\n- **top FunctionCall**: `{}` ({})\n",
+                    label,
+                    fmt_ms(*d)
+                ));
             }
             out.push('\n');
         }
 
         let json_children: Vec<Value> = children
             .iter()
-            .map(|(name, count, dur)| json!({"name": name, "count": count, "total_us": dur.round()}))
+            .map(
+                |(name, count, dur)| json!({"name": name, "count": count, "total_us": dur.round()}),
+            )
             .collect();
         json_rows.push(json!({
             "rank": rank + 1,
@@ -1413,18 +1599,44 @@ pub fn task_section(
     (out, Value::Array(json_rows))
 }
 
-/// Jank clusters: windows where dropped frames / ≥16.7ms spikes occurred,
+/// Jank clusters: windows where dropped frames / over-budget spikes occurred,
 /// even below the 50ms Long Task threshold. See analysis::analyze_jank.
 /// Honors the scope's window: events outside are ignored, and hot buckets
 /// are not merged across the window boundary.
+///
+/// `budget_us`: explicit frame budget in µs (None = auto-detect from vsync
+/// cadence). `bucket_ms`: explicit jank bucket width in ms (None = 50ms
+/// default). A bucket is hot when it contains dropped frames, any
+/// RunTask/FireAnimationFrame/GPUTask event lasting at least the frame
+/// budget, or ≥50ms of attributed main-thread busy time.
 pub fn jank_section(
     events: &[TraceEvent],
     scope: &Scope,
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
+    jank_section_with_budget(events, scope, top, min_ts, None, None)
+}
+
+/// `jank_section` with an explicit frame budget (µs) and bucket width (ms).
+/// Prefer `resolve_frame_budget_us` or `--frame-budget` / `--bucket` for values.
+pub fn jank_section_with_budget(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+    budget_us: Option<f64>,
+    bucket_ms: Option<f64>,
+) -> (String, Value) {
     let main_tid = crate::trace::detect_main_thread(events);
-    let res = crate::analysis::analyze_jank(events, main_tid, Some(scope));
+    let budget = budget_us.unwrap_or_else(|| crate::windowed::detect_frame_budget_us(events));
+    let res = crate::analysis::analyze_jank_with_budget_and_bucket(
+        events,
+        main_tid,
+        Some(scope),
+        budget,
+        bucket_ms,
+    );
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -1432,9 +1644,14 @@ pub fn jank_section(
         res.total_dropped,
         res.bucket_ms.round() as i64,
     ));
+    out.push_str(&format!(
+        "- **Frame budget**: {}\n\n",
+        frame_budget_label(budget),
+    ));
     out.push_str(
-        "Windows where dropped frames, ≥16.7ms spikes (RunTask/FireAnimationFrame/GPUTask)\n\
-         or heavy main-thread busy occurred — even below the 50ms Long Task threshold.\n\n",
+        "Windows where dropped frames, over-budget spikes (RunTask/FireAnimationFrame/GPUTask\n\
+         lasting at least the frame budget) or heavy main-thread busy (≥50ms attributed)\n\
+         occurred — even below the 50ms Long Task threshold.\n\n",
     );
 
     let mut json_rows: Vec<Value> = Vec::new();
@@ -1524,10 +1741,22 @@ pub fn memory_section(
         let data = args.get("data");
         samples.push(Sample {
             ts: e.ts,
-            heap: data.and_then(|d| d.get("jsHeapSizeUsed")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-            nodes: data.and_then(|d| d.get("nodes")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-            documents: data.and_then(|d| d.get("documents")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-            listeners: data.and_then(|d| d.get("jsEventListeners")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+            heap: data
+                .and_then(|d| d.get("jsHeapSizeUsed"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            nodes: data
+                .and_then(|d| d.get("nodes"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            documents: data
+                .and_then(|d| d.get("documents"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            listeners: data
+                .and_then(|d| d.get("jsEventListeners"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
         });
     }
     samples.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
@@ -1557,9 +1786,18 @@ pub fn memory_section(
         .copied()
         .max_by(|a, b| a.heap.partial_cmp(&b.heap).unwrap())
         .unwrap();
-    let peak_nodes = samples.iter().map(|s| s.nodes).fold(f64::NEG_INFINITY, f64::max);
-    let peak_documents = samples.iter().map(|s| s.documents).fold(f64::NEG_INFINITY, f64::max);
-    let peak_listeners = samples.iter().map(|s| s.listeners).fold(f64::NEG_INFINITY, f64::max);
+    let peak_nodes = samples
+        .iter()
+        .map(|s| s.nodes)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let peak_documents = samples
+        .iter()
+        .map(|s| s.documents)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let peak_listeners = samples
+        .iter()
+        .map(|s| s.listeners)
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let span_s = (last.ts - first.ts) / 1_000_000.0;
     let heap_growth_mb = mb(last.heap - first.heap);
@@ -1641,11 +1879,19 @@ pub fn memory_section(
         out.push_str("|-------|------|-----------|---------------|--------------|\n");
         for cp in change_points.iter().take(cp_shown) {
             let dfmt = |v: f64| {
-                if v == 0.0 { String::new() } else { format!(" ({:+})", v as i64) }
+                if v == 0.0 {
+                    String::new()
+                } else {
+                    format!(" ({:+})", v as i64)
+                }
             };
             let dhfmt = |v: f64| {
                 let m = mb(v);
-                if m.abs() < 0.05 { String::new() } else { format!(" ({:+.1})", m) }
+                if m.abs() < 0.05 {
+                    String::new()
+                } else {
+                    format!(" ({:+.1})", m)
+                }
             };
             out.push_str(&format!(
                 "| {:.2} | {:.0}{} | {:.0}{} | {:.0}{} | {:.1}{} |\n",
@@ -1663,7 +1909,8 @@ pub fn memory_section(
         if change_points.len() > cp_shown {
             out.push_str(&format!(
                 "\n_Showing {} of {} change points (use --top to see more)._\n",
-                cp_shown, change_points.len()
+                cp_shown,
+                change_points.len()
             ));
         }
         out.push('\n');
@@ -1673,7 +1920,8 @@ pub fn memory_section(
     let bucket_size_us = 5_000_000.0;
     let mut json_buckets = Vec::new();
     if span_s >= 5.0 && n >= 10 {
-        let mut buckets_map: rustc_hash::FxHashMap<usize, Vec<Sample>> = rustc_hash::FxHashMap::default();
+        let mut buckets_map: rustc_hash::FxHashMap<usize, Vec<Sample>> =
+            rustc_hash::FxHashMap::default();
         for s in &samples {
             let b = ((s.ts - first.ts) / bucket_size_us) as usize;
             buckets_map.entry(b).or_default().push(*s);
@@ -1790,12 +2038,15 @@ pub fn memory_section(
             "listeners_per_s": (listeners_rate * 10.0).round() / 10.0,
         },
     });
-    (out, json!({
-        "summary": summary,
-        "samples": json_rows,
-        "change_points": json_change_points,
-        "buckets": json_buckets,
-    }))
+    (
+        out,
+        json!({
+            "summary": summary,
+            "samples": json_rows,
+            "change_points": json_change_points,
+            "buckets": json_buckets,
+        }),
+    )
 }
 
 fn event_type_category(ty: &str) -> &'static str {
@@ -1877,7 +2128,8 @@ pub fn input_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let mut by_type_durs: rustc_hash::FxHashMap<String, Vec<f64>> = rustc_hash::FxHashMap::default();
+    let mut by_type_durs: rustc_hash::FxHashMap<String, Vec<f64>> =
+        rustc_hash::FxHashMap::default();
     let mut by_type_ts: rustc_hash::FxHashMap<String, Vec<f64>> = rustc_hash::FxHashMap::default();
     let mut worst: Vec<(String, f64, f64)> = Vec::new(); // (type, ts, dur)
 
@@ -1943,7 +2195,9 @@ pub fn input_section(
             let (p50_gap, hz) = if ts_list.len() >= 2 {
                 let mut sorted_ts = ts_list.clone();
                 sorted_ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let mut gaps = (1..sorted_ts.len()).map(|i| (sorted_ts[i] - sorted_ts[i-1]).max(0.0)).collect::<Vec<_>>();
+                let mut gaps = (1..sorted_ts.len())
+                    .map(|i| (sorted_ts[i] - sorted_ts[i - 1]).max(0.0))
+                    .collect::<Vec<_>>();
                 gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let med = percentile(&gaps, 50.0) / 1000.0;
                 let h = if med > 0.0 { 1000.0 / med } else { 0.0 };
@@ -2080,12 +2334,18 @@ pub fn frame_tree_section(
 
     if frames.is_empty() {
         out.push_str("No TracingStartedInBrowser frame tree found in trace.\n\n");
-        return (out, json!({"total_frames": 0, "frames": [], "processes": []}));
+        return (
+            out,
+            json!({"total_frames": 0, "frames": [], "processes": []}),
+        );
     }
 
-    let mut id_map: rustc_hash::FxHashMap<&str, &crate::trace::FrameInfo> = rustc_hash::FxHashMap::default();
-    let mut children_map: rustc_hash::FxHashMap<&str, Vec<&crate::trace::FrameInfo>> = rustc_hash::FxHashMap::default();
-    let mut processes: rustc_hash::FxHashMap<u64, (usize, String)> = rustc_hash::FxHashMap::default();
+    let mut id_map: rustc_hash::FxHashMap<&str, &crate::trace::FrameInfo> =
+        rustc_hash::FxHashMap::default();
+    let mut children_map: rustc_hash::FxHashMap<&str, Vec<&crate::trace::FrameInfo>> =
+        rustc_hash::FxHashMap::default();
+    let mut processes: rustc_hash::FxHashMap<u64, (usize, String)> =
+        rustc_hash::FxHashMap::default();
 
     for f in frames {
         id_map.insert(&f.id, f);
@@ -2114,16 +2374,19 @@ pub fn frame_tree_section(
         rendered.insert(f.id.clone());
         let indent = "  ".repeat(depth);
         let flags = if f.is_main_frame { " [main]" } else { "" };
-        let name_str = if !f.name.is_empty() { format!(" ({})", f.name) } else { String::new() };
-        let url_display = if f.url.is_empty() { "(empty url)" } else { &f.url };
+        let name_str = if !f.name.is_empty() {
+            format!(" ({})", f.name)
+        } else {
+            String::new()
+        };
+        let url_display = if f.url.is_empty() {
+            "(empty url)"
+        } else {
+            &f.url
+        };
         out.push_str(&format!(
             "{}- **`{}`**{}{} · pid {} (frame `{}`)\n",
-            indent,
-            url_display,
-            flags,
-            name_str,
-            f.process_id,
-            f.id,
+            indent, url_display, flags, name_str, f.process_id, f.id,
         ));
         if let Some(children) = children_map.get(f.id.as_str()) {
             for child in children {
@@ -2152,10 +2415,17 @@ pub fn frame_tree_section(
     out.push('\n');
 
     // Process summary
-    let mut procs_vec: Vec<(u64, usize, String)> = processes.into_iter().map(|(pid, (cnt, url))| (pid, cnt, url)).collect();
+    let mut procs_vec: Vec<(u64, usize, String)> = processes
+        .into_iter()
+        .map(|(pid, (cnt, url))| (pid, cnt, url))
+        .collect();
     procs_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
 
-    out.push_str(&format!("### Frame Processes ({} distinct pid{})\n\n", procs_vec.len(), if procs_vec.len() == 1 { "" } else { "s" }));
+    out.push_str(&format!(
+        "### Frame Processes ({} distinct pid{})\n\n",
+        procs_vec.len(),
+        if procs_vec.len() == 1 { "" } else { "s" }
+    ));
     out.push_str("| pid | frames | primary url |\n");
     out.push_str("|-----|--------|-------------|\n");
     let mut json_procs = Vec::new();
@@ -2183,11 +2453,14 @@ pub fn frame_tree_section(
         })
         .collect();
 
-    (out, json!({
-        "total_frames": total,
-        "frames": json_frames,
-        "processes": json_procs,
-    }))
+    (
+        out,
+        json!({
+            "total_frames": total,
+            "frames": json_frames,
+            "processes": json_procs,
+        }),
+    )
 }
 
 /// Helper to parse frame objects directly from `TracingStartedInBrowser`.
@@ -2202,13 +2475,34 @@ pub fn extract_frames_from_events(events: &[TraceEvent]) -> Vec<crate::trace::Fr
             {
                 let mut res = Vec::new();
                 for frame in frames {
-                    let id = frame.get("frame").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let parent_id = frame.get("parent").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let id = frame
+                        .get("frame")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let parent_id = frame
+                        .get("parent")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let process_id = frame.get("processId").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let is_main_frame = frame.get("isInPrimaryMainFrame").and_then(|v| v.as_bool()).unwrap_or(false)
-                        || frame.get("isOutermostMainFrame").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let url = frame
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = frame
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_main_frame = frame
+                        .get("isInPrimaryMainFrame")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || frame
+                            .get("isOutermostMainFrame")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                     res.push(crate::trace::FrameInfo {
                         id,
                         parent_id,
@@ -2239,8 +2533,10 @@ pub fn async_section(
     // (pid, id), `f` consumes it. Chrome recycles flow ids, so entries must
     // not survive their finish — a two-pass or_insert kept the FIRST start
     // and reused ids measured against a stale begin.
-    let mut starts: rustc_hash::FxHashMap<(u64, u64), (&'static str, f64)> = rustc_hash::FxHashMap::default();
-    let mut by_name: rustc_hash::FxHashMap<&'static str, Vec<f64>> = rustc_hash::FxHashMap::default();
+    let mut starts: rustc_hash::FxHashMap<(u64, u64), (&'static str, f64)> =
+        rustc_hash::FxHashMap::default();
+    let mut by_name: rustc_hash::FxHashMap<&'static str, Vec<f64>> =
+        rustc_hash::FxHashMap::default();
     let mut longest: Vec<(&'static str, f64, f64)> = Vec::new(); // (name, start ts, dur)
     for e in events {
         if !e.has_id {
@@ -2346,6 +2642,510 @@ pub fn async_section(
     (out, json!({"tasks": task_rows, "longest": longest_rows}))
 }
 
+// ── Loading / Network / Raster / Coverage (new detectors) ──
+
+/// Loading milestones + user timing + official responsiveness signals.
+/// Window-scoped by `--around`/`--window` (filters by scope).
+pub fn loading_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    let kept: Vec<TraceEvent> = events
+        .iter()
+        .filter(|e| scope.allows_event(e))
+        .cloned()
+        .collect();
+    let main_tid = crate::trace::detect_main_thread(events);
+    let r = crate::analysis::analyze_loading(&kept);
+    let official = crate::analysis::analyze_long_tasks_official(&kept, main_tid);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Loading milestones ({}, {})\n\n",
+        r.entries.iter().filter(|e| e.ts_us.is_some()).count(),
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if let Some(nav) = r.navigation_start_us {
+        out.push_str(&format!(
+            "- **navigationStart**: {:.2}ms from trace start\n",
+            (nav - min_ts) / 1000.0
+        ));
+    } else {
+        out.push_str("- **navigationStart**: none found\n");
+    }
+    match r.first_contentful_paint_us {
+        Some(v) => out.push_str(&format!("- **FCP**: {:.2}ms\n", v / 1000.0)),
+        None => out.push_str("- **FCP**: none found\n"),
+    }
+    match r.largest_contentful_paint_us {
+        Some(v) => out.push_str(&format!("- **LCP**: {:.2}ms\n", v / 1000.0)),
+        None => out.push_str("- **LCP**: none found\n"),
+    }
+    out.push('\n');
+
+    out.push_str("| milestone | t(ms rel nav) | t(ms abs) | dur(ms) |\n");
+    out.push_str("|-----------|----------------|-----------|----------|\n");
+    for e in &r.entries {
+        let rel = e
+            .rel_us
+            .map(|v| format!("{:.2}", v / 1000.0))
+            .unwrap_or_else(|| "—".to_string());
+        let abs = e
+            .ts_us
+            .map(|v| format!("{:.2}", (v - min_ts) / 1000.0))
+            .unwrap_or_else(|| "—".to_string());
+        let dur = e
+            .dur_us
+            .map(|v| format!("{:.2}", v / 1000.0))
+            .unwrap_or_else(|| "—".to_string());
+        out.push_str(&format!("| {} | {} | {} | {} |\n", e.name, rel, abs, dur));
+    }
+    out.push('\n');
+
+    if !r.lcp.is_empty() {
+        out.push_str(&format!("### LCP candidates ({})\n\n", r.lcp.len()));
+        out.push_str("| # | t(ms) | size | node | url |\n");
+        out.push_str("|---|-------|------|------|-----|\n");
+        for (i, c) in r.lcp.iter().take(top).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_ms(c.ts_us - min_ts),
+                c.size
+                    .map(|v| format!("{:.0}", v))
+                    .unwrap_or_else(|| "—".to_string()),
+                c.node.as_deref().unwrap_or("—"),
+                c.url.as_deref().unwrap_or("—"),
+            ));
+        }
+        out.push('\n');
+    } else {
+        out.push_str("No LCP candidates found.\n\n");
+    }
+
+    if !r.user_timing.is_empty() {
+        out.push_str(&format!(
+            "### User timing ({} entries)\n\n",
+            r.user_timing.len()
+        ));
+        out.push_str("| # | t(ms) | dur(ms) | name |\n");
+        out.push_str("|---|-------|---------|------|\n");
+        for (i, u) in r.user_timing.iter().take(top).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_ms(u.ts_us - min_ts),
+                u.dur_us.map(fmt_ms).unwrap_or_else(|| "—".to_string()),
+                u.name,
+            ));
+        }
+        out.push('\n');
+    } else {
+        out.push_str("No user timing entries found.\n\n");
+    }
+
+    if !official.is_empty() {
+        out.push_str(&format!(
+            "### Official responsiveness signals ({})\n\n",
+            official.len()
+        ));
+        out.push_str("| # | t(ms) | dur(ms) | name | interaction |\n");
+        out.push_str("|---|-------|---------|------|-------------|\n");
+        for (i, l) in official.iter().take(top).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_ms(l.ts_us - min_ts),
+                l.dur_us.map(fmt_ms).unwrap_or_else(|| "—".to_string()),
+                l.name,
+                if l.interaction_type.is_empty() {
+                    "—"
+                } else {
+                    &l.interaction_type
+                },
+            ));
+        }
+        out.push('\n');
+    } else {
+        out.push_str("No official long-task/EventTiming signals found.\n\n");
+    }
+
+    let j = json!({
+        "navigation_start_us": r.navigation_start_us.map(|v| v.round()),
+        "first_contentful_paint_us": r.first_contentful_paint_us.map(|v| v.round()),
+        "largest_contentful_paint_us": r.largest_contentful_paint_us.map(|v| v.round()),
+        "entries": r.entries.iter().map(|e| json!({
+            "name": e.name, "ts_us": e.ts_us.map(|v| v.round()),
+            "rel_us": e.rel_us.map(|v| v.round()), "dur_us": e.dur_us.map(|v| v.round()),
+        })).collect::<Vec<_>>(),
+        "lcp": r.lcp.iter().map(|c| json!({
+            "t_us": c.ts_us.round(), "rel_us": c.rel_us.map(|v| v.round()),
+            "size": c.size, "node": c.node, "url": c.url,
+        })).collect::<Vec<_>>(),
+        "user_timing": r.user_timing.iter().map(|u| json!({
+            "name": u.name, "t_us": u.ts_us.round(), "dur_us": u.dur_us.map(|v| v.round()),
+        })).collect::<Vec<_>>(),
+        "official": official.iter().map(|l| json!({
+            "name": l.name, "t_us": l.ts_us.round(),
+            "dur_us": l.dur_us.map(|v| v.round()), "interaction_type": l.interaction_type,
+        })).collect::<Vec<_>>(),
+    });
+    (out, j)
+}
+
+/// Network request lifecycle. Window-scoped by `--around`/`--window`.
+pub fn network_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    let kept: Vec<TraceEvent> = events
+        .iter()
+        .filter(|e| scope.allows_event(e))
+        .cloned()
+        .collect();
+    let main_tid = crate::trace::detect_main_thread(events);
+    let r = crate::analysis::analyze_network(&kept, main_tid);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Network ({} requests, {})\n\n",
+        r.request_count,
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!("- **Requests**: {}\n", r.request_count));
+    out.push_str(&format!("- **Cache hits**: {}\n", r.cache_hits));
+    out.push_str(&format!(
+        "- **Render-blocking**: {}\n",
+        r.render_blocking_count
+    ));
+    out.push_str(&format!("- **Total wall**: {}\n", fmt_ms(r.total_wall_us)));
+    out.push_str(&format!("- **Incomplete**: {}\n\n", r.incomplete));
+
+    if r.requests.is_empty() {
+        out.push_str("none found (0 requests).\n\n");
+    } else {
+        out.push_str(&format!(
+            "### Slowest {} requests\n\n",
+            top.min(r.requests.len())
+        ));
+        out.push_str("| # | total(ms) | ttfb(ms) | url | priority | cached | render-blocking |\n");
+        out.push_str("|---|-----------|----------|-----|----------|--------|-----------------|\n");
+        for (i, q) in r.slowest(top).iter().enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                i + 1,
+                q.total_us.map(fmt_ms).unwrap_or_else(|| "—".to_string()),
+                q.send_to_first_byte_us
+                    .map(fmt_ms)
+                    .unwrap_or_else(|| "—".to_string()),
+                truncate(&q.url, 80),
+                q.priority.as_deref().unwrap_or("—"),
+                if q.from_cache { "yes" } else { "no" },
+                if q.render_blocking { "yes" } else { "no" },
+            ));
+        }
+        out.push('\n');
+    }
+
+    let j = json!({
+        "request_count": r.request_count,
+        "cache_hits": r.cache_hits,
+        "render_blocking_count": r.render_blocking_count,
+        "total_wall_us": r.total_wall_us.round(),
+        "total_wall_ms": (r.total_wall_us / 1000.0 * 100.0).round() / 100.0,
+        "incomplete": r.incomplete,
+        "requests": r.requests.iter().take(top).map(|q| json!({
+            "request_id": q.request_id, "url": q.url,
+            "start_us": q.start_us.map(|v| v.round()),
+            "first_byte_us": q.first_byte_us.map(|v| v.round()),
+            "end_us": q.end_us.map(|v| v.round()),
+            "send_to_first_byte_us": q.send_to_first_byte_us.map(|v| v.round()),
+            "send_to_first_byte_ms": q.send_to_first_byte_us.map(|v| (v / 1000.0 * 100.0).round() / 100.0),
+            "total_us": q.total_us.map(|v| v.round()),
+            "total_ms": q.total_us.map(|v| (v / 1000.0 * 100.0).round() / 100.0),
+            "encoded_data_length": q.encoded_data_length,
+            "data_chunks": q.data_chunks,
+            "from_cache": q.from_cache, "render_blocking": q.render_blocking,
+            "priority": q.priority, "queued_us": q.queued_us.map(|v| v.round()),
+            "is_xhr": q.is_xhr, "on_main_thread": q.on_main_thread,
+        })).collect::<Vec<_>>(),
+    });
+    (out, j)
+}
+
+/// Compositor/raster/GPU pipeline. Window-scoped by `--around`/`--window`.
+pub fn raster_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    let kept: Vec<TraceEvent> = events
+        .iter()
+        .filter(|e| scope.allows_event(e))
+        .cloned()
+        .collect();
+    let main_tid = crate::trace::detect_main_thread(events);
+    let r = crate::analysis::analyze_raster(&kept, main_tid);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Raster / Compositor ({} lanes, {})\n\n",
+        r.lanes.len(),
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "- **Raster total**: {}\n",
+        fmt_ms(r.total_raster_us)
+    ));
+    out.push_str(&format!(
+        "- **Decode total**: {} (max {})\n",
+        fmt_ms(r.total_decode_us),
+        fmt_ms(r.max_decode_us)
+    ));
+    out.push_str(&format!(
+        "- **Composite total**: {}\n",
+        fmt_ms(r.total_composite_us)
+    ));
+    out.push_str(&format!("- **GPU task**: {}\n\n", fmt_ms(r.gpu_task_us)));
+
+    if r.lanes.is_empty() {
+        out.push_str("No raster/compositor events found.\n\n");
+    } else {
+        out.push_str("| # | tid | thread | event | count | total(ms) | max(ms) |\n");
+        out.push_str("|---|-----|--------|-------|-------|-----------|----------|\n");
+        for (i, l) in r.lanes.iter().take(top).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                i + 1,
+                l.tid,
+                if l.thread_name.is_empty() {
+                    "—"
+                } else {
+                    &l.thread_name
+                },
+                l.name,
+                l.count,
+                fmt_ms(l.total_us),
+                fmt_ms(l.max_us),
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !r.decode_hotspots.is_empty() {
+        out.push_str(&format!(
+            "### Decode hotspots ({})\n\n",
+            r.decode_hotspots.len()
+        ));
+        out.push_str("| # | t(ms) | dur(ms) | source |\n");
+        out.push_str("|---|-------|---------|--------|\n");
+        for (i, h) in r.decode_hotspots.iter().take(top).enumerate() {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                i + 1,
+                fmt_ms(h.ts_us - min_ts),
+                fmt_ms(h.dur_us),
+                if h.url_or_node.is_empty() {
+                    "—"
+                } else {
+                    &h.url_or_node
+                },
+            ));
+        }
+        out.push('\n');
+    } else {
+        out.push_str("No decode hotspots found.\n\n");
+    }
+
+    let j = json!({
+        "lanes": r.lanes.iter().take(top).map(|l| json!({
+            "tid": l.tid, "thread_name": l.thread_name, "name": l.name,
+            "count": l.count, "total_us": l.total_us.round(),
+            "total_ms": (l.total_us / 1000.0 * 100.0).round() / 100.0,
+            "max_us": l.max_us.round(),
+        })).collect::<Vec<_>>(),
+        "total_raster_us": r.total_raster_us.round(),
+        "total_decode_us": r.total_decode_us.round(),
+        "total_composite_us": r.total_composite_us.round(),
+        "gpu_task_us": r.gpu_task_us.round(),
+        "max_decode_us": r.max_decode_us.round(),
+        "decode_hotspots": r.decode_hotspots.iter().take(top).map(|h| json!({
+            "t_us": h.ts_us.round(), "dur_us": h.dur_us.round(), "url_or_node": h.url_or_node,
+        })).collect::<Vec<_>>(),
+    });
+    (out, j)
+}
+
+/// Names chperf actually interprets (exact) plus prefix families (`*` suffix).
+const RECOGNIZED_EXACT: &[&str] = &[
+    "RunTask",
+    "FunctionCall",
+    "EvaluateScript",
+    "UpdateLayoutTree",
+    "Layout",
+    "Paint",
+    "HitTest",
+    "Layerize",
+    "Commit",
+    "FireAnimationFrame",
+    "GPUTask",
+    "DroppedFrame",
+    "MajorGC",
+    "MinorGC",
+    "EventDispatch",
+    "UpdateCounters",
+    "Profile",
+    "ProfileChunk",
+    "RasterTask",
+    "Decode Image",
+    "DecodeImage",
+    "PaintImage",
+    "CompositeLayers",
+    "DrawFrame",
+    "BeginFrame",
+    "ActivateLayerTree",
+    "ParseHTML",
+    "EventTiming",
+    "Rasterize",
+    "Decode Image",
+    "InteractionToNextPaint",
+    "responsiveness::UserInteraction",
+    "PerformanceTracker::LongTask",
+    "longtask",
+    "LargestContentfulPaint::Candidate",
+    "LargestTextPaint::Candidate",
+    "largestContentfulPaint::Invalidate",
+    "PerformanceMark",
+    "PerformanceMeasure",
+    "navigationStart",
+    "firstPaint",
+    "firstContentfulPaint",
+    "firstImagePaint",
+    "firstMeaningfulPaint",
+    "MarkLoad",
+    "MarkDOMContent",
+    "domContentLoadedEventEnd",
+    "loadEvent",
+    "ResourceWillSendRequest",
+    "ResourceSendRequest",
+    "ResourceReceiveResponse",
+    "ResourceReceivedData",
+    "ResourceFinish",
+    "XHRReadyStateChange",
+    "XHRLoad",
+    "AsyncTask",
+    "SubmitCompositorFrameToPresentationCompositorFrame",
+    "thread_name",
+    "process_name",
+];
+
+fn is_recognized(name: &str) -> bool {
+    if RECOGNIZED_EXACT.contains(&name) {
+        return true;
+    }
+    if name.starts_with("V8.GC") || name.starts_with("CppGC") {
+        return true;
+    }
+    if name.starts_with("Resource") || name.starts_with("XHR") {
+        return true;
+    }
+    false
+}
+
+/// Trace health + event-name coverage. `stats` are the parse counters from
+/// `TraceFile.stats`; the top-20 names and recognized/unrecognized split are
+/// computed over the scope.
+pub fn coverage_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    stats: &crate::trace::ParseStats,
+    min_ts: f64,
+) -> (String, Value) {
+    let mut counts: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
+    let mut total = 0usize;
+    let mut recognized = 0usize;
+    for e in events {
+        if !scope.allows_event(e) {
+            continue;
+        }
+        total += 1;
+        *counts.entry(e.name).or_default() += 1;
+        if is_recognized(e.name) {
+            recognized += 1;
+        }
+    }
+    let mut rows: Vec<(&str, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+
+    let unrecognized = total.saturating_sub(recognized);
+    let pct = if total > 0 {
+        recognized as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Trace coverage ({})\n\n",
+        window_label(scope.window)
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!("- **Events parsed**: {}\n", stats.parsed));
+    out.push_str(&format!("- **Events skipped**: {}\n", stats.skipped));
+    out.push_str(&format!("- **Events malformed**: {}\n", stats.malformed));
+    out.push_str(&format!("- **Events in scope**: {}\n", total));
+    out.push_str(&format!(
+        "- **Recognized**: {} ({:.1}% of scoped events)\n",
+        recognized, pct
+    ));
+    out.push_str(&format!("- **Unrecognized**: {}\n\n", unrecognized));
+
+    out.push_str("### Top 20 event names by count\n\n");
+    out.push_str("| # | name | count | recognized |\n");
+    out.push_str("|---|------|-------|------------|\n");
+    let mut json_rows: Vec<Value> = Vec::new();
+    for (i, (name, count)) in rows.iter().take(20).enumerate() {
+        let rec = is_recognized(name);
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            i + 1,
+            name,
+            count,
+            if rec { "yes" } else { "no" },
+        ));
+        json_rows.push(json!({"name": name, "count": count, "recognized": rec}));
+    }
+    out.push('\n');
+
+    let j = json!({
+        "parsed": stats.parsed, "skipped": stats.skipped, "malformed": stats.malformed,
+        "scoped_events": total, "recognized": recognized, "unrecognized": unrecognized,
+        "recognized_pct": (pct * 10.0).round() / 10.0,
+        "top_names": json_rows,
+    });
+    (out, j)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2392,7 +3192,12 @@ mod tests {
             flow(b's', 7, 20_000.0),
             flow(b'f', 7, 21_000.0),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (_, json) = async_section(&events, &scope, 10, 0.0);
         let row = &json["tasks"][0];
         assert_eq!(row["count"], 2);
@@ -2458,7 +3263,9 @@ mod tests {
                 None,
                 0,
                 false,
-                Some(json!({"data": {"jsHeapSizeUsed": 1_048_576.0, "nodes": 10.0, "documents": 2.0, "jsEventListeners": 5.0}})),
+                Some(
+                    json!({"data": {"jsHeapSizeUsed": 1_048_576.0, "nodes": 10.0, "documents": 2.0, "jsEventListeners": 5.0}}),
+                ),
             ),
             evx(
                 2_000.0,
@@ -2467,11 +3274,18 @@ mod tests {
                 None,
                 0,
                 false,
-                Some(json!({"data": {"jsHeapSizeUsed": 2_097_152.0, "nodes": 20.0, "documents": 2.0, "jsEventListeners": 8.0}})),
+                Some(
+                    json!({"data": {"jsHeapSizeUsed": 2_097_152.0, "nodes": 20.0, "documents": 2.0, "jsEventListeners": 8.0}}),
+                ),
             ),
             evx(1_500.0, "RunTask", b'X', Some(10.0), 0, false, None),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (md, j) = memory_section(&events, &scope, 10, 0.0);
         assert!(md.contains("2 samples"), "{}", md);
         assert!(md.contains("1.0 MB → 2.0 MB (+1.0 MB)"), "{}", md);
@@ -2485,7 +3299,15 @@ mod tests {
     #[test]
     fn input_section_groups_by_type_with_percentiles() {
         let dispatch = |ty: &str, dur: f64| {
-            evx(1_000.0, "EventDispatch", b'X', Some(dur), 0, false, Some(json!({"data": {"type": ty}})))
+            evx(
+                1_000.0,
+                "EventDispatch",
+                b'X',
+                Some(dur),
+                0,
+                false,
+                Some(json!({"data": {"type": ty}})),
+            )
         };
         let events = vec![
             dispatch("pointerdown", 1_000.0),
@@ -2494,7 +3316,12 @@ mod tests {
             dispatch("mousemove", 100.0),
             evx(500.0, "RunTask", b'X', Some(9_999.0), 0, false, None),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (md, j) = input_section(&events, &scope, 5, 0.0);
         assert!(md.contains("4 events, 2 types"), "{}", md);
         let types = j["types"].as_array().unwrap();
@@ -2521,7 +3348,12 @@ mod tests {
             evx(7_000.0, "AnimationFrame", b's', None, 0, false, None),
             evx(8_000.0, "AnimationFrame", b'f', None, 0, false, None),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (md, j) = async_section(&events, &scope, 5, 0.0);
         assert!(md.contains("2 tasks, 1 names"), "{}", md);
         let tasks = j["tasks"].as_array().unwrap();
@@ -2537,11 +3369,32 @@ mod tests {
     #[test]
     fn worst_runtask_and_task_section_disregard_profiler_overhead() {
         let events = vec![
-            evx(1_000_000.0, "RunTask", b'X', Some(1_079_000.0), 0, false, None),
-            evx(1_001_000.0, "CpuProfiler::StartProfiling", b'X', Some(1_076_000.0), 0, false, None),
+            evx(
+                1_000_000.0,
+                "RunTask",
+                b'X',
+                Some(1_079_000.0),
+                0,
+                false,
+                None,
+            ),
+            evx(
+                1_001_000.0,
+                "CpuProfiler::StartProfiling",
+                b'X',
+                Some(1_076_000.0),
+                0,
+                false,
+                None,
+            ),
             evx(3_000_000.0, "RunTask", b'X', Some(80_000.0), 0, false, None),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
 
         // worst_runtask should pick the 80ms task, not the profiler startup task
         let worst = worst_runtask(&events, &scope);
@@ -2561,7 +3414,15 @@ mod tests {
     #[test]
     fn gaps_section_detects_cadence_and_periodicity() {
         let dispatch = |ty: &str, ts: f64| {
-            evx(ts, "EventDispatch", b'X', Some(10.0), 0, false, Some(json!({"data": {"type": ty}})))
+            evx(
+                ts,
+                "EventDispatch",
+                b'X',
+                Some(10.0),
+                0,
+                false,
+                Some(json!({"data": {"type": ty}})),
+            )
         };
         // 5 seeking events spaced 64ms apart (64_000 µs)
         let events = vec![
@@ -2571,7 +3432,12 @@ mod tests {
             dispatch("seeking", 292_000.0),
             dispatch("seeking", 356_000.0),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let filter = NameFilter::new(&["seeking".to_string()], false).unwrap();
         let (md, j) = gaps_section(&events, &filter, "seeking", &scope, 0.0, 10, 100_000.0);
 
@@ -2588,34 +3454,32 @@ mod tests {
 
     #[test]
     fn frame_tree_section_renders_hierarchy() {
-        let events = vec![
-            evx(
-                0.0,
-                "TracingStartedInBrowser",
-                b'I',
-                None,
-                0,
-                false,
-                Some(json!({
-                    "data": {
-                        "frames": [
-                            {
-                                "frame": "ROOT_FRAME",
-                                "url": "https://example.com/app",
-                                "processId": 1234,
-                                "isInPrimaryMainFrame": true
-                            },
-                            {
-                                "frame": "CHILD_SVG",
-                                "parent": "ROOT_FRAME",
-                                "url": "https://example.com/icon.svg",
-                                "processId": 1234
-                            }
-                        ]
-                    }
-                })),
-            ),
-        ];
+        let events = vec![evx(
+            0.0,
+            "TracingStartedInBrowser",
+            b'I',
+            None,
+            0,
+            false,
+            Some(json!({
+                "data": {
+                    "frames": [
+                        {
+                            "frame": "ROOT_FRAME",
+                            "url": "https://example.com/app",
+                            "processId": 1234,
+                            "isInPrimaryMainFrame": true
+                        },
+                        {
+                            "frame": "CHILD_SVG",
+                            "parent": "ROOT_FRAME",
+                            "url": "https://example.com/icon.svg",
+                            "processId": 1234
+                        }
+                    ]
+                }
+            })),
+        )];
         let (md, j) = frame_tree_section(&events, None, 0.0);
         assert!(md.contains("2 frames"), "{}", md);
         assert!(md.contains("https://example.com/app"), "{}", md);
@@ -2634,7 +3498,9 @@ mod tests {
                 None,
                 0,
                 false,
-                Some(json!({"data": {"jsHeapSizeUsed": 10_000_000.0, "nodes": 100.0, "documents": 1.0, "jsEventListeners": 10.0}})),
+                Some(
+                    json!({"data": {"jsHeapSizeUsed": 10_000_000.0, "nodes": 100.0, "documents": 1.0, "jsEventListeners": 10.0}}),
+                ),
             ),
             evx(
                 2_000_000.0,
@@ -2644,10 +3510,17 @@ mod tests {
                 0,
                 false,
                 // +50 listeners, +80 nodes, +1 document -> significant change point!
-                Some(json!({"data": {"jsHeapSizeUsed": 12_000_000.0, "nodes": 180.0, "documents": 2.0, "jsEventListeners": 60.0}})),
+                Some(
+                    json!({"data": {"jsHeapSizeUsed": 12_000_000.0, "nodes": 180.0, "documents": 2.0, "jsEventListeners": 60.0}}),
+                ),
             ),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (md, j) = memory_section(&events, &scope, 10, 1_000_000.0);
 
         assert!(md.contains("Significant change points (jumps)"), "{}", md);
@@ -2661,7 +3534,15 @@ mod tests {
     #[test]
     fn input_section_categorizes_and_measures_cadence() {
         let dispatch = |ty: &str, ts: f64| {
-            evx(ts, "EventDispatch", b'X', Some(1.0), 0, false, Some(json!({"data": {"type": ty}})))
+            evx(
+                ts,
+                "EventDispatch",
+                b'X',
+                Some(1.0),
+                0,
+                false,
+                Some(json!({"data": {"type": ty}})),
+            )
         };
         let events = vec![
             dispatch("pointerdown", 1_000_000.0),
@@ -2669,7 +3550,12 @@ mod tests {
             dispatch("seeking", 2_050_000.0),
             dispatch("resize", 3_000_000.0),
         ];
-        let scope = Scope { window: None, tid: None, pid: None, cat: None };
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
         let (md, j) = input_section(&events, &scope, 10, 1_000_000.0);
 
         assert!(md.contains("Input"), "{}", md);
@@ -2683,4 +3569,3 @@ mod tests {
         assert_eq!(seeking_row["cadence_hz"], 20.0);
     }
 }
-

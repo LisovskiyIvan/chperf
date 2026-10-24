@@ -26,7 +26,8 @@ pub(crate) struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "-")]
     pub(crate) html: Option<String>,
 
-    /// CPU throttle factor (e.g. --throttle 20 divides all times by 20)
+    /// CPU throttle factor (reference note only: shown in the report header,
+    /// times are not rescaled)
     #[arg(short, long)]
     pub(crate) throttle: Option<f64>,
 
@@ -189,12 +190,47 @@ pub(crate) struct Cli {
     pub(crate) frames: bool,
 
     /// Inspect: frame event name for --frames/--delta
-    #[arg(long, default_value = "SubmitCompositorFrameToPresentationCompositorFrame")]
+    #[arg(
+        long,
+        default_value = "SubmitCompositorFrameToPresentationCompositorFrame"
+    )]
     pub(crate) frame_event: String,
 
     /// Inspect: inter-event gap distribution and cadence/periodicity (use with --events or alone)
     #[arg(long)]
     pub(crate) gaps: bool,
+
+    /// Inspect: frame budget override in ms for --frames/--jank/--delta
+    /// (0 or omitted = auto-detect from vsync cadence: 8.33/11.11/16.67ms)
+    #[arg(long = "frame-budget")]
+    pub(crate) frame_budget: Option<f64>,
+
+    /// Inspect: loading milestones (navigation/FCP/LCP/user timing + official
+    /// responsiveness signals when present)
+    #[arg(long)]
+    pub(crate) loading: bool,
+
+    /// Inspect: network request lifecycle (Resource*/XHR* pairs)
+    #[arg(long)]
+    pub(crate) network: bool,
+
+    /// Inspect: compositor/raster/GPU pipeline lanes + decode hotspots
+    #[arg(long)]
+    pub(crate) raster: bool,
+
+    /// Inspect: trace health + event-name coverage (parsed/skipped/malformed,
+    /// top 20 names, recognized vs unrecognized split)
+    #[arg(long)]
+    pub(crate) coverage: bool,
+
+    /// Inspect: when --anchor/--worst finds no match, warn and use the full
+    /// trace instead of exiting 2
+    #[arg(long = "full-on-miss")]
+    pub(crate) full_on_miss: bool,
+
+    /// Compare mode: exit 3 when any finding is Regressed
+    #[arg(long = "fail-on-regressed")]
+    pub(crate) fail_on_regressed: bool,
 
     /// Inspect: browser frame/document hierarchy from TracingStartedInBrowser
     #[arg(long = "frame-tree")]
@@ -225,5 +261,9 @@ impl Cli {
             || self.frames
             || self.gaps
             || self.frame_tree
+            || self.loading
+            || self.network
+            || self.raster
+            || self.coverage
     }
 }

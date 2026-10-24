@@ -1,4 +1,17 @@
-//! Jank-cluster detection: spikes below the 50ms Long Task threshold.
+//! Jank-cluster detection: fixed 50ms buckets where main-thread work
+//! exceeds the frame budget.
+//!
+//! A bucket is hot when any of these hold:
+//! - it contains dropped frames, or
+//! - any RunTask / FireAnimationFrame / GPUTask event in it lasts at least
+//!   the frame budget (detected from vsync cadence, default 16.667ms @60Hz), or
+//! - its attributed main-thread busy time reaches 50ms.
+//!
+//! Busy time is attributed work-to-frame: each task's duration is split
+//! across the buckets it overlaps proportionally, so `busy_us` never exceeds
+//! the bucket span and a long task smears across the frames it actually
+//! blocked. The `max_*` spikes stay with the bucket containing the event's
+//! start.
 
 use crate::inspect::Scope;
 use crate::trace::{
@@ -26,25 +39,92 @@ pub struct JankResult {
     pub bucket_ms: f64,
 }
 
-/// Frame budget at 60fps (µs). Spikes above this mean dropped frames.
-const FRAME_BUDGET_US: f64 = 16_667.0;
+/// Default bucket width (ms). Fixed so clusters are comparable across
+/// traces; overridable via `analyze_jank_with_budget_and_bucket`.
+pub const DEFAULT_BUCKET_MS: f64 = 50.0;
 
-/// A single hot bucket (or any bucket containing dropped frames).
-fn bucket_hot(busy: f64, max_run: f64, max_faf: f64, max_gpu: f64, dropped: u32) -> bool {
+/// Split a task interval across the buckets it overlaps proportionally to
+/// the overlap, so `busy[b]` never exceeds the bucket span. Touches one
+/// bucket per overlapped bucket (~dur/bucket_us); total O(tasks + buckets).
+fn attribute_busy(busy: &mut [f64], min_ts: f64, bucket_us: f64, start: f64, dur: f64) {
+    let n = busy.len();
+    if n == 0 || dur <= 0.0 {
+        return;
+    }
+    let end = start + dur;
+    let first = (((start - min_ts) / bucket_us) as usize).min(n - 1);
+    let last = (((end - min_ts) / bucket_us) as usize).min(n - 1);
+    if first == last {
+        busy[first] += dur;
+        return;
+    }
+    for (i, slot) in busy[first..=last].iter_mut().enumerate() {
+        let lo = min_ts + (first + i) as f64 * bucket_us;
+        let overlap = (end.min(lo + bucket_us) - start.max(lo)).max(0.0);
+        *slot += overlap;
+    }
+}
+
+/// A single hot bucket (or any bucket containing dropped frames): dropped
+/// frames, any event at/over the frame budget, or ≥50ms attributed busy.
+fn bucket_hot(
+    busy: f64,
+    max_run: f64,
+    max_faf: f64,
+    max_gpu: f64,
+    dropped: u32,
+    budget_us: f64,
+) -> bool {
     dropped > 0
-        || max_run >= FRAME_BUDGET_US
-        || max_faf >= FRAME_BUDGET_US
-        || max_gpu >= FRAME_BUDGET_US
+        || max_run >= budget_us
+        || max_faf >= budget_us
+        || max_gpu >= budget_us
         || busy >= 50_000.0
 }
 
-/// Detect jank clusters across the whole trace: 1-second-ish buckets where
-/// dropped frames, ≥16.7ms spikes (RunTask/FireAnimationFrame/GPUTask) or
-/// heavy main-thread busy occurred. Adjacent hot buckets merge into
-/// clusters, ranked by dropped frames → worst spike → busy. For each top
-/// cluster, the dominating FunctionCalls are collected (the "what happened"
-/// chain). This catches spikes that the 50ms Long Task summary misses.
+/// Detect jank clusters: fixed-width buckets where dropped frames,
+/// ≥frame-budget spikes (RunTask/FireAnimationFrame/GPUTask) or heavy
+/// main-thread busy occurred. Adjacent hot buckets merge into clusters,
+/// ranked by dropped frames → worst spike → busy. For each top cluster,
+/// the dominating FunctionCalls are collected (the "what happened" chain).
+/// This catches spikes that the 50ms Long Task summary misses.
+///
+/// The frame budget is auto-detected from the trace's vsync cadence (see
+/// [`crate::windowed::detect_frame_budget_us`]). For an explicit budget or
+/// bucket width use `analyze_jank_with_budget(_and_bucket)`.
 pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>) -> JankResult {
+    analyze_jank_with_budget(
+        events,
+        main_tid,
+        scope,
+        crate::windowed::detect_frame_budget_us(events),
+    )
+}
+
+/// `analyze_jank` with an explicit frame budget (µs): a bucket is hot when
+/// any event lasts at least `budget_us`, plus the dropped-frame and 50ms
+/// busy rules. Prefer [`crate::windowed::detect_frame_budget_us`] or a
+/// `--frame-budget` override for the value.
+pub fn analyze_jank_with_budget(
+    events: &[TraceEvent],
+    main_tid: u64,
+    scope: Option<&Scope>,
+    budget_us: f64,
+) -> JankResult {
+    analyze_jank_with_budget_and_bucket(events, main_tid, scope, budget_us, None)
+}
+
+/// `analyze_jank_with_budget` with an explicit bucket width override
+/// (`Some(ms)`; non-finite or non-positive falls back to
+/// [`DEFAULT_BUCKET_MS`]). Buckets are fixed-width from the trace start so
+/// results are comparable across traces.
+pub fn analyze_jank_with_budget_and_bucket(
+    events: &[TraceEvent],
+    main_tid: u64,
+    scope: Option<&Scope>,
+    budget_us: f64,
+    bucket_ms: Option<f64>,
+) -> JankResult {
     let overheads = find_profiler_overhead(events);
     // One pass for both bounds: min_ts skips metadata events (their ts is the
     // process start), max_ts includes everything.
@@ -61,8 +141,10 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
     }
     let span_us = (max_ts - min_ts).max(1.0);
 
-    let bucket_ms = (span_us / 1000.0 / 2000.0).clamp(50.0, 1000.0);
-    let bucket_us = bucket_ms * 1000.0;
+    let bucket_ms = bucket_ms
+        .filter(|b| b.is_finite() && *b > 0.0)
+        .unwrap_or(DEFAULT_BUCKET_MS);
+    let bucket_us = (bucket_ms * 1000.0).max(1.0);
     let n = ((span_us / bucket_us).ceil() as usize).max(1);
     let mut busy = vec![0.0f64; n];
     let mut max_run = vec![0.0f64; n];
@@ -79,16 +161,19 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         if e.ts < min_ts || e.ts > max_ts {
             continue;
         }
-        if let (Some(lo), Some(hi)) = (win_lo, win_hi)
-            && (e.ts < lo || e.ts > hi) {
-                continue;
-            }
+        // Same rule as `crate::windowed::dropped_frames` / `frames_section`:
+        // the full scope (window + tid/pid/cat), not just the window.
+        if scope.is_some_and(|s| !s.allows_event(e)) {
+            continue;
+        }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         match e.name {
             "RunTask" if e.ph == b'X' && e.tid == main_tid => {
                 if e.dur.is_some() {
                     let eff = effective_runtask_dur(e, &overheads);
-                    busy[b] += eff;
+                    // Work-to-frame: smear busy across overlapped buckets;
+                    // the max spike stays with the start bucket.
+                    attribute_busy(&mut busy, min_ts, bucket_us, e.ts, eff);
                     if eff > max_run[b] {
                         max_run[b] = eff;
                     }
@@ -96,15 +181,17 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
             }
             "FireAnimationFrame" if e.ph == b'X' && e.tid == main_tid => {
                 if let Some(d) = e.dur
-                    && d > max_faf[b] {
-                        max_faf[b] = d;
-                    }
+                    && d > max_faf[b]
+                {
+                    max_faf[b] = d;
+                }
             }
             "GPUTask" if e.ph == b'X' => {
                 if let Some(d) = e.dur
-                    && d > max_gpu[b] {
-                        max_gpu[b] = d;
-                    }
+                    && d > max_gpu[b]
+                {
+                    max_gpu[b] = d;
+                }
             }
             "DroppedFrame" if !is_profiler_dropped_frame(e.ts, &overheads) => {
                 dropped[b] += 1;
@@ -125,7 +212,9 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
     }
     let mut accs: Vec<Acc> = Vec::new();
     for b in 0..n {
-        let hot = bucket_hot(busy[b], max_run[b], max_faf[b], max_gpu[b], dropped[b]);
+        let hot = bucket_hot(
+            busy[b], max_run[b], max_faf[b], max_gpu[b], dropped[b], budget_us,
+        );
         if !hot {
             continue;
         }
@@ -160,14 +249,25 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
         }
     }
 
-    let total_dropped: usize = dropped.iter().map(|&d| d as usize).sum();
+    // Single source of truth for the total: the shared counter. The
+    // per-bucket loop above uses the identical predicate, so this equals
+    // the bucket sum.
+    let total_dropped: usize = crate::windowed::dropped_frames(events, scope);
 
     // Rank: dropped frames first, then worst spike, then busy.
     accs.sort_by(|a, b| {
         b.dropped
             .cmp(&a.dropped)
-            .then_with(|| b.max_run.partial_cmp(&a.max_run).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| b.busy.partial_cmp(&a.busy).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                b.max_run
+                    .partial_cmp(&a.max_run)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.busy
+                    .partial_cmp(&a.busy)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     let top = accs.into_iter().take(8).collect::<Vec<_>>();
 
@@ -177,15 +277,18 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
     for (ci, a) in top.iter().enumerate() {
         in_cluster[a.start..=a.end].fill(Some(ci));
     }
-    let mut calls: Vec<rustc_hash::FxHashMap<String, f64>> = (0..top.len()).map(|_| rustc_hash::FxHashMap::default()).collect();
+    let mut calls: Vec<rustc_hash::FxHashMap<String, f64>> = (0..top.len())
+        .map(|_| rustc_hash::FxHashMap::default())
+        .collect();
     for e in events {
         if e.name != "FunctionCall" || e.ph != b'X' {
             continue;
         }
         if let (Some(lo), Some(hi)) = (win_lo, win_hi)
-            && (e.ts < lo || e.ts > hi) {
-                continue;
-            }
+            && (e.ts < lo || e.ts > hi)
+        {
+            continue;
+        }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         let args = e.args_value();
         if let Some(ci) = in_cluster[b]
@@ -195,9 +298,10 @@ pub fn analyze_jank(events: &[TraceEvent], main_tid: u64, scope: Option<&Scope>)
                 .and_then(|a| a.get("data"))
                 .and_then(|d| d.get("functionName"))
                 .and_then(|v| v.as_str())
-            && !name.is_empty() {
-                *calls[ci].entry(name.to_string()).or_default() += d;
-            }
+            && !name.is_empty()
+        {
+            *calls[ci].entry(name.to_string()).or_default() += d;
+        }
     }
 
     let clusters: Vec<JankCluster> = top
@@ -252,7 +356,13 @@ mod tests {
         let events = vec![
             // Profiler startup task with dropped frames during it
             ev("RunTask", b'X', 1_000_000.0, Some(1_079_000.0), 1),
-            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(1_076_000.0), 1),
+            ev(
+                "CpuProfiler::StartProfiling",
+                b'X',
+                1_001_000.0,
+                Some(1_076_000.0),
+                1,
+            ),
             ev("DroppedFrame", b'I', 1_010_000.0, None, 7),
             ev("DroppedFrame", b'I', 1_030_000.0, None, 7),
             // Trace end marker to give span
@@ -263,7 +373,103 @@ mod tests {
         // All dropped frames were inside profiler freeze, so total_dropped is 0
         assert_eq!(res.total_dropped, 0);
         // Profiler task effective duration is 3ms (<16.67ms frame budget and <50ms busy), so no hot clusters
-        assert!(res.clusters.is_empty(), "expected no jank clusters, found {}", res.clusters.len());
+        assert!(
+            res.clusters.is_empty(),
+            "expected no jank clusters, found {}",
+            res.clusters.len()
+        );
+    }
+
+    /// A 10ms task is hot at a 120Hz budget (≥8333µs) but cold at 60Hz.
+    #[test]
+    fn jank_budget_override_changes_hotness() {
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(10_000.0), 1),
+            ev("RunTask", b'X', 3_000_000.0, Some(1_000.0), 1),
+        ];
+        let hot = analyze_jank_with_budget(&events, 1, None, 8_333.0);
+        assert_eq!(hot.clusters.len(), 1);
+        assert!((hot.clusters[0].max_run_us - 10_000.0).abs() < 1e-9);
+        let cold = analyze_jank_with_budget(&events, 1, None, 16_667.0);
+        assert!(cold.clusters.is_empty());
+    }
+
+    /// `analyze_jank` equals `analyze_jank_with_budget` with the detected
+    /// budget (no frame ticks here → 60Hz fallback).
+    #[test]
+    fn jank_default_uses_detected_budget() {
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(10_000.0), 1),
+            ev("RunTask", b'X', 3_000_000.0, Some(1_000.0), 1),
+        ];
+        let a = analyze_jank(&events, 1, None);
+        let b = analyze_jank_with_budget(&events, 1, None, 16_667.0);
+        assert_eq!(a.clusters.len(), b.clusters.len());
+        assert_eq!(a.total_dropped, b.total_dropped);
+        assert_eq!(a.bucket_ms, b.bucket_ms);
+    }
+
+    /// A 60ms task straddling a bucket boundary attributes 40ms + 20ms, so
+    /// with a huge budget neither bucket reaches the 50ms busy rule —
+    /// start-bucket attribution would have marked it hot via 60ms busy.
+    #[test]
+    fn jank_busy_smeared_across_buckets() {
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(1_000.0), 1),
+            ev("RunTask", b'X', 1_010_000.0, Some(60_000.0), 1),
+            ev("RunTask", b'X', 3_000_000.0, Some(1_000.0), 1),
+        ];
+        let res = analyze_jank_with_budget_and_bucket(&events, 1, None, 1e12, Some(50.0));
+        assert!(
+            res.clusters.is_empty(),
+            "expected smeared busy to stay cold, found {:?}",
+            res.clusters.iter().map(|c| c.busy_us).collect::<Vec<_>>()
+        );
+    }
+
+    /// A 100ms aligned task fills two buckets (50ms + 50ms); both trip the
+    /// busy rule and merge into one cluster preserving total busy.
+    #[test]
+    fn jank_merged_cluster_preserves_total_busy() {
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(100_000.0), 1),
+            ev("RunTask", b'X', 3_000_000.0, Some(1_000.0), 1),
+        ];
+        let res = analyze_jank_with_budget_and_bucket(&events, 1, None, 1e12, Some(50.0));
+        assert_eq!(res.clusters.len(), 1);
+        assert!((res.clusters[0].busy_us - 100_000.0).abs() < 1e-6);
+    }
+
+    /// Buckets are fixed at 50ms regardless of trace length.
+    #[test]
+    fn jank_buckets_deterministic_across_spans() {
+        let short = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(20_000.0), 1),
+            ev("RunTask", b'X', 1_200_000.0, Some(1_000.0), 1),
+        ];
+        let mut long = short.clone();
+        long.push(ev("RunTask", b'X', 30_000_000.0, Some(1_000.0), 1));
+        let a = analyze_jank(&short, 1, None);
+        let b = analyze_jank(&long, 1, None);
+        assert_eq!(a.bucket_ms, 50.0);
+        assert_eq!(b.bucket_ms, 50.0);
+    }
+
+    /// Jank total dropped uses the shared counter: identical to
+    /// `windowed::dropped_frames` on the same trace.
+    #[test]
+    fn jank_dropped_matches_shared_helper() {
+        let events = vec![
+            ev("RunTask", b'X', 1_000_000.0, Some(20_000.0), 1),
+            ev("DroppedFrame", b'I', 1_005_000.0, None, 7),
+            ev("DroppedFrame", b'I', 1_006_000.0, None, 7),
+            ev("RunTask", b'X', 3_000_000.0, Some(1_000.0), 1),
+        ];
+        let res = analyze_jank(&events, 1, None);
+        assert_eq!(
+            res.total_dropped,
+            crate::windowed::dropped_frames(&events, None)
+        );
+        assert_eq!(res.total_dropped, 2);
     }
 }
-

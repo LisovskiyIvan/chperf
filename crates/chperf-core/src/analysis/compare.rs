@@ -76,17 +76,32 @@ pub struct CompareResult {
     pub findings: Vec<Finding>,
 }
 
+/// Relative change in percent. `0 -> 0` is `0.0`; `0 -> N` is
+/// `f64::INFINITY` — an unbounded relative jump, never "+100%". Threshold
+/// rules (`> 10%`, `> 15%`) still fire on it; human-facing messages must go
+/// through `fmt_change`, which renders the absolute `0 -> N` delta instead.
 fn pct_diff(a: f64, b: f64) -> f64 {
     if a > 0.0 {
         (b - a) / a * 100.0
     } else if b > 0.0 {
-        // Zero baseline: any new activity is an unbounded relative jump.
-        // Report a full regression so the >10% / >15% threshold rules fire
-        // (0 long tasks -> 15 must not silently read as "no change").
-        100.0
+        f64::INFINITY
     } else {
         0.0
     }
+}
+
+/// Honest rendering of a relative change. Zero baselines print the absolute
+/// `0 -> N` delta (a new metric, not a percent); real ratios print
+/// `{:+.0}%`, so "+100%" only ever means a genuine doubling. `fmt` renders
+/// the endpoint values in the caller's units.
+pub fn fmt_change(a: f64, b: f64, fmt: &dyn Fn(f64) -> String) -> String {
+    if a == 0.0 {
+        if b == 0.0 {
+            return "+0%".to_string();
+        }
+        return format!("{} → {}", fmt(a), fmt(b));
+    }
+    format!("{:+.0}%", (b - a) / a * 100.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -107,16 +122,10 @@ pub fn analyze_compare(
     jank_b: &JankResult,
 ) -> CompareResult {
     // ── Event rows ──
-    let map_a: HashMap<&str, &EventTypeStat> = summary_a
-        .event_stats
-        .iter()
-        .map(|s| (s.name, s))
-        .collect();
-    let map_b: HashMap<&str, &EventTypeStat> = summary_b
-        .event_stats
-        .iter()
-        .map(|s| (s.name, s))
-        .collect();
+    let map_a: HashMap<&str, &EventTypeStat> =
+        summary_a.event_stats.iter().map(|s| (s.name, s)).collect();
+    let map_b: HashMap<&str, &EventTypeStat> =
+        summary_b.event_stats.iter().map(|s| (s.name, s)).collect();
 
     let mut all_names: Vec<&str> = map_a.keys().chain(map_b.keys()).copied().collect();
     all_names.sort();
@@ -169,17 +178,15 @@ pub fn analyze_compare(
     let total_a = cpu_a.total_sample_time_us;
     let total_b = cpu_b.total_sample_time_us;
 
-    let mut func_map_a: rustc_hash::FxHashMap<(&str, &str), &FunctionTime> = rustc_hash::FxHashMap::default();
+    let mut func_map_a: rustc_hash::FxHashMap<(&str, &str), &FunctionTime> =
+        rustc_hash::FxHashMap::default();
     for f in &cpu_a.functions {
-        func_map_a
-            .entry((&f.function_name, &f.url))
-            .or_insert(f);
+        func_map_a.entry((&f.function_name, &f.url)).or_insert(f);
     }
-    let mut func_map_b: rustc_hash::FxHashMap<(&str, &str), &FunctionTime> = rustc_hash::FxHashMap::default();
+    let mut func_map_b: rustc_hash::FxHashMap<(&str, &str), &FunctionTime> =
+        rustc_hash::FxHashMap::default();
     for f in &cpu_b.functions {
-        func_map_b
-            .entry((&f.function_name, &f.url))
-            .or_insert(f);
+        func_map_b.entry((&f.function_name, &f.url)).or_insert(f);
     }
 
     let mut all_funcs: Vec<(&str, &str)> = func_map_a
@@ -197,8 +204,16 @@ pub fn analyze_compare(
             let fb = func_map_b.get(&(name, url));
             let time_a = fa.map(|f| f.self_time_us).unwrap_or(0.0);
             let time_b = fb.map(|f| f.self_time_us).unwrap_or(0.0);
-            let pct_a = if total_a > 0.0 { time_a / total_a * 100.0 } else { 0.0 };
-            let pct_b = if total_b > 0.0 { time_b / total_b * 100.0 } else { 0.0 };
+            let pct_a = if total_a > 0.0 {
+                time_a / total_a * 100.0
+            } else {
+                0.0
+            };
+            let pct_b = if total_b > 0.0 {
+                time_b / total_b * 100.0
+            } else {
+                0.0
+            };
             let source = fa
                 .map(|f| f.source_type.clone())
                 .or_else(|| fb.map(|f| f.source_type.clone()))
@@ -220,7 +235,8 @@ pub fn analyze_compare(
         .collect();
 
     // Sort by absolute diff in self-time (most impactful first),
-    // tie-breaking by percentage point difference.
+    // tie-breaking by percentage point difference. Kept whole: findings
+    // scan the full list; consumers truncate for display (take(20)).
     cpu_diff.sort_by(|a, b| {
         b.diff_time_us
             .abs()
@@ -233,7 +249,8 @@ pub fn analyze_compare(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
-    cpu_diff.truncate(30); // top 30
+    // No truncate here: the findings scan below walks the full diff list and
+    // display layers (CLI `take(20)`) truncate for rendering.
 
     // ── Findings ──
     let mut findings = Vec::new();
@@ -243,7 +260,9 @@ pub fn analyze_compare(
         summary_a.total_blocking_time_us,
         summary_b.total_blocking_time_us,
     );
-    if tbt_diff.abs() > 10.0 || (summary_a.total_blocking_time_us - summary_b.total_blocking_time_us).abs() >= 20_000.0 {
+    if tbt_diff.abs() > 10.0
+        || (summary_a.total_blocking_time_us - summary_b.total_blocking_time_us).abs() >= 20_000.0
+    {
         let improved = summary_b.total_blocking_time_us < summary_a.total_blocking_time_us;
         findings.push(Finding {
             severity: if improved {
@@ -253,10 +272,14 @@ pub fn analyze_compare(
             },
             category: "Total Blocking Time".to_string(),
             message: format!(
-                "{:.1}ms -> {:.1}ms ({:+.0}%)",
+                "{:.1}ms -> {:.1}ms ({})",
                 summary_a.total_blocking_time_us / 1000.0,
                 summary_b.total_blocking_time_us / 1000.0,
-                tbt_diff
+                fmt_change(
+                    summary_a.total_blocking_time_us,
+                    summary_b.total_blocking_time_us,
+                    &|v| format!("{:.1}ms", v / 1000.0),
+                )
             ),
             detail: if improved {
                 "Decreased main-thread blocking time".to_string()
@@ -266,12 +289,16 @@ pub fn analyze_compare(
         });
     }
 
-    // Long task count comparison
+    // Long task count comparison: noise floor of |Δ| >= 2 or >25% so
+    // trivial ±1 wobble on small counts stays silent.
     let lt_diff = pct_diff(
         summary_a.long_task_count as f64,
         summary_b.long_task_count as f64,
     );
-    if lt_diff.abs() > 10.0 {
+    let lt_abs = (summary_b.long_task_count as isize - summary_a.long_task_count as isize).abs();
+    // Zero baselines have no honest percent: 0 -> 1 stays silent (needs
+    // |Δ| >= 2 like everything else), 0 -> N>=2 fires on the count.
+    if lt_abs >= 2 || (summary_a.long_task_count > 0 && lt_diff.abs() > 25.0) {
         findings.push(Finding {
             severity: if lt_diff < 0.0 {
                 FindingSeverity::Improved
@@ -280,8 +307,14 @@ pub fn analyze_compare(
             },
             category: "Long Tasks".to_string(),
             message: format!(
-                "{} -> {} ({:+.0}%)",
-                summary_a.long_task_count, summary_b.long_task_count, lt_diff
+                "{} -> {} ({})",
+                summary_a.long_task_count,
+                summary_b.long_task_count,
+                fmt_change(
+                    summary_a.long_task_count as f64,
+                    summary_b.long_task_count as f64,
+                    &|v| format!("{v:.0}"),
+                )
             ),
             detail: if lt_diff < 0.0 {
                 "Fewer long tasks blocking the main thread".to_string()
@@ -291,24 +324,52 @@ pub fn analyze_compare(
         });
     }
 
-    // Dropped Frames comparison
-    if jank_a.total_dropped != jank_b.total_dropped {
+    // Dropped Frames comparison: counts are meaningless across traces of
+    // different lengths, so normalize per second of trace. Fires on
+    // |Δ| >= 3 or on a >=2x rate swing with a material rate (>= 1/s on one
+    // side) — never on ±1.
+    {
         let diff = jank_b.total_dropped as isize - jank_a.total_dropped as isize;
-        let improved = diff < 0;
-        findings.push(Finding {
-            severity: if improved {
-                FindingSeverity::Improved
-            } else {
-                FindingSeverity::Regressed
-            },
-            category: "Dropped Frames".to_string(),
-            message: format!("{} -> {} ({:+})", jank_a.total_dropped, jank_b.total_dropped, diff),
-            detail: if improved {
-                "Fewer dropped frames".to_string()
-            } else {
-                "More dropped frames causing visual jank".to_string()
-            },
-        });
+        let secs_a = summary_a.total_trace_duration_us / 1_000_000.0;
+        let secs_b = summary_b.total_trace_duration_us / 1_000_000.0;
+        let rate_a = if secs_a > 0.0 {
+            jank_a.total_dropped as f64 / secs_a
+        } else {
+            0.0
+        };
+        let rate_b = if secs_b > 0.0 {
+            jank_b.total_dropped as f64 / secs_b
+        } else {
+            0.0
+        };
+        let rate_ratio = if rate_a > 0.0 {
+            rate_b / rate_a
+        } else if rate_b > 0.0 {
+            f64::INFINITY
+        } else {
+            1.0
+        };
+        let rate_fires = rate_a.max(rate_b) >= 1.0 && (rate_ratio >= 2.0 || rate_ratio <= 0.5);
+        if diff.abs() >= 3 || rate_fires {
+            let improved = diff < 0 || (diff == 0 && rate_b < rate_a);
+            findings.push(Finding {
+                severity: if improved {
+                    FindingSeverity::Improved
+                } else {
+                    FindingSeverity::Regressed
+                },
+                category: "Dropped Frames".to_string(),
+                message: format!(
+                    "{} -> {} ({:+}) — {:.1}/s -> {:.1}/s",
+                    jank_a.total_dropped, jank_b.total_dropped, diff, rate_a, rate_b
+                ),
+                detail: if improved {
+                    "Fewer dropped frames".to_string()
+                } else {
+                    "More dropped frames causing visual jank".to_string()
+                },
+            });
+        }
     }
 
     // Forced Reflow (Layout Thrashing) comparison
@@ -318,7 +379,12 @@ pub fn analyze_compare(
             forced_reflow_b.total_reflows as f64,
         );
         let improved = forced_reflow_b.total_reflows < forced_reflow_a.total_reflows;
-        if reflow_diff.abs() > 10.0 || (forced_reflow_a.total_reflows as isize - forced_reflow_b.total_reflows as isize).abs() >= 2 {
+        // Same noise floor as long tasks: ±1 on a zero baseline is not a
+        // finding (0 -> 1 needs the count gate, which it fails).
+        if (forced_reflow_a.total_reflows as isize - forced_reflow_b.total_reflows as isize).abs()
+            >= 2
+            || (forced_reflow_a.total_reflows > 0 && reflow_diff.abs() > 10.0)
+        {
             findings.push(Finding {
                 severity: if improved {
                     FindingSeverity::Improved
@@ -327,10 +393,14 @@ pub fn analyze_compare(
                 },
                 category: "Forced Reflows".to_string(),
                 message: format!(
-                    "{} -> {} reflows ({:+.0}%)",
+                    "{} -> {} reflows ({})",
                     forced_reflow_a.total_reflows,
                     forced_reflow_b.total_reflows,
-                    reflow_diff
+                    fmt_change(
+                        forced_reflow_a.total_reflows as f64,
+                        forced_reflow_b.total_reflows as f64,
+                        &|v| format!("{v:.0}"),
+                    )
                 ),
                 detail: format!(
                     "Thrashing time: {:.1}ms -> {:.1}ms",
@@ -352,12 +422,11 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "Scroll Duration".to_string(),
-                message: format!("{:+.1}% avg scroll task time", dur_diff),
-                detail: format!(
-                    "Bottleneck: {} -> {}",
-                    sa.bottleneck(),
-                    sb.bottleneck()
+                message: format!(
+                    "{} avg frame-blocking task time",
+                    fmt_change(sa.dur_us, sb.dur_us, &|v| format!("{v:.1}")),
                 ),
+                detail: format!("Bottleneck: {} -> {}", sa.bottleneck(), sb.bottleneck()),
             });
         }
 
@@ -371,7 +440,10 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "JS in Scroll".to_string(),
-                message: format!("{:+.1}% JS execution time", js_diff),
+                message: format!(
+                    "{} JS execution time",
+                    fmt_change(sa.js_us, sb.js_us, &|v| format!("{v:.1}")),
+                ),
                 detail: String::new(),
             });
         }
@@ -386,7 +458,10 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "Style Recalc".to_string(),
-                message: format!("{:+.1}% UpdateLayoutTree time", ult_diff),
+                message: format!(
+                    "{} UpdateLayoutTree time",
+                    fmt_change(sa.ult_us, sb.ult_us, &|v| format!("{v:.1}")),
+                ),
                 detail: String::new(),
             });
         }
@@ -401,7 +476,10 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "Layout".to_string(),
-                message: format!("{:+.1}% layout time", layout_diff),
+                message: format!(
+                    "{} layout time",
+                    fmt_change(sa.layout_us, sb.layout_us, &|v| format!("{v:.1}")),
+                ),
                 detail: String::new(),
             });
         }
@@ -416,7 +494,10 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "Paint".to_string(),
-                message: format!("{:+.1}% paint time", paint_diff),
+                message: format!(
+                    "{} paint time",
+                    fmt_change(sa.paint_us, sb.paint_us, &|v| format!("{v:.1}")),
+                ),
                 detail: String::new(),
             });
         }
@@ -431,7 +512,10 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "HitTest".to_string(),
-                message: format!("{:+.1}% hit test time", hit_diff),
+                message: format!(
+                    "{} hit test time",
+                    fmt_change(sa.hit_test_us, sb.hit_test_us, &|v| format!("{v:.1}")),
+                ),
                 detail: String::new(),
             });
         }
@@ -446,7 +530,10 @@ pub fn analyze_compare(
                     FindingSeverity::Regressed
                 },
                 category: "Composite".to_string(),
-                message: format!("{:+.1}% composite time", comp_diff),
+                message: format!(
+                    "{} composite time",
+                    fmt_change(sa.composite_us, sb.composite_us, &|v| format!("{v:.1}")),
+                ),
                 detail: String::new(),
             });
         }
@@ -462,7 +549,14 @@ pub fn analyze_compare(
                 FindingSeverity::Regressed
             },
             category: "Main Thread".to_string(),
-            message: format!("{:+.1}% total busy time", busy_diff),
+            message: format!(
+                "{} total busy time",
+                fmt_change(
+                    summary_a.main_thread_busy_us,
+                    summary_b.main_thread_busy_us,
+                    &|v| format!("{v:.1}"),
+                ),
+            ),
             detail: String::new(),
         });
     }
@@ -478,15 +572,20 @@ pub fn analyze_compare(
             },
             category: "Layout Dirty".to_string(),
             message: format!(
-                "Avg dirty {:.0} -> {:.0} ({:+.1}%)",
-                layout_a.avg_dirty, layout_b.avg_dirty, dirty_diff
+                "Avg dirty {:.0} -> {:.0} ({})",
+                layout_a.avg_dirty,
+                layout_b.avg_dirty,
+                fmt_change(layout_a.avg_dirty, layout_b.avg_dirty, &|v| format!(
+                    "{v:.0}"
+                )),
             ),
             detail: String::new(),
         });
     }
 
-    // Style recalc elements
-    if style_recalc_a.total_count > 0 && style_recalc_b.total_count > 0 {
+    // Style recalc elements: either side having data is enough — a 0 -> N
+    // regression (new style work) must surface, not be gated out.
+    if style_recalc_a.total_count > 0 || style_recalc_b.total_count > 0 {
         let elem_diff = pct_diff(style_recalc_a.avg_elements, style_recalc_b.avg_elements);
         if elem_diff.abs() > 10.0 {
             findings.push(Finding {
@@ -497,8 +596,14 @@ pub fn analyze_compare(
                 },
                 category: "Style Elements".to_string(),
                 message: format!(
-                    "Avg {:.0} -> {:.0} ({:+.1}%)",
-                    style_recalc_a.avg_elements, style_recalc_b.avg_elements, elem_diff
+                    "Avg {:.0} -> {:.0} ({})",
+                    style_recalc_a.avg_elements,
+                    style_recalc_b.avg_elements,
+                    fmt_change(
+                        style_recalc_a.avg_elements,
+                        style_recalc_b.avg_elements,
+                        &|v| format!("{v:.0}"),
+                    ),
                 ),
                 detail: format!(
                     "Max {} -> {}",
@@ -508,35 +613,53 @@ pub fn analyze_compare(
         }
     }
 
-    // Specific CPU function regressions (≥20ms and ≥15%)
+    // CPU function changes (≥20ms and ≥15%, either direction) over the full
+    // diff list — improvements surface too, and zero-baseline appearances
+    // (0 -> N, unbounded jump) are findings, not silence.
     for d in &cpu_diff {
-        if d.diff_time_us >= 20_000.0 && (d.diff_pct >= 15.0 || d.time_a_us == 0.0) {
-            let fn_name = if d.function_name.is_empty() {
-                "(anonymous)"
-            } else {
-                &d.function_name
-            };
-            findings.push(Finding {
-                severity: FindingSeverity::Regressed,
-                category: "CPU Function".to_string(),
-                message: format!(
-                    "{}: +{:.1}ms ({:+.0}%)",
-                    fn_name,
-                    d.diff_time_us / 1000.0,
-                    d.diff_pct
-                ),
-                detail: if d.url.is_empty() {
-                    d.source_type.label().to_string()
-                } else {
-                    let short_url = if let Some(idx) = d.url.rfind('/') {
-                        &d.url[idx + 1..]
-                    } else {
-                        &d.url
-                    };
-                    format!("{short_url} ({})", d.source_type.label())
-                },
-            });
+        let mag_fires = d.diff_time_us.abs() >= 20_000.0
+            && (d.diff_pct.abs() >= 15.0 || d.time_a_us == 0.0 || d.time_b_us == 0.0);
+        if !mag_fires {
+            continue;
         }
+        let improved = d.diff_time_us < 0.0;
+        let fn_name = if d.function_name.is_empty() {
+            "(anonymous)"
+        } else {
+            &d.function_name
+        };
+        let signed_ms = if improved {
+            format!("-{:.1}ms", d.diff_time_us.abs() / 1000.0)
+        } else {
+            format!("+{:.1}ms", d.diff_time_us.abs() / 1000.0)
+        };
+        findings.push(Finding {
+            severity: if improved {
+                FindingSeverity::Improved
+            } else {
+                FindingSeverity::Regressed
+            },
+            category: "CPU Function".to_string(),
+            message: format!(
+                "{}: {} ({})",
+                fn_name,
+                signed_ms,
+                fmt_change(d.time_a_us, d.time_b_us, &|v| format!(
+                    "{:.1}ms",
+                    v / 1000.0
+                )),
+            ),
+            detail: if d.url.is_empty() {
+                format!("{} (of sampled time)", d.source_type.label())
+            } else {
+                let short_url = if let Some(idx) = d.url.rfind('/') {
+                    &d.url[idx + 1..]
+                } else {
+                    &d.url
+                };
+                format!("{short_url} ({}, of sampled time)", d.source_type.label())
+            },
+        });
     }
 
     // Sort findings: regressions first, then improvements
@@ -581,7 +704,12 @@ pub fn analyze_compare(
 mod tests {
     use super::*;
 
-    fn dummy_summary(busy: f64, tbt: f64, lt_count: usize, stats: Vec<EventTypeStat>) -> SummaryResult {
+    fn dummy_summary(
+        busy: f64,
+        tbt: f64,
+        lt_count: usize,
+        stats: Vec<EventTypeStat>,
+    ) -> SummaryResult {
         SummaryResult {
             long_task_count: lt_count,
             long_tasks_top: vec![],
@@ -605,12 +733,14 @@ mod tests {
                 composite_us: 0.0,
                 hit_test_us: 0.0,
                 layout_us: 0.0,
+                over_50ms: false,
             },
             percentiles: ScrollFramePercentiles {
                 p50_us: 0.0,
                 p90_us: 0.0,
                 p99_us: 0.0,
             },
+            heuristic_fallback: true,
         }
     }
 
@@ -695,13 +825,20 @@ mod tests {
         let sum_b = dummy_summary(6_000_000.0, 0.0, 0, vec![]);
 
         let cmp = analyze_compare(
-            &sum_a, &sum_b,
-            &dummy_scroll(), &dummy_scroll(),
-            &cpu_a, &cpu_b,
-            &dummy_layout(), &dummy_layout(),
-            &dummy_style(), &dummy_style(),
-            &dummy_reflow(0), &dummy_reflow(0),
-            &dummy_jank(0), &dummy_jank(0),
+            &sum_a,
+            &sum_b,
+            &dummy_scroll(),
+            &dummy_scroll(),
+            &cpu_a,
+            &cpu_b,
+            &dummy_layout(),
+            &dummy_layout(),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_reflow(0),
+            &dummy_reflow(0),
+            &dummy_jank(0),
+            &dummy_jank(0),
         );
 
         // renderWorld (+1000ms) must be ranked ahead of tinyHelper (+170ms)
@@ -710,22 +847,228 @@ mod tests {
         assert_eq!(cmp.cpu_diff[1].function_name, "tinyHelper");
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn cmp_with(
+        sum_a: &SummaryResult,
+        sum_b: &SummaryResult,
+        cpu_a: &CpuProfileResult,
+        cpu_b: &CpuProfileResult,
+        style_a: &StyleRecalcResult,
+        style_b: &StyleRecalcResult,
+        jank_a: &JankResult,
+        jank_b: &JankResult,
+    ) -> CompareResult {
+        analyze_compare(
+            sum_a,
+            sum_b,
+            &dummy_scroll(),
+            &dummy_scroll(),
+            cpu_a,
+            cpu_b,
+            &dummy_layout(),
+            &dummy_layout(),
+            style_a,
+            style_b,
+            &dummy_reflow(0),
+            &dummy_reflow(0),
+            jank_a,
+            jank_b,
+        )
+    }
+
+    #[test]
+    fn zero_baseline_reports_absolute_delta_never_100pct() {
+        assert_eq!(pct_diff(0.0, 0.0), 0.0);
+        assert_eq!(pct_diff(0.0, 5.0), f64::INFINITY);
+        assert_eq!(fmt_change(0.0, 5.0, &|v| format!("{v:.0}")), "0 → 5");
+        assert_eq!(fmt_change(0.0, 0.0, &|v| format!("{v:.0}")), "+0%");
+        assert_eq!(fmt_change(1.0, 2.0, &|v| format!("{v:.0}")), "+100%");
+        // A 0 -> N TBT jump must not read "+100%".
+        let cmp = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 100_000.0, 0, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(0),
+            &dummy_jank(0),
+        );
+        let tbt = cmp
+            .findings
+            .iter()
+            .find(|f| f.category == "Total Blocking Time")
+            .expect("TBT finding must fire on 0 -> 100ms");
+        assert!(
+            tbt.message.contains("0.0ms → 100.0ms"),
+            "got: {}",
+            tbt.message
+        );
+        assert!(!tbt.message.contains("+100%"));
+    }
+
+    #[test]
+    fn trivial_count_noise_stays_silent() {
+        // Long tasks +1 within 25% (5 -> 6) and 0 -> 1: silent.
+        // 0 -> 2: fires on the count gate.
+        let quiet = cmp_with(
+            &dummy_summary(0.0, 0.0, 5, vec![]),
+            &dummy_summary(0.0, 0.0, 6, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(0),
+            &dummy_jank(0),
+        );
+        assert!(quiet.findings.iter().all(|f| f.category != "Long Tasks"));
+        let quiet_zero = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 0.0, 1, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(0),
+            &dummy_jank(0),
+        );
+        assert!(
+            quiet_zero
+                .findings
+                .iter()
+                .all(|f| f.category != "Long Tasks")
+        );
+        let loud = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 0.0, 2, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(0),
+            &dummy_jank(0),
+        );
+        assert!(loud.findings.iter().any(|f| f.category == "Long Tasks"));
+        // Dropped frames ±1 on equal-length traces: silent. ±3: fires.
+        let quiet = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(5),
+            &dummy_jank(6),
+        );
+        assert!(
+            quiet
+                .findings
+                .iter()
+                .all(|f| f.category != "Dropped Frames")
+        );
+        let loud = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(5),
+            &dummy_jank(8),
+        );
+        assert!(loud.findings.iter().any(|f| f.category == "Dropped Frames"));
+    }
+
+    #[test]
+    fn style_zero_baseline_regression_is_a_finding() {
+        let style_a = StyleRecalcResult {
+            entries: vec![],
+            avg_elements: 0.0,
+            max_elements: 0,
+            total_count: 0,
+        };
+        let style_b = StyleRecalcResult {
+            entries: vec![],
+            avg_elements: 500.0,
+            max_elements: 500,
+            total_count: 3,
+        };
+        let cmp = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &style_a,
+            &style_b,
+            &dummy_jank(0),
+            &dummy_jank(0),
+        );
+        let style = cmp
+            .findings
+            .iter()
+            .find(|f| f.category == "Style Elements")
+            .expect("0 -> N style work must be a finding");
+        assert_eq!(style.severity, FindingSeverity::Regressed);
+    }
+
+    #[test]
+    fn cpu_findings_cover_improvements_and_the_full_diff_list() {
+        // 40 functions each improving by 30ms/50%: findings must reach past
+        // the old top-30 truncation and report improvements, not just
+        // regressions.
+        let mk = |i: usize, t: f64| FunctionTime {
+            function_name: format!("fn{i:02}"),
+            url: "app.js".to_string(),
+            self_time_us: t,
+            source_type: SourceType::AppCode,
+        };
+        let cpu_a: Vec<FunctionTime> = (0..40).map(|i| mk(i, 60_000.0)).collect();
+        let cpu_b: Vec<FunctionTime> = (0..40).map(|i| mk(i, 30_000.0)).collect();
+        let cmp = cmp_with(
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_summary(0.0, 0.0, 0, vec![]),
+            &dummy_cpu(cpu_a, 2_400_000.0),
+            &dummy_cpu(cpu_b, 1_200_000.0),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_jank(0),
+            &dummy_jank(0),
+        );
+        assert_eq!(cmp.cpu_diff.len(), 40, "full diff list must survive");
+        let improved = cmp
+            .findings
+            .iter()
+            .filter(|f| f.category == "CPU Function" && f.severity == FindingSeverity::Improved)
+            .count();
+        assert_eq!(improved, 40);
+    }
+
     #[test]
     fn compare_flags_tbt_dropped_frames_and_reflow_regressions() {
         let sum_a = dummy_summary(100_000.0, 20_000.0, 1, vec![]);
         let sum_b = dummy_summary(800_000.0, 450_000.0, 5, vec![]);
 
         let cmp = analyze_compare(
-            &sum_a, &sum_b,
-            &dummy_scroll(), &dummy_scroll(),
-            &dummy_cpu(vec![], 0.0), &dummy_cpu(vec![], 0.0),
-            &dummy_layout(), &dummy_layout(),
-            &dummy_style(), &dummy_style(),
-            &dummy_reflow(1), &dummy_reflow(8),
-            &dummy_jank(2), &dummy_jank(15),
+            &sum_a,
+            &sum_b,
+            &dummy_scroll(),
+            &dummy_scroll(),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_layout(),
+            &dummy_layout(),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_reflow(1),
+            &dummy_reflow(8),
+            &dummy_jank(2),
+            &dummy_jank(15),
         );
 
-        let tbt_finding = cmp.findings.iter().find(|f| f.category == "Total Blocking Time");
+        let tbt_finding = cmp
+            .findings
+            .iter()
+            .find(|f| f.category == "Total Blocking Time");
         assert!(tbt_finding.is_some(), "missing TBT finding");
         assert_eq!(tbt_finding.unwrap().severity, FindingSeverity::Regressed);
 
@@ -740,8 +1083,8 @@ mod tests {
 
     #[test]
     fn compare_profiler_overhead_traces_does_not_produce_false_tbt_or_jank_findings() {
-        use crate::analysis::summary::analyze_summary;
         use crate::analysis::jank::analyze_jank;
+        use crate::analysis::summary::analyze_summary;
         use crate::trace::TraceEvent;
 
         fn ev(name: &'static str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
@@ -762,7 +1105,13 @@ mod tests {
         // Trace A: RunTask 1079ms, StartProfiling 1076ms, 3 dropped frames
         let events_a = vec![
             ev("RunTask", b'X', 1_000_000.0, Some(1_079_000.0), 1),
-            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(1_076_000.0), 1),
+            ev(
+                "CpuProfiler::StartProfiling",
+                b'X',
+                1_001_000.0,
+                Some(1_076_000.0),
+                1,
+            ),
             ev("DroppedFrame", b'I', 1_010_000.0, None, 7),
             ev("DroppedFrame", b'I', 1_020_000.0, None, 7),
             ev("DroppedFrame", b'I', 1_030_000.0, None, 7),
@@ -771,7 +1120,13 @@ mod tests {
         // Trace B: RunTask 890ms, StartProfiling 886ms, 1 dropped frame
         let events_b = vec![
             ev("RunTask", b'X', 1_000_000.0, Some(890_000.0), 1),
-            ev("CpuProfiler::StartProfiling", b'X', 1_001_000.0, Some(886_000.0), 1),
+            ev(
+                "CpuProfiler::StartProfiling",
+                b'X',
+                1_001_000.0,
+                Some(886_000.0),
+                1,
+            ),
             ev("DroppedFrame", b'I', 1_010_000.0, None, 7),
         ];
 
@@ -788,18 +1143,28 @@ mod tests {
         assert_eq!(jank_b.total_dropped, 0);
 
         let cmp = analyze_compare(
-            &sum_a, &sum_b,
-            &dummy_scroll(), &dummy_scroll(),
-            &dummy_cpu(vec![], 0.0), &dummy_cpu(vec![], 0.0),
-            &dummy_layout(), &dummy_layout(),
-            &dummy_style(), &dummy_style(),
-            &dummy_reflow(0), &dummy_reflow(0),
-            &jank_a, &jank_b,
+            &sum_a,
+            &sum_b,
+            &dummy_scroll(),
+            &dummy_scroll(),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_cpu(vec![], 0.0),
+            &dummy_layout(),
+            &dummy_layout(),
+            &dummy_style(),
+            &dummy_style(),
+            &dummy_reflow(0),
+            &dummy_reflow(0),
+            &jank_a,
+            &jank_b,
         );
 
         // Neither TBT nor Dropped Frames should generate a finding
-        assert!(cmp.findings.iter().all(|f| f.category != "Total Blocking Time"));
+        assert!(
+            cmp.findings
+                .iter()
+                .all(|f| f.category != "Total Blocking Time")
+        );
         assert!(cmp.findings.iter().all(|f| f.category != "Dropped Frames"));
     }
 }
-

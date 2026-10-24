@@ -4,9 +4,10 @@ mod export;
 mod html;
 mod inspect;
 mod repl;
+mod report_json;
 
-use chperf_core::{analysis, trace};
 use crate::cli::Cli;
+use chperf_core::{analysis, trace};
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -35,49 +36,58 @@ pub(crate) struct Analyzed {
 
 pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
-    let trace = trace::parse_trace(path)?;
+    let trace = trace::parse_trace(path).map_err(|e| {
+        format!(
+            "{}: {}",
+            path.display(),
+            e.to_string().split('\n').next().unwrap_or("")
+        )
+    })?;
     let main_tid = trace::detect_main_thread(&trace.trace_events);
     let min_ts = chperf_core::inspect::trace_start_us(&trace.trace_events);
     let events = &trace.trace_events;
-    eprintln!(
-        "  {} events, main thread tid={}",
-        events.len(),
-        main_tid
-    );
+    eprintln!("  {} events, main thread tid={}", events.len(), main_tid);
     // The six analysis passes are independent and read-only, so on large
     // traces they run concurrently (each pass itself parallelizes hot work).
     const PARALLEL_THRESHOLD: usize = 20_000;
-    let (summary, scroll_frames, layout_dirty, style_recalc, forced_reflows, jank, (cpu_profile, cpu_cache)) =
-        if events.len() >= PARALLEL_THRESHOLD {
-            std::thread::scope(|s| {
-                let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
-                let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
-                let c = s.spawn(|| analysis::analyze_cpu_profile_full(events));
-                let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
-                let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
-                let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
-                let g = s.spawn(|| analysis::analyze_jank(events, main_tid, None));
-                (
-                    a.join().unwrap(),
-                    b.join().unwrap(),
-                    d.join().unwrap(),
-                    e.join().unwrap(),
-                    f.join().unwrap(),
-                    g.join().unwrap(),
-                    c.join().unwrap(),
-                )
-            })
-        } else {
+    let (
+        summary,
+        scroll_frames,
+        layout_dirty,
+        style_recalc,
+        forced_reflows,
+        jank,
+        (cpu_profile, cpu_cache),
+    ) = if events.len() >= PARALLEL_THRESHOLD {
+        std::thread::scope(|s| {
+            let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
+            let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
+            let c = s.spawn(|| analysis::analyze_cpu_profile_full(events));
+            let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
+            let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
+            let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
+            let g = s.spawn(|| analysis::analyze_jank(events, main_tid, None));
             (
-                analysis::analyze_summary(events, main_tid),
-                analysis::analyze_scroll_frames(events, main_tid),
-                analysis::analyze_layout_dirty(events, main_tid),
-                analysis::analyze_style_recalc(events, main_tid),
-                analysis::analyze_forced_reflows(events, main_tid),
-                analysis::analyze_jank(events, main_tid, None),
-                analysis::analyze_cpu_profile_full(events),
+                a.join().unwrap(),
+                b.join().unwrap(),
+                d.join().unwrap(),
+                e.join().unwrap(),
+                f.join().unwrap(),
+                g.join().unwrap(),
+                c.join().unwrap(),
             )
-        };
+        })
+    } else {
+        (
+            analysis::analyze_summary(events, main_tid),
+            analysis::analyze_scroll_frames(events, main_tid),
+            analysis::analyze_layout_dirty(events, main_tid),
+            analysis::analyze_style_recalc(events, main_tid),
+            analysis::analyze_forced_reflows(events, main_tid),
+            analysis::analyze_jank(events, main_tid, None),
+            analysis::analyze_cpu_profile_full(events),
+        )
+    };
     Ok(Analyzed {
         summary,
         scroll_frames,
@@ -95,11 +105,7 @@ pub(crate) fn load_and_analyze(path: &Path) -> Result<Analyzed, Box<dyn std::err
 
 /// Build the App (with optional compare) from analyzed traces. Borrows the
 /// analyses so the REPL can rebuild the app (e.g. after `compare <file>`).
-fn build_app(
-    a: &Analyzed,
-    b: Option<(&Analyzed, String)>,
-    name_a: String,
-) -> app::App {
+fn build_app(a: &Analyzed, b: Option<(&Analyzed, String)>, name_a: String) -> app::App {
     let (compare_result, trace_name_b) = if let Some((bb, name_b)) = b {
         let cmp = analysis::analyze_compare(
             &a.summary,
@@ -122,6 +128,17 @@ fn build_app(
         (None, None)
     };
 
+    let events = &a.trace.trace_events;
+    let loading = analysis::analyze_loading(events);
+    let network = analysis::analyze_network(events, a.main_tid);
+    let raster = analysis::analyze_raster(events, a.main_tid);
+    let official_long_tasks = analysis::analyze_long_tasks_official(events, a.main_tid);
+    let mut tids = std::collections::HashSet::new();
+    for e in events {
+        tids.insert(e.tid);
+    }
+    let frame_budget_us = chperf_core::windowed::detect_frame_budget_us(events);
+
     let metadata = a.trace.metadata.clone();
     app::App::new(
         a.summary.clone(),
@@ -131,6 +148,15 @@ fn build_app(
         a.style_recalc.clone(),
         a.forced_reflows.clone(),
         a.jank.clone(),
+        loading,
+        network,
+        raster,
+        official_long_tasks,
+        a.trace.stats.clone(),
+        tids.len(),
+        a.summary.total_trace_duration_us,
+        frame_budget_us,
+        a.main_tid,
         compare_result,
         name_a,
         trace_name_b,
@@ -138,7 +164,44 @@ fn build_app(
     )
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// True when any inspect modifier is present without an inspect query.
+/// (--throttle/--export/--html/--compare/--summary/--fail-on-regressed are
+/// full-report flags, not modifiers; --json/--csv handled separately.)
+fn has_inspect_modifier(cli: &Cli) -> bool {
+    cli.around.is_some()
+        || cli.window.is_some()
+        || cli.tid.is_some()
+        || cli.pid.is_some()
+        || cli.cat.is_some()
+        || cli.sort.is_some()
+        || cli.min_dur.is_some()
+        || cli.regex
+        || cli.full_args
+        || cli.bucket.is_some()
+        || cli.frame_budget.is_some()
+        || (cli.lt - 50.0).abs() > f64::EPSILON
+        || (cli.pre - 500.0).abs() > f64::EPSILON
+        || (cli.post - 500.0).abs() > f64::EPSILON
+        || cli.url.is_some()
+        || cli.stats
+        || cli.gaps
+        || cli.top != 30
+}
+
+fn main() {
+    if let Err(e) = real_main() {
+        let msg = e.to_string();
+        if msg.starts_with("usage:") {
+            eprintln!("chperf: {}", msg);
+            std::process::exit(2);
+        }
+        // Parse/IO errors already carry "path: message" context.
+        eprintln!("chperf: {}", msg);
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let trace_path = match cli.trace.as_deref().map(Path::new) {
         Some(p) => p,
@@ -155,7 +218,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Directory mode: scan for traces, then batch-export or list them.
     if trace_path.is_dir() {
-        let traces = trace::list_traces(trace_path)?;
+        let traces = trace::list_traces(trace_path).map_err(|e| {
+            format!(
+                "{}: {}",
+                trace_path.display(),
+                e.to_string().split('\n').next().unwrap_or("")
+            )
+        })?;
         if traces.is_empty() {
             eprintln!(
                 "No trace files (*.json / *.json.gz) found in {}",
@@ -167,15 +236,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return batch_export(&cli, &traces);
         }
         // No TUI picker: list traces and guide the user to pick one explicitly.
-        eprintln!("Found {} trace(s) in {}:", traces.len(), cli.trace.as_deref().unwrap_or(""));
+        eprintln!(
+            "Found {} trace(s) in {}:",
+            traces.len(),
+            cli.trace.as_deref().unwrap_or("")
+        );
         for (i, p) in traces.iter().enumerate() {
             eprintln!("  {:>3}. {}", i + 1, p.display());
         }
         eprintln!(
             "\nAnalyze one: chperf <file> [--export] [--compare <file2>] | inspect: --events/--function/--find"
         );
-        eprintln!("Export all:  chperf {} --export", cli.trace.as_deref().unwrap_or(""));
+        eprintln!(
+            "Export all:  chperf {} --export",
+            cli.trace.as_deref().unwrap_or("")
+        );
         return Ok(());
+    }
+
+    // Modifier gating + full-report JSON/CSV handling (no inspect query).
+    if !cli.is_inspect() {
+        if cli.stats {
+            return Err(
+                "usage: --stats requires --events <names> (duration table of an event list)".into(),
+            );
+        }
+        if cli.gaps {
+            return Err(
+                "usage: --gaps requires --events <names> (no silent EventDispatch default)".into(),
+            );
+        }
+        if cli.summary && cli.compare.is_none() {
+            return Err(
+                "usage: --summary requires --compare <file> (summary-only is a compare view)"
+                    .into(),
+            );
+        }
+        if cli.csv {
+            return Err(
+                "usage: CSV only for inspect queries (add --events/--names/--frames/...)".into(),
+            );
+        }
+        if cli.fail_on_regressed && cli.compare.is_none() {
+            return Err("usage: --fail-on-regressed requires --compare <file>".into());
+        }
+        if cli.json {
+            if has_inspect_modifier(&cli) {
+                // --json with other modifiers but no query: modifiers are meaningless.
+                return Err("usage: no inspect query given — add --events/--timeline/--frames/--loading/--network/--raster/--coverage/... or drop these flags for the full report".into());
+            }
+            return run_single(trace_path, cli.compare.as_deref().map(Path::new), &cli);
+        }
+        if has_inspect_modifier(&cli) {
+            return Err("usage: no inspect query given — add --events/--timeline/--frames/--loading/--network/--raster/--coverage/... or drop these flags for the full report".into());
+        }
+    } else {
+        // Inspect path validates --stats/--gaps inside inspect_output.
+        if cli.summary {
+            // --summary with an inspect query: summary flag is for compare-only.
+            return Err("usage: --summary requires --compare <file> (not an inspect query)".into());
+        }
+        if cli.fail_on_regressed && cli.compare.is_none() {
+            return Err("usage: --fail-on-regressed requires --compare <file>".into());
+        }
     }
 
     // Granular inspect mode: print targeted tables to stdout, skip analysis.
@@ -190,15 +313,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// window/thread/process/category. Prints Markdown to stdout.
 fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loading {}...", path.display());
-    let trace = trace::parse_trace(path)?;
+    let trace = trace::parse_trace(path).map_err(|e| {
+        format!(
+            "{}: {}",
+            path.display(),
+            e.to_string().split('\n').next().unwrap_or("")
+        )
+    })?;
     eprintln!("  {} events", trace.trace_events.len());
     let name_a = trace::trace_stem(path);
     let min_ts = chperf_core::inspect::trace_start_us(&trace.trace_events);
     let Some(path_b) = cli.compare.as_deref().map(Path::new) else {
-        return inspect::inspect_output(&trace.trace_events, min_ts, &name_a, cli, None);
+        return inspect::inspect_output(
+            &trace.trace_events,
+            min_ts,
+            &name_a,
+            cli,
+            None,
+            &trace.stats,
+        );
     };
     eprintln!("Loading {}...", path_b.display());
-    let trace_b = trace::parse_trace(path_b)?;
+    let trace_b = trace::parse_trace(path_b).map_err(|e| {
+        format!(
+            "{}: {}",
+            path_b.display(),
+            e.to_string().split('\n').next().unwrap_or("")
+        )
+    })?;
     eprintln!("  {} events", trace_b.trace_events.len());
     inspect::inspect_compare_output(
         &trace.trace_events,
@@ -206,6 +348,8 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         &trace_b.trace_events,
         &trace::trace_stem(path_b),
         cli,
+        &trace.stats,
+        &trace_b.stats,
     )
 }
 
@@ -224,7 +368,11 @@ fn run_single(
         None
     };
 
-    let mut app = build_app(&analyzed_a, b_opt.as_ref().map(|(b, n)| (b, n.clone())), trace::trace_stem(path_a));
+    let mut app = build_app(
+        &analyzed_a,
+        b_opt.as_ref().map(|(b, n)| (b, n.clone())),
+        trace::trace_stem(path_a),
+    );
 
     // Apply throttle: CLI flag takes priority, otherwise auto-detect from trace metadata
     let throttle = cli.throttle.unwrap_or_else(|| {
@@ -252,7 +400,9 @@ fn run_single(
     // --html wins over --export: it needs the raw events for the memory /
     // input / async sections, which only live on `Analyzed` here.
     if let Some(target) = cli.html.as_deref() {
-        let events_b = b_opt.as_ref().map(|(b, _)| (b.trace.trace_events.as_slice(), b.min_ts));
+        let events_b = b_opt
+            .as_ref()
+            .map(|(b, _)| (b.trace.trace_events.as_slice(), b.min_ts));
         let doc = html::export_html(
             &app,
             &analyzed_a.trace.trace_events,
@@ -262,11 +412,26 @@ fn run_single(
         match target {
             "-" => print!("{}", doc),
             t => {
-                std::fs::write(t, &doc)?;
+                std::fs::write(t, &doc).map_err(|e| format!("{}: {}", t, e))?;
                 eprintln!("Exported HTML to {}", t);
             }
         }
-        return Ok(());
+        return check_fail_on_regressed(&app, cli);
+    }
+
+    // Machine-readable full report: --json with no inspect query.
+    if cli.json {
+        let v =
+            report_json::full_report_json(&app, &analyzed_a.trace.trace_events, analyzed_a.min_ts);
+        let s = serde_json::to_string_pretty(&v)?;
+        match cli.export.as_deref() {
+            Some(target) if target != "-" => {
+                std::fs::write(target, &s).map_err(|e| format!("{}: {}", target, e))?;
+                eprintln!("Exported JSON to {}", target);
+            }
+            _ => print!("{}", s),
+        }
+        return check_fail_on_regressed(&app, cli);
     }
 
     let md = if cli.summary {
@@ -277,9 +442,23 @@ fn run_single(
     match cli.export.as_deref() {
         Some("-") | None => print!("{}", md),
         Some(target) => {
-            std::fs::write(target, &md)?;
+            std::fs::write(target, &md).map_err(|e| format!("{}: {}", target, e))?;
             eprintln!("Exported to {}", target);
         }
+    }
+    check_fail_on_regressed(&app, cli)
+}
+
+/// --fail-on-regressed: exit 3 when any compare finding is Regressed.
+fn check_fail_on_regressed(app: &app::App, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.fail_on_regressed
+        && let Some(ref cmp) = app.compare
+        && cmp
+            .findings
+            .iter()
+            .any(|f| f.severity == analysis::FindingSeverity::Regressed)
+    {
+        std::process::exit(3);
     }
     Ok(())
 }
@@ -287,20 +466,32 @@ fn run_single(
 /// Batch-export every trace in a directory as Markdown files.
 /// Traces are analyzed in parallel in small groups: trace parsing is
 /// memory-heavy, so we cap concurrency to keep peak RAM bounded.
+/// Per-file failures print + final "N failed" + exit 1.
 fn batch_export(cli: &Cli, traces: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     const GROUP: usize = 3;
     let summary_only = cli.summary;
+    if summary_only {
+        return Err("usage: --summary requires --compare <file> (not batch export)".into());
+    }
     let throttle = cli.throttle;
+    let failed = AtomicUsize::new(0);
     for group in traces.chunks(GROUP) {
         std::thread::scope(|s| {
             for path in group {
                 s.spawn(|| {
                     if let Err(e) = export_one(path, throttle, summary_only) {
                         eprintln!("  ERROR {}: {}", path.display(), e);
+                        failed.fetch_add(1, Ordering::Relaxed);
                     }
                 });
             }
         });
+    }
+    let n = failed.load(Ordering::Relaxed);
+    if n > 0 {
+        eprintln!("{} failed", n);
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -345,8 +536,13 @@ fn export_one(
 
 #[cfg(test)]
 mod tests {
-    use chperf_core::{analysis, inspect::{self, Scope}, trace::{self, TraceEvent}, windowed};
     use crate::inspect::{compare_csv_rows, compare_json};
+    use chperf_core::{
+        analysis,
+        inspect::{self, Scope},
+        trace::{self, TraceEvent},
+        windowed,
+    };
     use std::path::PathBuf;
 
     fn fixture_path() -> PathBuf {
@@ -394,7 +590,12 @@ mod tests {
         // Frames: 2 b/e pairs (16ms, 20ms), 2 dropped.
         let (md, _) = windowed::frames_section(
             &events,
-            &Scope { window: None, tid: None, pid: None, cat: None },
+            &Scope {
+                window: None,
+                tid: None,
+                pid: None,
+                cat: None,
+            },
             "SubmitCompositorFrameToPresentationCompositorFrame",
             1_000_000.0,
         );
@@ -404,7 +605,12 @@ mod tests {
         // GC: 1 major 5ms, 1 minor 1ms, 1 long task ≥50ms.
         let (md, _) = windowed::gc_section(
             &events,
-            &Scope { window: None, tid: None, pid: None, cat: None },
+            &Scope {
+                window: None,
+                tid: None,
+                pid: None,
+                cat: None,
+            },
             50.0,
             1_000_000.0,
         );
@@ -420,7 +626,12 @@ mod tests {
         let (md, _) = inspect::find_section(
             &events,
             &inspect::Matcher::new("player_shoot", false).unwrap(),
-            &Scope { window: None, tid: None, pid: None, cat: None },
+            &Scope {
+                window: None,
+                tid: None,
+                pid: None,
+                cat: None,
+            },
             false,
             30,
             1_000_000.0,
@@ -430,7 +641,12 @@ mod tests {
         let (md, _) = inspect::find_section(
             &events,
             &inspect::Matcher::new("weapon.ts", false).unwrap(),
-            &Scope { window: None, tid: None, pid: None, cat: None },
+            &Scope {
+                window: None,
+                tid: None,
+                pid: None,
+                cat: None,
+            },
             false,
             30,
             1_000_000.0,
@@ -484,14 +700,31 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             state >> 33
         };
-        let names = ["RunTask", "FunctionCall", "ProfileChunk", "thread_name", "MajorGC", "MinorGC", "DroppedFrame", "SubmitCompositorFrameToPresentationCompositorFrame", "Paint", "Profile", "Layout", "UpdateLayoutTree"];
+        let names = [
+            "RunTask",
+            "FunctionCall",
+            "ProfileChunk",
+            "thread_name",
+            "MajorGC",
+            "MinorGC",
+            "DroppedFrame",
+            "SubmitCompositorFrameToPresentationCompositorFrame",
+            "Paint",
+            "Profile",
+            "Layout",
+            "UpdateLayoutTree",
+        ];
         let phases = ["X", "b", "e", "P", "M", "I", "B", "E", "N", ""];
 
         for iter in 0..60 {
             let n_ev = (rng() % 200) as usize;
             let mut arr: Vec<serde_json::Value> = Vec::with_capacity(n_ev + 2);
-            arr.push(serde_json::json!({"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0}));
-            arr.push(serde_json::json!({"name": "Profile", "ph": "P", "ts": 1_000_000.0, "pid": 2}));
+            arr.push(
+                serde_json::json!({"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0}),
+            );
+            arr.push(
+                serde_json::json!({"name": "Profile", "ph": "P", "ts": 1_000_000.0, "pid": 2}),
+            );
             for _ in 0..n_ev {
                 let name = names[(rng() % names.len() as u64) as usize];
                 let ph = phases[(rng() % phases.len() as u64) as usize];
@@ -536,7 +769,8 @@ mod tests {
                         _ => {
                             let n_s = (rng() % 6) as usize;
                             let samples: Vec<u64> = (0..n_s).map(|_| rng() % 5).collect();
-                            let deltas: Vec<f64> = (0..n_s).map(|_| (rng() % 50) as f64 - 20.0).collect();
+                            let deltas: Vec<f64> =
+                                (0..n_s).map(|_| (rng() % 50) as f64 - 20.0).collect();
                             ev["args"] = serde_json::json!({"data": {"cpuProfile": {
                                 "nodes": [{"id": 1, "callFrame": {"functionName": "x", "url": "http://x.ts"}, "parent": null}],
                                 "samples": samples,
@@ -551,7 +785,11 @@ mod tests {
             }
             let trace = serde_json::json!({"traceEvents": arr});
 
-            let path = std::env::temp_dir().join(format!("chperf-fuzz-{}-{}.json", std::process::id(), iter));
+            let path = std::env::temp_dir().join(format!(
+                "chperf-fuzz-{}-{}.json",
+                std::process::id(),
+                iter
+            ));
             std::fs::write(&path, serde_json::to_string(&trace).unwrap()).unwrap();
 
             let events = trace::parse_trace(&path).unwrap().trace_events;
@@ -560,7 +798,12 @@ mod tests {
             // Full scan: totals finite and non-negative.
             let (_nodes, full) = analysis::scan_profile_chunks(&events, None, 0);
             let full_total: f64 = full.values().sum();
-            assert!(full_total.is_finite() && full_total >= 0.0, "iter {}: bad full total {}", iter, full_total);
+            assert!(
+                full_total.is_finite() && full_total >= 0.0,
+                "iter {}: bad full total {}",
+                iter,
+                full_total
+            );
 
             // Whole-trace window == full scan; partial window ⊆ full.
             let (min_ts, max_ts) = {
@@ -579,7 +822,12 @@ mod tests {
                     (mn, mx.max(mn + 1.0))
                 }
             };
-            let scope_all = Scope { window: Some((min_ts, max_ts)), tid: None, pid: None, cat: None };
+            let scope_all = Scope {
+                window: Some((min_ts, max_ts)),
+                tid: None,
+                pid: None,
+                cat: None,
+            };
             let (_, win_all) = analysis::scan_profile_chunks(&events, Some(&scope_all), 0);
             let win_total: f64 = win_all.values().sum();
             assert!(
@@ -590,10 +838,20 @@ mod tests {
                 full_total
             );
             let mid = (min_ts + max_ts) / 2.0;
-            let scope_half = Scope { window: Some((min_ts, mid)), tid: None, pid: None, cat: None };
+            let scope_half = Scope {
+                window: Some((min_ts, mid)),
+                tid: None,
+                pid: None,
+                cat: None,
+            };
             let (_, win_half) = analysis::scan_profile_chunks(&events, Some(&scope_half), 0);
             for (id, t) in &win_half {
-                assert!(*t <= full.get(id).copied().unwrap_or(0.0) + 1e-9, "iter {}: windowed > full for node {:?}", iter, id);
+                assert!(
+                    *t <= full.get(id).copied().unwrap_or(0.0) + 1e-9,
+                    "iter {}: windowed > full for node {:?}",
+                    iter,
+                    id
+                );
             }
 
             // Analysis passes must not panic on garbage.
@@ -605,20 +863,35 @@ mod tests {
             let main_tid = trace::detect_main_thread(&events);
             let _ = windowed::gc_section(
                 &events,
-                &Scope { window: Some((min_ts, max_ts)), tid: Some(main_tid), pid: None, cat: None },
+                &Scope {
+                    window: Some((min_ts, max_ts)),
+                    tid: Some(main_tid),
+                    pid: None,
+                    cat: None,
+                },
                 50.0,
                 min_ts,
             );
             let _ = windowed::frames_section(
                 &events,
-                &Scope { window: Some((min_ts, max_ts)), tid: None, pid: None, cat: None },
+                &Scope {
+                    window: Some((min_ts, max_ts)),
+                    tid: None,
+                    pid: None,
+                    cat: None,
+                },
                 "SubmitCompositorFrameToPresentationCompositorFrame",
                 min_ts,
             );
             let _ = windowed::find_anchor(&events, &inspect::Matcher::new("shoot", false).unwrap());
             let _ = windowed::calltree_section(
                 &events,
-                &Scope { window: None, tid: None, pid: None, cat: None },
+                &Scope {
+                    window: None,
+                    tid: None,
+                    pid: None,
+                    cat: None,
+                },
                 None,
                 None,
                 30,
