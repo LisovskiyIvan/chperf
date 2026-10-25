@@ -1,6 +1,8 @@
 //! The hand-rolled, block-parallel `traceEvents` tokenizer and `parse_trace`.
 
-use super::event::{ArgsText, SharedStr, StrInterner, normalize_id_bytes, parse_tid_pid_str, take_serde_malformed};
+use super::event::{
+    ArgsText, SharedStr, StrInterner, normalize_id_bytes, parse_tid_pid_str, take_serde_malformed,
+};
 use super::{FrameInfo, TraceEvent, TraceFile, TraceMetadata};
 use std::io::Read;
 use std::path::Path;
@@ -36,7 +38,33 @@ fn parse_events_fast<'b>(
     ix: &mut StrInterner<'b>,
 ) -> Result<Vec<TraceEvent>, ()> {
     // ~200 bytes per event on Chrome traces: reserve to skip reallocs.
-    let mut events: Vec<TraceEvent> = Vec::with_capacity((e - s).max(1) / 200);
+    parse_events_fast_inner(
+        bytes,
+        Some(shared),
+        s,
+        e,
+        stats,
+        ix,
+        None,
+        (e - s).max(1) / 200,
+    )
+}
+
+/// Indexed variant of the fast tokenizer: writes events into `out[0..]`
+/// instead of pushing, for in-place window parsing (see `stream.rs`).
+/// `out.len()` must cover the walk's owned-element count; returns the actual
+/// count. `spans` record `(slot, buffer start, buffer end)` triples for the
+/// copy pass. Buffer-local coords.
+fn parse_events_fast_into<'b>(
+    bytes: &'b [u8],
+    s: usize,
+    e: usize,
+    stats: &mut ParseStats,
+    ix: &mut StrInterner<'b>,
+    spans: &mut Vec<ArgsSpan>,
+    out: &mut [TraceEvent],
+) -> Result<usize, ()> {
+    let mut n = 0usize;
     let mut p = s;
     p = skip_ws(bytes, p);
     if p < e && bytes[p] == b'[' {
@@ -51,7 +79,52 @@ fn parse_events_fast<'b>(
             p += 1;
             continue;
         }
-        let (ev, next) = parse_event_fast(bytes, shared, p, stats, ix)?;
+        let slot = out.get_mut(n).ok_or(())?;
+        // Reborrow per event: the loop may record many spans.
+        let sink = ArgsSink::Record(&mut *spans, n as u32);
+        let (ev, next) = parse_event_fast(bytes, p, stats, ix, sink)?;
+        *slot = ev;
+        n += 1;
+        stats.parsed += 1;
+        p = next;
+    }
+    Ok(n)
+}
+
+/// Shared body of [`parse_events_fast`] (push-based whole-buffer path).
+/// `spans` selects the `args` sink: `None` borrows `shared` (plus `shared`
+/// must be `Some`), `Some` records buffer spans for the copy pass.
+fn parse_events_fast_inner<'b>(
+    bytes: &'b [u8],
+    shared: Option<&Arc<[u8]>>,
+    s: usize,
+    e: usize,
+    stats: &mut ParseStats,
+    ix: &mut StrInterner<'b>,
+    spans: Option<&mut Vec<ArgsSpan>>,
+    reserve: usize,
+) -> Result<Vec<TraceEvent>, ()> {
+    let mut events: Vec<TraceEvent> = Vec::with_capacity(reserve);
+    let mut spans = spans;
+    let mut p = s;
+    p = skip_ws(bytes, p);
+    if p < e && bytes[p] == b'[' {
+        p += 1;
+    }
+    loop {
+        p = skip_ws(bytes, p);
+        if p >= e || (p < bytes.len() && bytes[p] == b']') {
+            break;
+        }
+        if bytes[p] == b',' {
+            p += 1;
+            continue;
+        }
+        let sink = match &mut spans {
+            Some(sp) => ArgsSink::Record(&mut **sp, events.len() as u32),
+            None => ArgsSink::Shared(shared.expect("shared sink needs the buffer")),
+        };
+        let (ev, next) = parse_event_fast(bytes, p, stats, ix, sink)?;
         events.push(ev);
         stats.parsed += 1;
         p = next;
@@ -85,7 +158,7 @@ fn parse_events_array_fast<'b>(
             p += 1;
             continue;
         }
-        let (ev, next) = parse_event_fast(bytes, shared, p, stats, ix)?;
+        let (ev, next) = parse_event_fast(bytes, p, stats, ix, ArgsSink::Shared(shared))?;
         events.push(ev);
         stats.parsed += 1;
         p = next;
@@ -154,6 +227,14 @@ fn parse_trace_fast<'b>(bytes: &'b [u8], shared: &Arc<[u8]>) -> Result<TraceFile
     })
 }
 
+/// Where one event's `args` bytes go: borrowed from the shared whole-file
+/// buffer (small-file path), or recorded as a buffer span for the streaming
+/// copy pass (window path; the `u32` is the event's index in its vec).
+enum ArgsSink<'x> {
+    Shared(&'x Arc<[u8]>),
+    Record(&'x mut Vec<ArgsSpan>, u32),
+}
+
 /// Parse one event object starting at bytes[p] == b'{'. Returns the event
 /// and the position after its closing '}'. Wrong-typed but salvageable
 /// fields coerce in place (numeric strings for ts/dur/pid/tid, clamped
@@ -161,10 +242,10 @@ fn parse_trace_fast<'b>(bytes: &'b [u8], shared: &Arc<[u8]>) -> Result<TraceFile
 /// handles (escaped strings, unterminated input) return Err.
 fn parse_event_fast<'b>(
     bytes: &'b [u8],
-    shared: &Arc<[u8]>,
     p: usize,
     stats: &mut ParseStats,
     ix: &mut StrInterner<'b>,
+    mut sink: ArgsSink<'_>,
 ) -> Result<(TraceEvent, usize), ()> {
     let len = bytes.len();
     let mut i = p;
@@ -378,12 +459,26 @@ fn parse_event_fast<'b>(
                     ev.args = None;
                 } else {
                     let end = skip_value(bytes, i)?;
-                    // Zero-copy span of the event's `args` slice: the shared
-                    // buffer outlives the events via `Arc` (see `ArgsText`).
                     // UTF-8 is validated here so a non-UTF-8 `args` bails to
                     // the tolerant serde path exactly like before.
-                    std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?;
-                    ev.args = Some(ArgsText::shared(shared, i, end));
+                    let raw = std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?;
+                    // By `&mut`: a duplicated `"args"` key reuses the sink
+                    // instead of moving it (last one wins, like before).
+                    match &mut sink {
+                        // Zero-copy span of the event's `args` slice: the
+                        // shared buffer outlives the events via `Arc` (see
+                        // `ArgsText`).
+                        ArgsSink::Shared(shared) => {
+                            ev.args = Some(ArgsText::shared(shared, i, end));
+                        }
+                        // Streaming path: record the span for the copy pass
+                        // (the window buffer is dropped right after it).
+                        ArgsSink::Record(spans, idx) => {
+                            debug_assert!(end <= u32::MAX as usize);
+                            spans.push((*idx, i as u32, end as u32));
+                            let _ = raw;
+                        }
+                    }
                     i = end;
                 }
             }
@@ -403,7 +498,7 @@ fn parse_event_fast<'b>(
     }
 }
 
-fn skip_ws(bytes: &[u8], mut p: usize) -> usize {
+pub(crate) fn skip_ws(bytes: &[u8], mut p: usize) -> usize {
     let len = bytes.len();
     while p < len && bytes[p].is_ascii_whitespace() {
         p += 1;
@@ -580,7 +675,11 @@ fn parse_tid_pid_fast(bytes: &[u8], p: usize, stats: &mut ParseStats) -> Result<
 /// coercions drained into `malformed`), structural failures count
 /// `skipped`/`malformed` and the walk continues — one bad event never fails
 /// the file.
-fn parse_slice_tolerant(bytes: &[u8], s: usize, e: usize) -> (Vec<TraceEvent>, ParseStats) {
+pub(crate) fn parse_slice_tolerant(
+    bytes: &[u8],
+    s: usize,
+    e: usize,
+) -> (Vec<TraceEvent>, ParseStats) {
     let mut stats = ParseStats::default();
     let mut events = Vec::new();
     let mut i = s;
@@ -626,6 +725,71 @@ fn parse_slice_tolerant(bytes: &[u8], s: usize, e: usize) -> (Vec<TraceEvent>, P
         }
     }
     (events, stats)
+}
+
+/// Indexed variant of [`parse_slice_tolerant`]: writes into `out[0..]` for
+/// in-place window parsing (see `stream.rs`). Returns the actual event
+/// count (skipped elements leave no holes — only successes advance) plus
+/// the stats. `out.len()` must cover the walk's owned-element count.
+fn parse_slice_tolerant_into(
+    bytes: &[u8],
+    s: usize,
+    e: usize,
+    out: &mut [TraceEvent],
+) -> (usize, ParseStats) {
+    let mut stats = ParseStats::default();
+    let mut n = 0usize;
+    let mut i = s;
+    while i < e {
+        i = skip_ws(bytes, i);
+        if i >= e {
+            break;
+        }
+        if bytes[i] == b',' || bytes[i] == b']' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'{' {
+            // Non-object element (number, string, …): drop, keep going.
+            match skip_value(bytes, i) {
+                Ok(m) if m > i => {
+                    i = m;
+                    stats.skipped += 1;
+                    stats.malformed += 1;
+                }
+                _ => break,
+            }
+            continue;
+        }
+        match skip_value(bytes, i) {
+            Ok(end) if end > i => {
+                let slice = &bytes[i..end.min(e)];
+                match serde_json::from_slice::<TraceEvent>(slice) {
+                    Ok(ev) => {
+                        stats.parsed += 1;
+                        stats.malformed += take_serde_malformed();
+                        if let Some(slot) = out.get_mut(n) {
+                            *slot = ev;
+                            n += 1;
+                        } else {
+                            // Slice exhausted (the walk's count is an upper
+                            // bound only on paths the tolerant walk skips
+                            // differently): stop, keep what parsed.
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        take_serde_malformed();
+                        stats.skipped += 1;
+                        stats.malformed += 1;
+                    }
+                }
+                i = end;
+            }
+            _ => break,
+        }
+    }
+    (n, stats)
 }
 
 /// Event phase: the first byte of a quoted, unescaped string (`0` when the
@@ -758,7 +922,7 @@ fn is_literal_null(bytes: &[u8], p: usize) -> bool {
 
 /// Skip one JSON value starting at p (string, object, array, or number /
 /// literal). Returns the position AFTER the value. Err on unterminated.
-fn skip_value(bytes: &[u8], p: usize) -> Result<usize, ()> {
+pub(crate) fn skip_value(bytes: &[u8], p: usize) -> Result<usize, ()> {
     let len = bytes.len();
     if p >= len {
         return Err(());
@@ -847,10 +1011,10 @@ fn skip_value(bytes: &[u8], p: usize) -> Result<usize, ()> {
 
 /// Byte ranges of the top-level `traceEvents` array and the `metadata`
 /// object, located by a block-counting scan.
-struct Layout {
-    arr_open: usize,
-    arr_close: usize,
-    metadata: Option<(usize, usize)>,
+pub(crate) struct Layout {
+    pub(crate) arr_open: usize,
+    pub(crate) arr_close: usize,
+    pub(crate) metadata: Option<(usize, usize)>,
 }
 
 /// Per-64KB-block JSON structure: brace depth and in-string state at each
@@ -859,23 +1023,23 @@ struct Layout {
 /// traces (e.g. `"origin":"null [internally: ..."` has unbalanced brackets
 /// inside a string) — and in-string state from exact (escape-aware) quote
 /// parity. The full element walk only runs inside the parse chunks.
-struct Blocks {
-    depth_at: Vec<i64>,
-    in_string_at: Vec<bool>,
+pub(crate) struct Blocks {
+    pub(crate) depth_at: Vec<i64>,
+    pub(crate) in_string_at: Vec<bool>,
     /// Escape-pending state at each block start: inside a string whose last
     /// byte of the previous block was a backslash opening an escape. Without
     /// it, an escaped quote split across a block boundary (`\` last byte of
     /// block k, `"` first byte of block k+1) is misread as closing the
     /// string, and depth drifts for every block after it.
-    esc_at: Vec<bool>,
+    pub(crate) esc_at: Vec<bool>,
 }
 
-const BLOCK: usize = 64 * 1024;
+pub(crate) const BLOCK: usize = 64 * 1024;
 
 /// Count unescaped quotes in `chunk` for parity. A quote is escaped iff
 /// preceded by an odd run of backslashes; a run reaching the chunk start
 /// continues into `prev_trail` (backslashes ending the previous block).
-fn count_unescaped_quotes(chunk: &[u8], prev_trail: usize) -> (usize, usize) {
+pub(crate) fn count_unescaped_quotes(chunk: &[u8], prev_trail: usize) -> (usize, usize) {
     let mut nq = 0usize;
     for q in memchr::memchr_iter(b'"', chunk) {
         let mut run = 0usize;
@@ -1063,7 +1227,7 @@ fn state_at(bytes: &[u8], blocks: &Blocks, pos: usize) -> (i64, bool) {
 /// exceeds the ~1ns per boring byte here; measured 228ms vs 189ms scan on a
 /// 959MB trace). Parallelism across 64KB blocks (see `build_blocks`) is the
 /// scaling lever, not per-byte speed.
-fn walk_range(r: &[u8], d: &mut i64, s: &mut bool, esc: &mut bool) {
+pub(crate) fn walk_range(r: &[u8], d: &mut i64, s: &mut bool, esc: &mut bool) {
     // Empty ranges leave the state untouched.
     if r.is_empty() {
         return;
@@ -1133,7 +1297,7 @@ fn find_top_level_open(bytes: &[u8], blocks: &Blocks, needle: &[u8]) -> Option<(
 /// Block-accelerated layout scan: array bounds via targeted probes, array
 /// close via the last block at array depth, metadata via key probe.
 /// Falls back to `None` when the structure isn't recognized.
-fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
+pub(crate) fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let blocks = build_blocks(bytes);
     let (arr_open, opener) = find_top_level_open(bytes, &blocks, b"traceEvents")?;
@@ -1249,7 +1413,7 @@ fn scan_layout(bytes: &[u8]) -> Option<(Layout, Blocks)> {
     ))
 }
 
-fn parse_thread_count(n: &usize) -> usize {
+pub(crate) fn parse_thread_count(n: &usize) -> usize {
     std::env::var("CHPERF_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1278,7 +1442,7 @@ type ParallelResult =
 /// structurally broken events (counted in `ParseStats`) instead of failing
 /// the chunk. The buffer is freed when `parse_trace` returns; events own
 /// their data.
-fn parse_parallel(
+pub(crate) fn parse_parallel(
     shared: &Arc<[u8]>,
     layout: &Layout,
     blocks: &Blocks,
@@ -1401,25 +1565,37 @@ fn parse_parallel(
     Ok((events, metadata, stats))
 }
 
-/// Walk `[from_block_start, to)` (extended to finish the element containing
-/// `to`), collecting the owned element range, and parsing the slice. The
-/// walk visits only structural positions (memchr-accelerated), not every
-/// byte. The buffer is never mutated; owned ranges are disjoint per chunk.
-fn chunk_work(
-    shared: &Arc<[u8]>,
+/// Structural walk over `[from_block_start, to)` (extended to finish the
+/// element containing `to`), returning the owned element byte range.
+///
+/// `bytes` holds file bytes `[base, base + bytes.len())`, `blocks` are global
+/// block states, `from`/`to` are global offsets. The walk visits only
+/// structural positions (memchr-accelerated), not every byte. Owned ranges
+/// are disjoint per chunk: a chunk owns elements whose start is inside
+/// `[from, to)`.
+///
+/// Returns the owned `(start, end)` range (global offsets), the number of
+/// owned complete elements, plus whether an element was still open when the
+/// walk ran out of buffer (`tail_open`): the streaming parser extends its
+/// lookahead and retries while `tail_open` is set and more file bytes exist
+/// past the buffer end.
+pub(crate) fn find_owned_range(
+    bytes: &[u8],
+    base: usize,
     blocks: &Blocks,
     from: usize,
     to: usize,
-) -> Result<(Vec<TraceEvent>, ParseStats), String> {
-    let bytes: &[u8] = shared;
+) -> (Option<(usize, usize)>, usize, bool) {
+    debug_assert!(from >= base);
     let block = from / BLOCK;
-    let start = block * BLOCK;
+    let start = block * BLOCK - base;
     let mut d = blocks.depth_at[block];
     let mut in_string = blocks.in_string_at[block];
 
     let mut first_start: Option<usize> = None;
     let mut last_end: usize = 0;
     let mut elem_start: Option<usize> = None;
+    let mut owned_count: usize = 0;
     let mut finished_last = false; // the element containing `to` was completed
 
     // Walk to the end of the buffer so the element containing `to` always
@@ -1444,18 +1620,19 @@ fn chunk_work(
             }
             _ => break,
         };
-        let i = start + rel;
+        // Global offset; local index is `i - base`.
+        let i = base + start + rel;
         if in_string {
             if b == b'"' {
                 let mut run = 0usize;
                 let mut k = i;
-                while k > start && bytes[k - 1] == b'\\' {
+                while k > base + start && bytes[k - 1 - base] == b'\\' {
                     run += 1;
                     k -= 1;
                 }
                 // A run reaching the block start continues the previous
                 // block's trailing backslash run; `esc_at` encodes its parity.
-                let escaped = if k == start {
+                let escaped = if k == base + start {
                     (run + blocks.esc_at[block] as usize) % 2 == 1
                 } else {
                     run % 2 == 1
@@ -1488,6 +1665,7 @@ fn chunk_work(
                             first_start = Some(e);
                         }
                         last_end = i + 1;
+                        owned_count += 1;
                         // Stop at the first element boundary at/after `to`
                         // even when the element *containing* `to` started
                         // before `from` (it belongs to the previous chunk):
@@ -1512,9 +1690,28 @@ fn chunk_work(
         }
     }
 
-    let (s, e) = match (first_start, last_end) {
-        (Some(s), e) if e > s => (s, e),
-        _ => return Ok((Vec::new(), ParseStats::default())),
+    let range = match (first_start, last_end) {
+        (Some(s), e) if e > s => Some((s, e)),
+        _ => None,
+    };
+    (range, owned_count, elem_start.is_some())
+}
+
+/// Walk `[from_block_start, to)` (extended to finish the element containing
+/// `to`), collecting the owned element range, and parsing the slice. The
+/// walk visits only structural positions (memchr-accelerated), not every
+/// byte. The buffer is never mutated; owned ranges are disjoint per chunk.
+fn chunk_work(
+    shared: &Arc<[u8]>,
+    blocks: &Blocks,
+    from: usize,
+    to: usize,
+) -> Result<(Vec<TraceEvent>, ParseStats), String> {
+    let bytes: &[u8] = shared;
+    let (range, _, _) = find_owned_range(bytes, 0, blocks, from, to);
+    let (s, e) = match range {
+        Some(r) => r,
+        None => return Ok((Vec::new(), ParseStats::default())),
     };
 
     // Fast path: hand-rolled tokenizer on the pristine bytes. Field
@@ -1544,32 +1741,68 @@ fn chunk_work(
     Ok(parse_slice_tolerant(bytes, s, e))
 }
 
+/// One recorded `args` span for the streaming copy pass: the event index in
+/// the window's event vec plus the buffer-local `[start, end)` byte range.
+/// The copy pass appends each span to the worker's [`ArgsArena`] and sets the
+/// event's `args` (see [`ArgsArena`]).
+pub(crate) type ArgsSpan = (u32, u32, u32);
+
+/// In-place variant of [`chunk_work_stream`]: tokenizes the owned range
+/// directly into `out[0..]` (see `stream.rs`). `out.len()` must cover the
+/// walk's owned-element count; returns the actual event count (a tolerant
+/// fallback may keep fewer — never more) plus stats, consumed end, and the
+/// tail-open flag.
+pub(crate) fn chunk_work_stream_into(
+    bytes: &[u8],
+    base: usize,
+    blocks: &Blocks,
+    from: usize,
+    to: usize,
+    spans: &mut Vec<ArgsSpan>,
+    out: &mut [TraceEvent],
+) -> Result<(usize, ParseStats, usize, bool), String> {
+    let (range, _owned_count, tail_open) = find_owned_range(bytes, base, blocks, from, to);
+    let Some((s, e)) = range else {
+        return Ok((0, ParseStats::default(), from, tail_open));
+    };
+
+    let t_fast = std::time::Instant::now();
+    let mut fast_stats = ParseStats::default();
+    let mut ix = StrInterner::with_capacity(512);
+    // Local slice views: the tokenizer works in buffer-local coords.
+    let ls = s - base;
+    let le = e - base;
+    if let Ok(n) = parse_events_fast_into(bytes, ls, le, &mut fast_stats, &mut ix, spans, out) {
+        if std::env::var("CHPERF_DEBUG").is_ok() {
+            eprintln!(
+                "  [parse] fast {}..{}: {:.1}ms, {} events",
+                s,
+                e,
+                t_fast.elapsed().as_secs_f64() * 1000.0,
+                n
+            );
+        }
+        return Ok((n, fast_stats, e, tail_open));
+    }
+
+    // The failed fast run may have recorded spans for its complete prefix:
+    // drop them — the tolerant pass below overwrites those slots with
+    // serde-owned events (which carry their own `args`), and stale spans
+    // must never resolve against another path's slots.
+    spans.clear();
+    if std::env::var("CHPERF_DEBUG").is_ok() {
+        eprintln!("  [parse] fast {}..{} failed, tolerant fallback", s, e);
+    }
+    let (n, stats) = parse_slice_tolerant_into(bytes, ls, le, out);
+    Ok((n, stats, e, tail_open))
+}
+
 /// Test-only counter for how many `parse_trace` calls were served by the
 /// fast single-pass tokenizer (no block scan, no serde). Lets throughput /
 /// fast-path tests assert the hot path was taken without parsing logs.
 #[cfg(test)]
 pub(crate) static FAST_SINGLE_PASS_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-
-/// Gzip footer ISIZE (last 4 bytes, LE u32): the exact uncompressed size for
-/// single-member files. `None` when unreadable or zero — never fail because
-/// of it; the caller falls back to a growable buffer.
-fn read_gz_isize(file: &std::fs::File) -> Option<usize> {
-    use std::io::Seek;
-    let len = file.metadata().ok()?.len();
-    if len < 4 {
-        return None;
-    }
-    let mut f = file.try_clone().ok()?;
-    f.seek(std::io::SeekFrom::End(-4)).ok()?;
-    let mut footer = [0u8; 4];
-    std::io::Read::read_exact(&mut f, &mut footer).ok()?;
-    // `try_clone` shares the seek offset with `file`: rewind so the caller
-    // decodes from the start, not from EOF.
-    f.seek(std::io::SeekFrom::Start(0)).ok()?;
-    let isize = u32::from_le_bytes(footer) as usize;
-    if isize == 0 { None } else { Some(isize) }
-}
 
 /// Read exactly `len` bytes from `r` into a fresh refcounted buffer, failing
 /// when fewer bytes — or a further trailing byte — follow (the size wasn't
@@ -1619,70 +1852,89 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // Drop any stale serde-fallback counts (unit tests deserialize events
     // directly without draining).
     take_serde_malformed();
-    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    // Decompress (if .gz) straight into the refcounted parse buffer. This is
-    // far faster than streaming serde_json through the gzip decoder: zlib-rs
-    // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
-    // Decoding into the final `Arc` allocation (rather than a `Vec` that is
-    // then converted) avoids a whole-file copy: `Arc<[u8]>` carries its
-    // refcount inline, so `Arc::from(vec)` would memcpy the buffer.
-    let shared: Arc<[u8]> = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        // Exact size from the gzip footer ISIZE (last 4 bytes, LE u32).
-        // Never fail because of it: any mismatch falls back to a growable
-        // `Vec` (multi-member gzip, trailing data, corrupt footer).
-        let hint: Option<usize> = read_gz_isize(&file);
-        match hint {
-            Some(h) => match read_exact_shared(flate2::read::GzDecoder::new(file), h) {
-                Ok(shared) => shared,
-                Err(e) => {
-                    if std::env::var("CHPERF_DEBUG").is_ok() {
-                        eprintln!("  [parse] exact gz read failed ({e}), Vec fallback");
+    let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
+    match super::stream::open_source(path, is_gz)? {
+        super::stream::SourceKind::SmallPlain(file) => {
+            // Small plain file: exact-size read, as before (no thread/scan
+            // tax, no behavior change where memory was never a problem).
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let shared: Arc<[u8]> = match usize::try_from(len).ok() {
+                Some(h) if h > 0 => match read_exact_shared(file, h) {
+                    Ok(shared) => shared,
+                    Err(_) => {
+                        let file = std::fs::File::open(path)
+                            .map_err(|e| format!("{}: {}", path.display(), e))?;
+                        read_vec_shared(file, h.saturating_add(1), path)?
                     }
-                    let file = std::fs::File::open(path)
-                        .map_err(|e| format!("{}: {}", path.display(), e))?;
-                    read_vec_shared(flate2::read::GzDecoder::new(file), h + 32, path)?
-                }
-            },
-            None => read_vec_shared(flate2::read::GzDecoder::new(file), 0, path)?,
+                },
+                _ => read_vec_shared(file, 0, path)?,
+            };
+            // Strip a UTF-8 BOM so every downstream path (fast single-pass,
+            // block scan, serde) sees the same `{`-first buffer. Without
+            // this the fast path bails (first byte isn't `{`) and relies on
+            // the slower fallbacks. The BOM essentially never occurs, so a
+            // strip copies (once, cold).
+            let shared: Arc<[u8]> = if shared.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                Arc::from(&shared[3..])
+            } else {
+                shared
+            };
+            finalize_trace(parse_trace_whole(&shared, path)?, path)
         }
+        super::stream::SourceKind::SmallGz(bytes) => {
+            // Small `.gz` input, already decoded + BOM-stripped by the
+            // bounded sniff: same whole-buffer path as before.
+            let shared: Arc<[u8]> = Arc::from(bytes);
+            finalize_trace(parse_trace_whole(&shared, path)?, path)
+        }
+        super::stream::SourceKind::Stream(src) => {
+            let len = src.decoded_len() as usize;
+            match super::stream::parse_stream(&src, path, len) {
+                Ok((trace_events, metadata, stats)) => finalize_trace(
+                    TraceFile {
+                        trace_events,
+                        metadata,
+                        stats,
+                    },
+                    path,
+                ),
+                Err(super::stream::StreamFail::Fatal(e)) => Err(e),
+                Err(super::stream::StreamFail::Fallback) => {
+                    // Exotic layout the windowed probe cannot frame (same
+                    // inputs the whole-file scan/tolerant path handled
+                    // before): read everything and run the whole-buffer path.
+                    let shared = read_whole_fallback(path, is_gz)?;
+                    finalize_trace(parse_trace_whole(&shared, path)?, path)
+                }
+            }
+        }
+    }
+}
+
+/// Whole-buffer fallback for exotic layouts: read the full decoded bytes
+/// (gz-decoded or plain) with a BOM strip, like the old load path.
+fn read_whole_fallback(path: &Path, is_gz: bool) -> Result<Arc<[u8]>, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let shared: Arc<[u8]> = if is_gz {
+        read_vec_shared(flate2::read::GzDecoder::new(file), 0, path)?
     } else {
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        match usize::try_from(len).ok() {
-            Some(h) if h > 0 => match read_exact_shared(file, h) {
-                Ok(shared) => shared,
-                Err(_) => {
-                    let file = std::fs::File::open(path)
-                        .map_err(|e| format!("{}: {}", path.display(), e))?;
-                    read_vec_shared(file, h.saturating_add(1), path)?
-                }
-            },
-            _ => read_vec_shared(file, 0, path)?,
-        }
+        read_vec_shared(file, 0, path)?
     };
-    // Strip a UTF-8 BOM so every downstream path (fast single-pass, block
-    // scan, serde) sees the same `{`-first buffer. Without this the fast
-    // path bails (first byte isn't `{`) and relies on the slower fallbacks.
-    // The BOM essentially never occurs, so a strip copies (once, cold).
-    let shared: Arc<[u8]> = if shared.starts_with(&[0xEF, 0xBB, 0xBF]) {
+    Ok(if shared.starts_with(&[0xEF, 0xBB, 0xBF]) {
         Arc::from(&shared[3..])
     } else {
         shared
-    };
-    // LIFETIME NOTE — no leaks on this path by design.
-    //
-    // The file buffer is wrapped in an `Arc` and every event's `args` is a
-    // zero-copy span of it (see `ArgsText`): no per-event `args` copies, and
-    // the buffer lives exactly as long as any event references it. `name`/
-    // `cat` are small owned `String`s copied out per event; the serde
-    // fallback owns small dedicated buffers per event. Nothing borrows from
-    // a local, so repeated `parse_trace` calls retain no memory.
-    //
-    // (History: `args` used to be `Option<&'static str>` borrowed zero-copy
-    // from a `Box::leak`ed whole-file buffer, plus a leaked name/category
-    // interner and per-event leaks on the serde path — one file-sized leak
-    // per call. The `Arc`-span model keeps the zero-copy win with none of
-    // the leaks; see the throughput test below for the measured budget.)
+    })
+}
 
+/// Whole-buffer parse of decoded `shared` bytes: the serial fast path for
+/// small inputs, the block-parallel path for large exotic layouts, then the
+/// serde/tolerant fallbacks — unchanged behavior, shared by every path that
+/// holds the full text.
+fn parse_trace_whole(
+    shared: &Arc<[u8]>,
+    path: &Path,
+) -> Result<TraceFile, Box<dyn std::error::Error>> {
     // Fast path: single-pass top-level + traceEvents parse without
     // pre-scanning 64KB blocks across the buffer.
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
@@ -1695,9 +1947,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // 180→78ms, 959MB 980→436ms). Small traces stay serial (no
     // thread/scan tax) and unusual layouts still fall through below.
     let go_parallel = shared.len() >= 16 * 1024 * 1024;
-    if !go_parallel
-        && let Ok(tf) = parse_trace_fast(&shared, &shared)
-    {
+    if !go_parallel && let Ok(tf) = parse_trace_fast(&shared, &shared) {
         #[cfg(test)]
         FAST_SINGLE_PASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if debug {
@@ -1754,7 +2004,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // valid layouts); if any single event breaks it, a tolerant per-element
     // pass keeps the good events and counts the bad ones — only a missing
     // top-level "traceEvents" still fails the file.
-    let mut trace = match trace {
+    let trace = match trace {
         Some(t) => t,
         None => {
             if scan_none && memchr::memmem::find(&shared, b"traceEvents").is_none() {
@@ -1778,6 +2028,16 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         eprintln!("  [parse] trace ready: {} events", trace.trace_events.len());
     }
 
+    Ok(trace)
+}
+
+/// Shared post-parse finalization for every parse path (whole-buffer
+/// and streaming): B/E pairing, the empty-trace error, and page
+/// URL/frame extraction from TracingStartedInBrowser events.
+fn finalize_trace(
+    mut trace: TraceFile,
+    path: &Path,
+) -> Result<TraceFile, Box<dyn std::error::Error>> {
     // Pair old-exporter B/E events into synthetic X completes. Runs once
     // here so every parse path (fast single-pass, parallel, serde and
     // tolerant fallbacks) funnels through it. Originals are kept (see the
@@ -2007,7 +2267,7 @@ fn parse_trace_truncated(
 /// first `"traceEvents"` occurrence followed by `"`, `:`, `[` whose
 /// preceding non-whitespace byte is `{` or `,` (a member position, not
 /// string content). `None` when no such opener exists.
-fn find_trace_events_open(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn find_trace_events_open(bytes: &[u8]) -> Option<usize> {
     for m in memchr::memmem::find_iter(bytes, b"traceEvents") {
         if m == 0 || bytes[m - 1] != b'"' {
             continue;

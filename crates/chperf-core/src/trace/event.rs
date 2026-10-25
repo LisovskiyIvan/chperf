@@ -182,10 +182,7 @@ pub(crate) struct StrInterner<'a> {
 impl<'a> StrInterner<'a> {
     pub(crate) fn with_capacity(n: usize) -> Self {
         Self {
-            map: rustc_hash::FxHashMap::with_capacity_and_hasher(
-                n,
-                rustc_hash::FxBuildHasher,
-            ),
+            map: rustc_hash::FxHashMap::with_capacity_and_hasher(n, rustc_hash::FxBuildHasher),
         }
     }
 
@@ -224,7 +221,10 @@ impl ArgsText {
     /// dedicated copy when the span exceeds `u32` (a >4GB buffer — never in
     /// practice; Chrome traces are orders of magnitude smaller).
     pub(crate) fn shared(buf: &std::sync::Arc<[u8]>, start: usize, end: usize) -> Self {
-        match (u32::try_from(start), u32::try_from(end.saturating_sub(start))) {
+        match (
+            u32::try_from(start),
+            u32::try_from(end.saturating_sub(start)),
+        ) {
             (Ok(s), Ok(l)) => Self {
                 buf: std::sync::Arc::clone(buf),
                 start: s,
@@ -244,6 +244,15 @@ impl ArgsText {
         }
     }
 
+    /// Reference a sealed arena chunk (see [`ArgsArena`]).
+    pub(crate) fn chunked(buf: &std::sync::Arc<[u8]>, start: u32, len: u32) -> Self {
+        Self {
+            buf: std::sync::Arc::clone(buf),
+            start,
+            len,
+        }
+    }
+
     /// The text, or `None` when the span is out of bounds or not UTF-8
     /// (cannot happen for parser-built values — the fast path validates —
     /// but cheap to guarantee).
@@ -253,9 +262,118 @@ impl ArgsText {
         std::str::from_utf8(self.buf.get(s..s.saturating_add(l))?).ok()
     }
 }
-/// FNV-1a 64 over the id string bytes. Shared by the fast tokenizer and the
+
+/// Append-only arena for event `args` bytes on the streaming parse path.
+///
+/// The whole-file buffer is dropped as windows are consumed, so `args` spans
+/// cannot borrow it. Instead each worker appends retained `args` bytes here:
+/// the current chunk is a fixed-capacity `Vec` (never reallocated — a chunk
+/// seals exactly when full), sealed chunks become refcounted slices shared by
+/// every event referencing them. Peak cost is the retained bytes plus one
+/// partial chunk per worker; per-event there is only a `memcpy`, no malloc.
+///
+/// Callers record `(seq, start, len)` per event during parsing (see
+/// `parse_events_fast_arena`), then resolve them to [`ArgsText`] once the
+/// window's bytes are fully appended (see [`ArgsArena::resolve`]).
+#[derive(Default)]
+pub(crate) struct ArgsArena {
+    sealed: Vec<std::sync::Arc<[u8]>>,
+    cur: Vec<u8>,
+    /// Index `cur` will occupy in `sealed` once sealed. Dedicated oversized
+    /// pushes seal a non-empty `cur` first, so this stays exact.
+    cur_seq: usize,
+}
+
+/// Chunk size: `u32` spans address it, one partial chunk per worker is the
+/// only waste, and sealing copies at most this much at once.
+pub(crate) const ARENA_CHUNK: usize = 1024 * 1024;
+
+impl ArgsArena {
+    pub(crate) fn new() -> Self {
+        Self {
+            sealed: Vec::new(),
+            cur: Vec::with_capacity(ARENA_CHUNK),
+            cur_seq: 0,
+        }
+    }
+
+    /// Append `bytes` (already UTF-8 validated by the caller). Oversized
+    /// values (a single `args` larger than a chunk) get a dedicated exact
+    /// allocation instead of blowing the chunk budget.
+    pub(crate) fn append(&mut self, bytes: &[u8]) -> (u32, u32, u32) {
+        debug_assert!(bytes.len() <= u32::MAX as usize);
+        if bytes.len() > ARENA_CHUNK {
+            // Seal any partial chunk first so `cur_seq` stays exact (see
+            // `seal`), then give the oversized value its own exact chunk.
+            self.seal();
+            self.sealed.push(std::sync::Arc::from(bytes));
+            let seq = self.sealed.len() - 1;
+            // The current chunk is empty here; it will land after this push.
+            self.cur_seq = self.sealed.len();
+            return (seq as u32, 0, bytes.len() as u32);
+        }
+        if self.cur.len() + bytes.len() > ARENA_CHUNK {
+            self.seal();
+        }
+        let start = self.cur.len() as u32;
+        self.cur.extend_from_slice(bytes);
+        (self.cur_seq as u32, start, bytes.len() as u32)
+    }
+
+    /// The [`ArgsText`] for a recorded `(seq, start, len)`. Seal the current
+    /// chunk first (see [`ArgsArena::seal`]) so `seq == cur_seq` resolves.
+    pub(crate) fn resolve(&self, seq: u32, start: u32, len: u32) -> ArgsText {
+        let arc = self
+            .sealed
+            .get(seq as usize)
+            .expect("arena seq must be sealed before resolve");
+        ArgsText::chunked(arc, start, len)
+    }
+
+    /// Seal the partial current chunk (no-op when empty) so every recorded
+    /// `seq` indexes `sealed`. The copy keeps the `Vec` allocation for the
+    /// next chunk instead of freeing it (hundreds of 1MB free cycles would
+    /// otherwise pile freed-dirty pages into maxRSS). An empty current chunk
+    /// just re-syncs `cur_seq` (dedicated oversized pushes may have grown
+    /// `sealed` meanwhile).
+    pub(crate) fn seal(&mut self) {
+        if self.cur.is_empty() {
+            self.cur_seq = self.sealed.len();
+            return;
+        }
+        self.sealed.push(std::sync::Arc::from(self.cur.as_slice()));
+        self.cur.clear();
+        self.cur_seq = self.sealed.len();
+    }
+
+    /// Total sealed bytes retained (debug accounting).
+    #[allow(dead_code)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.sealed.iter().map(|c| c.len()).sum::<usize>() + self.cur.len()
+    }
+}
+/// Manual default: the blank slot for in-place window parsing (see
+/// `stream.rs`). All blanks share the empty interned strings; the parser
+/// overwrites every slot it owns.
+impl Default for TraceEvent {
+    fn default() -> Self {
+        TraceEvent {
+            name: SharedStr::empty(),
+            id: 0,
+            has_id: false,
+            ph: 0,
+            ts: 0.0,
+            dur: None,
+            tid: 0,
+            pid: 0,
+            cat: None,
+            args: None,
+        }
+    }
+}
 /// serde fallback so both paths map a non-numeric id to the same `u64`, and
 /// `s`/`f` pairing by `(pid, id)` agrees across paths.
+/// FNV-1a 64 over the id string bytes. Shared by the fast tokenizer and the
 pub(crate) fn hash_id_str(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {

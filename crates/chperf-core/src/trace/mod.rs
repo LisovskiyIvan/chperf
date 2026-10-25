@@ -1,13 +1,15 @@
 //! Trace loading and the parsed event model.
 //!
-//! Split across three submodules: [`event`] (the `TraceEvent` struct + name
-//! interner), [`meta`] (top-level `TraceFile`/`TraceMetadata` and helpers)
-//! and [`parse`] (the hand-rolled, block-parallel `traceEvents` tokenizer).
+//! Split across four submodules: [`event`] (the `TraceEvent` struct + name
+//! interner), [`meta`] (top-level `TraceFile`/`TraceMetadata` and helpers),
+//! [`parse`] (the hand-rolled, block-parallel `traceEvents` tokenizer) and
+//! [`stream`] (the windowed streaming parse for large files).
 
 mod event;
 mod meta;
 mod parse;
 mod profiler;
+pub(crate) mod stream;
 
 pub use event::ArgsText;
 pub use event::SharedStr;
