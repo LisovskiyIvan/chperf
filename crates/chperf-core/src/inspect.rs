@@ -1989,31 +1989,29 @@ pub fn has_memory_samples(events: &[TraceEvent]) -> bool {
         .any(|e| e.name == "UpdateCounters" && e.ph == b'I')
 }
 
-/// Memory timeline: `UpdateCounters` (phase `I`) samples carry the JS heap
-/// size and DOM node / document / event-listener counts. Renders a peak &
-/// growth summary plus a (downsampled) timeline; JSON returns every sample.
-pub fn memory_section(
-    events: &[TraceEvent],
-    scope: &Scope,
-    top: usize,
-    min_ts: f64,
-) -> (String, Value) {
-    #[derive(Clone, Copy)]
-    struct Sample {
-        ts: f64,
-        heap: f64,
-        nodes: f64,
-        documents: f64,
-        listeners: f64,
-    }
-    let mut samples: Vec<Sample> = Vec::new();
+/// One `UpdateCounters` (phase `I`) sample: JS heap bytes + DOM counters.
+/// 40B, `Copy` so chart/downsample passes never re-parse event args.
+#[derive(Clone, Copy)]
+pub struct MemorySample {
+    pub ts: f64,
+    pub heap: f64,
+    pub nodes: f64,
+    pub documents: f64,
+    pub listeners: f64,
+}
+
+/// Scan every in-scope `UpdateCounters` sample, ts-sorted. Shared by
+/// [`memory_section`] and [`memory_chart_data`] so both see the same sample
+/// order (the sort is stable: equal timestamps keep event order).
+pub fn collect_memory_samples(events: &[TraceEvent], scope: &Scope) -> Vec<MemorySample> {
+    let mut samples: Vec<MemorySample> = Vec::new();
     for e in events {
         if e.name != "UpdateCounters" || e.ph != b'I' || !scope.allows_event(e) {
             continue;
         }
         let Some(args) = e.args_value() else { continue };
         let data = args.get("data");
-        samples.push(Sample {
+        samples.push(MemorySample {
             ts: e.ts,
             heap: data
                 .and_then(|d| d.get("jsHeapSizeUsed"))
@@ -2034,25 +2032,156 @@ pub fn memory_section(
         });
     }
     samples.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+    samples
+}
+
+fn memory_mb(b: f64) -> f64 {
+    b / 1_048_576.0
+}
+
+/// The `summary` object [`memory_section`] returns, factored out so the
+/// HTML chart path ([`memory_chart_data`]) reuses the exact same scalars
+/// without building the per-sample rows.
+fn memory_summary_json(samples: &[MemorySample], min_ts: f64) -> Value {
+    let n = samples.len();
+    let first = samples[0];
+    let last = samples[n - 1];
+    let peak = samples
+        .iter()
+        .copied()
+        .max_by(|a, b| a.heap.partial_cmp(&b.heap).unwrap())
+        .unwrap();
+    let peak_nodes = samples
+        .iter()
+        .map(|s| s.nodes)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let peak_documents = samples
+        .iter()
+        .map(|s| s.documents)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let peak_listeners = samples
+        .iter()
+        .map(|s| s.listeners)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let span_s = (last.ts - first.ts) / 1_000_000.0;
+    let (heap_rate, nodes_rate, listeners_rate) = if span_s > 0.05 {
+        (
+            memory_mb(last.heap - first.heap) / span_s,
+            (last.nodes - first.nodes) / span_s,
+            (last.listeners - first.listeners) / span_s,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    json!({
+        "samples": n,
+        "first_heap_mb": memory_mb(first.heap),
+        "last_heap_mb": memory_mb(last.heap),
+        "growth_mb": memory_mb(last.heap - first.heap),
+        "peak_heap_mb": memory_mb(peak.heap),
+        "peak_heap_t_us": (peak.ts - min_ts).round(),
+        "peak_nodes": peak_nodes,
+        "peak_documents": peak_documents,
+        "peak_listeners": peak_listeners,
+        "growth_velocity": {
+            "span_s": (span_s * 10.0).round() / 10.0,
+            "heap_mb_per_s": (heap_rate * 100.0).round() / 100.0,
+            "nodes_per_s": (nodes_rate * 10.0).round() / 10.0,
+            "listeners_per_s": (listeners_rate * 10.0).round() / 10.0,
+        },
+    })
+}
+
+/// Lean memory data for the HTML report: the same `summary` object
+/// [`memory_section`] returns, plus the heap/node chart points the HTML
+/// charts plot. Skips the markdown table, the per-sample JSON rows, change
+/// points and buckets — tens of MB of transient on sample-heavy traces
+/// (79K samples on the 89MB dump) that HTML never reads. The rendered HTML
+/// is byte-identical (same scalars, same point values in the same order).
+pub struct MemoryChartData {
+    pub summary: Value,
+    pub heap: Vec<(f64, f64)>,
+    pub nodes: Vec<(f64, f64)>,
+}
+
+pub fn memory_chart_data(
+    events: &[TraceEvent],
+    scope: &Scope,
+    min_ts: f64,
+) -> MemoryChartData {
+    let samples = collect_memory_samples(events, scope);
+    if samples.is_empty() {
+        return MemoryChartData {
+            summary: json!({"samples": 0}),
+            heap: Vec::new(),
+            nodes: Vec::new(),
+        };
+    }
+    let summary = memory_summary_json(&samples, min_ts);
+    // Same values the HTML extractor reads from the full section JSON:
+    // `t_us` is `(ts - min_ts).round()`, plotted in ms.
+    let heap = samples
+        .iter()
+        .map(|s| ((s.ts - min_ts).round() / 1000.0, memory_mb(s.heap)))
+        .collect();
+    let nodes = samples
+        .iter()
+        .map(|s| ((s.ts - min_ts).round() / 1000.0, s.nodes))
+        .collect();
+    MemoryChartData {
+        summary,
+        heap,
+        nodes,
+    }
+}
+
+/// Memory timeline: `UpdateCounters` (phase `I`) samples carry the JS heap
+/// size and DOM node / document / event-listener counts. Renders a peak &
+/// growth summary plus a (downsampled) timeline; JSON returns every sample.
+pub fn memory_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    memory_section_opts(events, scope, top, min_ts, true)
+}
+
+/// [`memory_section`] with a markdown toggle: `--json` and HTML only read
+/// the JSON half, and with `top = usize::MAX` the markdown samples table
+/// alone is ~5MB of transient (plus 79K `format!` rows of wall time).
+/// `want_markdown = false` returns an empty string with identical JSON.
+pub fn memory_section_opts(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+    want_markdown: bool,
+) -> (String, Value) {
+    let samples = collect_memory_samples(events, scope);
     let n = samples.len();
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "## Memory timeline (UpdateCounters) — {} samples, {}\n\n",
-        n,
-        window_label(scope.window),
-    ));
-    if let Some(line) = scope.window_line(min_ts) {
-        out.push_str(&line);
-        out.push('\n');
+    if want_markdown {
+        out.push_str(&format!(
+            "## Memory timeline (UpdateCounters) — {} samples, {}\n\n",
+            n,
+            window_label(scope.window),
+        ));
+        if let Some(line) = scope.window_line(min_ts) {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
     if n == 0 {
-        out.push_str("No UpdateCounters samples.\n\n");
+        if want_markdown {
+            out.push_str("No UpdateCounters samples.\n\n");
+        }
         let summary = json!({"samples": 0});
         return (out, json!({"summary": summary, "samples": []}));
     }
 
-    let mb = |b: f64| b / 1_048_576.0;
+    let mb = memory_mb;
     let first = samples[0];
     let last = samples[n - 1];
     let peak = samples
@@ -2087,25 +2216,27 @@ pub fn memory_section(
         (0.0, 0.0, 0.0)
     };
 
-    out.push_str(&format!(
-        "- **JS heap**: {:.1} MB → {:.1} MB ({:+.1} MB), peak {:.1} MB at t={:.2}ms\n",
-        mb(first.heap),
-        mb(last.heap),
-        mb(last.heap - first.heap),
-        mb(peak.heap),
-        (peak.ts - min_ts) / 1000.0,
-    ));
-    out.push_str(&format!(
-        "- **DOM nodes** peak {:.0} · **documents** peak {:.0} · **event listeners** peak {:.0}\n",
-        peak_nodes, peak_documents, peak_listeners,
-    ));
-    if span_s > 0.05 {
+    if want_markdown {
         out.push_str(&format!(
-            "- **Growth velocity**: {:+.2} MB/s heap · {:+.1} nodes/s · {:+.1} listeners/s (span {:.1}s)\n\n",
-            heap_rate, nodes_rate, listeners_rate, span_s,
+            "- **JS heap**: {:.1} MB → {:.1} MB ({:+.1} MB), peak {:.1} MB at t={:.2}ms\n",
+            mb(first.heap),
+            mb(last.heap),
+            mb(last.heap - first.heap),
+            mb(peak.heap),
+            (peak.ts - min_ts) / 1000.0,
         ));
-    } else {
-        out.push('\n');
+        out.push_str(&format!(
+            "- **DOM nodes** peak {:.0} · **documents** peak {:.0} · **event listeners** peak {:.0}\n",
+            peak_nodes, peak_documents, peak_listeners,
+        ));
+        if span_s > 0.05 {
+            out.push_str(&format!(
+                "- **Growth velocity**: {:+.2} MB/s heap · {:+.1} nodes/s · {:+.1} listeners/s (span {:.1}s)\n\n",
+                heap_rate, nodes_rate, listeners_rate, span_s,
+            ));
+        } else {
+            out.push('\n');
+        }
     }
 
     // Significant change points (jumps)
@@ -2143,7 +2274,7 @@ pub fn memory_section(
         }
     }
 
-    if !change_points.is_empty() {
+    if want_markdown && !change_points.is_empty() {
         let cp_shown = change_points.len().min(top);
         out.push_str(&format!(
             "### Significant change points (jumps) — {} detected\n\n",
@@ -2194,7 +2325,7 @@ pub fn memory_section(
     let bucket_size_us = 5_000_000.0;
     let mut json_buckets = Vec::new();
     if span_s >= 5.0 && n >= 10 {
-        let mut buckets_map: rustc_hash::FxHashMap<usize, Vec<Sample>> =
+        let mut buckets_map: rustc_hash::FxHashMap<usize, Vec<MemorySample>> =
             rustc_hash::FxHashMap::default();
         for s in &samples {
             let b = ((s.ts - first.ts) / bucket_size_us) as usize;
@@ -2203,9 +2334,11 @@ pub fn memory_section(
         let mut bucket_keys: Vec<usize> = buckets_map.keys().copied().collect();
         bucket_keys.sort();
 
-        out.push_str("### Growth progression (5s buckets)\n\n");
-        out.push_str("| window | docs | nodes (Δ) | listeners (Δ) | heap(MB) (Δ) |\n");
-        out.push_str("|--------|------|-----------|---------------|--------------|\n");
+        if want_markdown {
+            out.push_str("### Growth progression (5s buckets)\n\n");
+            out.push_str("| window | docs | nodes (Δ) | listeners (Δ) | heap(MB) (Δ) |\n");
+            out.push_str("|--------|------|-----------|---------------|--------------|\n");
+        }
         for &k in &bucket_keys {
             let list = &buckets_map[&k];
             let b_first = list[0];
@@ -2215,22 +2348,24 @@ pub fn memory_section(
             let dh = mb(b_last.heap - b_first.heap);
             let w_start = k as f64 * 5.0;
             let w_end = w_start + 5.0;
-            out.push_str(&format!(
-                "| {:.0}–{:.0}s | {:.0} → {:.0} | {:.0} → {:.0} ({:+}) | {:.0} → {:.0} ({:+}) | {:.1} → {:.1} ({:+.1}) |\n",
-                w_start,
-                w_end,
-                b_first.documents,
-                b_last.documents,
-                b_first.nodes,
-                b_last.nodes,
-                dn as i64,
-                b_first.listeners,
-                b_last.listeners,
-                dl as i64,
-                mb(b_first.heap),
-                mb(b_last.heap),
-                dh,
-            ));
+            if want_markdown {
+                out.push_str(&format!(
+                    "| {:.0}–{:.0}s | {:.0} → {:.0} | {:.0} → {:.0} ({:+}) | {:.0} → {:.0} ({:+}) | {:.1} → {:.1} ({:+.1}) |\n",
+                    w_start,
+                    w_end,
+                    b_first.documents,
+                    b_last.documents,
+                    b_first.nodes,
+                    b_last.nodes,
+                    dn as i64,
+                    b_first.listeners,
+                    b_last.listeners,
+                    dl as i64,
+                    mb(b_first.heap),
+                    mb(b_last.heap),
+                    dh,
+                ));
+            }
             json_buckets.push(json!({
                 "window": format!("{:.0}-{:.0}s", w_start, w_end),
                 "docs_start": b_first.documents,
@@ -2243,27 +2378,29 @@ pub fn memory_section(
         out.push('\n');
     }
 
-    out.push_str("| t(ms) | heap(MB) | nodes | docs | listeners |\n");
-    out.push_str("|-------|----------|-------|------|-----------|\n");
-    let shown = top.max(1);
-    for idx in downsample_indices(n, shown) {
-        let s = samples[idx];
-        out.push_str(&format!(
-            "| {:.2} | {:.1} | {:.0} | {:.0} | {:.0} |\n",
-            (s.ts - min_ts) / 1000.0,
-            mb(s.heap),
-            s.nodes,
-            s.documents,
-            s.listeners,
-        ));
+    if want_markdown {
+        out.push_str("| t(ms) | heap(MB) | nodes | docs | listeners |\n");
+        out.push_str("|-------|----------|-------|------|-----------|\n");
+        let shown = top.max(1);
+        for idx in downsample_indices(n, shown) {
+            let s = samples[idx];
+            out.push_str(&format!(
+                "| {:.2} | {:.1} | {:.0} | {:.0} | {:.0} |\n",
+                (s.ts - min_ts) / 1000.0,
+                mb(s.heap),
+                s.nodes,
+                s.documents,
+                s.listeners,
+            ));
+        }
+        if n > shown {
+            out.push_str(&format!(
+                "\n_Showing {} of {} samples (use --top to see more)._{}",
+                shown, n, '\n'
+            ));
+        }
+        out.push('\n');
     }
-    if n > shown {
-        out.push_str(&format!(
-            "\n_Showing {} of {} samples (use --top to see more)._{}",
-            shown, n, '\n'
-        ));
-    }
-    out.push('\n');
 
     let json_rows: Vec<Value> = samples
         .iter()

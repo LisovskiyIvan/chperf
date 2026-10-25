@@ -152,31 +152,23 @@ fn bucket_of(name: &str) -> Option<usize> {
 
 pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFrameResult {
     let overheads = find_profiler_overhead(events);
-    // One fused pass: main-thread X indices (+ their corrected durations)
-    // and scroll/input timestamps. Three separate filters here would read
-    // the whole events vec three times (~450MB on big traces).
-    let mut main_x: Vec<usize> = Vec::with_capacity(events.len() / 8);
+    // One fused pass: main-thread X (event index + corrected duration, so
+    // the artifact spike inside a profiler-freeze span lands in no
+    // category) and scroll/input timestamps. Separate filters here would
+    // read the whole events vec several times (~450MB on big traces), and
+    // the old dense per-event duration vector was 8B/event (32MB on
+    // 4M-event traces) to serve only main-thread X lookups.
+    let mut main_x: Vec<(usize, f64)> = Vec::with_capacity(events.len() / 8);
     let mut input_ts: Vec<f64> = Vec::with_capacity(4096);
-    // Overhead-corrected duration per event index (children inside a
-    // profiler-freeze span correct toward 0 so the artifact spike lands in
-    // no category).
-    let mut dur_of: Vec<f64> = vec![0.0f64; events.len()];
     for (i, e) in events.iter().enumerate() {
         if e.tid == main_tid && e.ph == b'X' {
-            main_x.push(i);
-            dur_of[i] = correct_event_dur(e, &overheads);
+            main_x.push((i, correct_event_dur(e, &overheads)));
         }
         if is_scroll_input(e) {
             input_ts.push(e.ts);
         }
     }
-    main_x.sort_by(|&a, &b| events[a].ts.partial_cmp(&events[b].ts).unwrap());
-
-    let run_tasks: Vec<usize> = main_x
-        .iter()
-        .copied()
-        .filter(|&i| events[i].name == "RunTask" && events[i].dur.is_some())
-        .collect();
+    main_x.sort_by(|a, b| events[a.0].ts.partial_cmp(&events[b.0].ts).unwrap());
 
     // Scroll/input evidence anywhere in the trace decides the gate: with
     // evidence, a task must overlap one; without, fall back to the workload
@@ -192,14 +184,19 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
 
     // Single sweep: RunTasks on a thread are serial and non-nested, so each
     // main-thread event falls inside at most one task. `lo` only moves forward.
+    // `kids` hold positions into `main_x` (not event indices), so corrected
+    // durations ride along without a dense per-event table.
     let mut lo = 0usize;
-    for &rt in &run_tasks {
-        let rt_ts = events[rt].ts;
-        let rt_dur = dur_of[rt];
-        let rt_end_raw = rt_ts + events[rt].dur.unwrap_or(0.0);
+    for &(rt, rt_dur) in &main_x {
+        let rte = &events[rt];
+        if rte.name != "RunTask" || rte.dur.is_none() {
+            continue;
+        }
+        let rt_ts = rte.ts;
+        let rt_end_raw = rt_ts + rte.dur.unwrap_or(0.0);
         let rt_end = rt_ts + rt_dur;
 
-        while lo < main_x.len() && events[main_x[lo]].ts < rt_ts {
+        while lo < main_x.len() && events[main_x[lo].0].ts < rt_ts {
             lo += 1;
         }
         // Children: main-thread X events overlapping the task, clipped to
@@ -208,15 +205,15 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
         // RunTasks sharing a boundary still attribute it to the next task.
         let mut kids: Vec<usize> = Vec::new();
         let mut j = lo;
-        while j < main_x.len() && events[main_x[j]].ts < rt_end_raw.max(rt_end) {
-            let i = main_x[j];
+        while j < main_x.len() && events[main_x[j].0].ts < rt_end_raw.max(rt_end) {
+            let i = main_x[j].0;
             if i != rt && events[i].ph == b'X' {
                 let d = events[i].dur.unwrap_or(0.0);
                 if d > 0.0 {
                     let s = events[i].ts.max(rt_ts);
                     let e = (events[i].ts + d).min(rt_end_raw);
                     if e > s {
-                        kids.push(i);
+                        kids.push(j);
                     }
                 }
             }
@@ -231,13 +228,13 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
         let mut has_budget_child = false;
         let mut has_heavy_child = false;
         let mut has_input = false;
-        for &i in &kids {
-            let e = &events[i];
+        for &p in &kids {
+            let e = &events[main_x[p].0];
             if is_scroll_input(e) {
                 has_input = true;
             }
             if bucket_of(&e.name).is_some() {
-                let d = dur_of[i];
+                let d = main_x[p].1;
                 if d > FRAME_BUDGET_US {
                     has_budget_child = true;
                 }
@@ -267,19 +264,20 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
         let mut spans: [Vec<(f64, f64)>; 6] = Default::default();
         // Order children parents-before-children for containment scans.
         kids.sort_by(|&a, &b| {
-            events[a]
+            events[main_x[a].0]
                 .ts
-                .partial_cmp(&events[b].ts)
+                .partial_cmp(&events[main_x[b].0].ts)
                 .unwrap()
                 .then_with(|| {
-                    events[b]
+                    events[main_x[b].0]
                         .dur
                         .unwrap_or(0.0)
-                        .partial_cmp(&events[a].dur.unwrap_or(0.0))
+                        .partial_cmp(&events[main_x[a].0].dur.unwrap_or(0.0))
                         .unwrap()
                 })
         });
-        for (k, &i) in kids.iter().enumerate() {
+        for (k, &p) in kids.iter().enumerate() {
+            let i = main_x[p].0;
             let slot = match bucket_of(&events[i].name) {
                 Some(s) => s,
                 None => continue,
@@ -287,25 +285,26 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
             let parent_ts = events[i].ts;
             let parent_dur = events[i].dur.unwrap_or(0.0);
             let s = parent_ts.max(rt_ts);
-            let e = (events[i].ts + dur_of[i]).min(rt_end);
+            let e = (events[i].ts + main_x[p].1).min(rt_end);
             if e <= s {
                 continue;
             }
             let mut inner: Vec<(f64, f64)> = Vec::new();
             for &m in kids.iter().skip(k + 1) {
-                if events[m].ph != b'X' {
+                let mi = main_x[m].0;
+                if events[mi].ph != b'X' {
                     continue;
                 }
-                let md = events[m].dur.unwrap_or(0.0);
-                if md <= 0.0 || bucket_of(&events[m].name).is_none() {
+                let md = events[mi].dur.unwrap_or(0.0);
+                if md <= 0.0 || bucket_of(&events[mi].name).is_none() {
                     continue;
                 }
-                let ms = events[m].ts;
+                let ms = events[mi].ts;
                 let me_raw = ms + md;
                 // Strictly contained (or equal but ordered later).
                 if ms >= parent_ts && me_raw <= parent_ts + parent_dur {
                     let cs = ms.max(s);
-                    let ce = (events[m].ts + dur_of[m]).min(e);
+                    let ce = (events[mi].ts + main_x[m].1).min(e);
                     if ce > cs {
                         inner.push((cs, ce));
                     }

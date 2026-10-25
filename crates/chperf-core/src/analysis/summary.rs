@@ -80,21 +80,23 @@ fn self_of(dur: f64, children: &mut [(f64, f64)]) -> f64 {
     (dur - covered).max(0.0)
 }
 
-/// Self time for every event in `sorted` (same-`tid` X events sorted by `ts`).
+/// Self time for every event in `order` (indices of same-`tid` X events
+/// sorted by `ts` into `events`).
 ///
-/// `dur_of[i]` is the overhead-corrected duration of `sorted[i]`. Returns the
-/// self time per index. Children are events whose raw interval is contained
-/// in the parent's raw interval (identical intervals break ties by index so
-/// they are not subtracted both ways); subtraction uses corrected durations
-/// clipped to the parent's corrected end, merged as a union.
-fn compute_self_times(sorted: &[&TraceEvent], dur_of: &[f64]) -> Vec<f64> {
-    let n = sorted.len();
+/// `dur_of[i]` is the overhead-corrected duration of `events[order[i]]`.
+/// Returns the self time per position. Children are events whose raw
+/// interval is contained in the parent's raw interval (identical intervals
+/// break ties by position so they are not subtracted both ways);
+/// subtraction uses corrected durations clipped to the parent's corrected
+/// end, merged as a union.
+fn compute_self_times(order: &[usize], events: &[TraceEvent], dur_of: &[f64]) -> Vec<f64> {
+    let n = order.len();
     let mut out = dur_of.to_vec();
     // Parents sort before their children (ts asc, dur desc), so every
-    // potential child of `sorted[i]` comes after `i`; the scan stops at the
+    // potential child of `order[i]` comes after `i`; the scan stops at the
     // first event starting at/after the parent's end.
     for i in 0..n {
-        let p = sorted[i];
+        let p = &events[order[i]];
         let p_dur = match p.dur {
             Some(d) => d,
             None => continue,
@@ -107,8 +109,8 @@ fn compute_self_times(sorted: &[&TraceEvent], dur_of: &[f64]) -> Vec<f64> {
         let p_eff_end = p.ts + dur_of[i];
         let mut children: Vec<(f64, f64)> = Vec::new();
         let mut j = i + 1;
-        while j < n && sorted[j].ts < p_end {
-            let c = sorted[j];
+        while j < n && events[order[j]].ts < p_end {
+            let c = &events[order[j]];
             if c.ph == b'X'
                 && let Some(cd) = c.dur
                 && cd > 0.0
@@ -133,9 +135,15 @@ fn compute_self_times(sorted: &[&TraceEvent], dur_of: &[f64]) -> Vec<f64> {
 /// Per-event self times for main-thread X events, keyed by event index.
 ///
 /// Shared helper so `summary` and `scroll` bucket overlap-safe self time the
-/// same way. `dur_of` maps `events` indices to overhead-corrected durations.
-/// Events that are not main-thread X events with a duration get `0.0`.
-pub fn main_thread_self_times(events: &[TraceEvent], main_tid: u64, dur_of: &[f64]) -> Vec<f64> {
+/// same way. `overheads` corrects durations exactly like the old dense
+/// `dur_of` vector did (which callers no longer materialize: at 8B/event it
+/// was a 32MB transient on 4M-event traces). Events that are not
+/// main-thread X events with a duration get `0.0`.
+pub fn main_thread_self_times(
+    events: &[TraceEvent],
+    main_tid: u64,
+    overheads: &[ProfilerOverhead],
+) -> Vec<f64> {
     let mut sorted_idx: Vec<usize> = events
         .iter()
         .enumerate()
@@ -156,9 +164,13 @@ pub fn main_thread_self_times(events: &[TraceEvent], main_tid: u64, dur_of: &[f6
                     .unwrap()
             })
     });
-    let sorted: Vec<&TraceEvent> = sorted_idx.iter().map(|&i| &events[i]).collect();
-    let sorted_dur: Vec<f64> = sorted_idx.iter().map(|&i| dur_of[i]).collect();
-    let sorted_self = compute_self_times(&sorted, &sorted_dur);
+    // Corrected durations in sort order (compact: only main-thread X, not
+    // one f64 per event).
+    let sorted_dur: Vec<f64> = sorted_idx
+        .iter()
+        .map(|&i| correct_event_dur(&events[i], overheads))
+        .collect();
+    let sorted_self = compute_self_times(&sorted_idx, events, &sorted_dur);
     let mut out = vec![0.0f64; events.len()];
     for (k, &i) in sorted_idx.iter().enumerate() {
         out[i] = sorted_self[k];
@@ -254,9 +266,9 @@ struct SummaryTidAccum {
 }
 
 /// One `analyze_summary` per tid, sharing the profiler-overhead scan and
-/// the trace-bounds pass across tids. Per-tid durations, self times and
-/// accumulators are computed tid-by-tid (not fused into one loop) so peak
-/// transient stays one `dur_of`/`self` pair, and every per-tid accumulation
+/// the trace-bounds pass across tids. Per-tid self times and accumulators
+/// are computed tid-by-tid (not fused into one loop) so peak transient
+/// stays one dense self-time vector, and every per-tid accumulation
 /// visits events in the same order as `analyze_summary` — results are
 /// identical, including float summation order and map iteration order.
 pub fn analyze_summary_multi(events: &[TraceEvent], main_tids: &[u64]) -> Vec<SummaryResult> {
@@ -282,24 +294,18 @@ pub fn analyze_summary_multi(events: &[TraceEvent], main_tids: &[u64]) -> Vec<Su
     main_tids
         .iter()
         .map(|&main_tid| {
-            let dur_of: Vec<f64> = events
-                .iter()
-                .map(|e| {
-                    if e.tid == main_tid && e.ph == b'X' {
-                        correct_event_dur(e, &overheads)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            let self_of_all = main_thread_self_times(events, main_tid, &dur_of);
+            // Overhead-corrected durations are computed inline below (and
+            // inside `main_thread_self_times`): the old dense `dur_of`
+            // vector was 8B per event (32MB on 4M-event traces) only to
+            // serve these same two consumers.
+            let self_of_all = main_thread_self_times(events, main_tid, &overheads);
             let mut acc = SummaryTidAccum::default();
             for (idx, e) in events.iter().enumerate() {
                 if e.tid != main_tid || e.ph != b'X' {
                     continue;
                 }
                 if e.name == "RunTask" && e.dur.is_some() {
-                    let eff = dur_of[idx];
+                    let eff = correct_event_dur(e, &overheads);
                     acc.runtask_total_us += eff;
                     if eff > 0.0 {
                         acc.busy_intervals.push((e.ts, e.ts + eff));
@@ -314,7 +320,7 @@ pub fn analyze_summary_multi(events: &[TraceEvent], main_tids: &[u64]) -> Vec<Su
                     && e.dur.is_some()
                 {
                     let entry = acc.stats_map.entry(key).or_default();
-                    entry.0 += dur_of[idx];
+                    entry.0 += correct_event_dur(e, &overheads);
                     entry.1 += self_of_all[idx];
                     entry.2 += 1;
                 }
@@ -587,8 +593,7 @@ mod tests {
         assert_eq!(by_name("Layout").self_time_us, 30_000.0);
         // The dur-less FunctionCall is not tracked at all.
         assert!(res.event_stats.iter().all(|s| s.name != "FunctionCall"));
-        let dur_of = vec![100_000.0, 0.0, 30_000.0];
-        let selfs = main_thread_self_times(&events, 1, &dur_of);
+        let selfs = main_thread_self_times(&events, 1, &[]);
         assert_eq!(selfs, vec![70_000.0, 0.0, 30_000.0]);
     }
 

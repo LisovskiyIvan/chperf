@@ -23,9 +23,11 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
     };
     // Memory section: skip the full sweep (it materializes every sample)
     // when the trace holds no UpdateCounters data; the empty shape below
-    // is exactly what memory_section returns for zero samples.
+    // is exactly what memory_section returns for zero samples. The markdown
+    // half is skipped (JSON only): with no row cap it would format every
+    // sample into a ~5MB string just to drop it.
     let mem_json = if inspect::has_memory_samples(events) {
-        inspect::memory_section(events, &scope, usize::MAX, min_ts).1
+        inspect::memory_section_opts(events, &scope, usize::MAX, min_ts, false).1
     } else {
         json!({"summary": {"samples": 0}, "samples": []})
     };

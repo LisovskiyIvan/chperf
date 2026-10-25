@@ -234,28 +234,6 @@ fn full_scope() -> inspect::Scope {
     }
 }
 
-fn memory_points(samples: &Value) -> Vec<(f64, f64)> {
-    samples
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|s| (jf(s, "t_us") / 1000.0, jf(s, "heap_mb")))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn nodes_points(samples: &Value) -> Vec<(f64, f64)> {
-    samples
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|s| (jf(s, "t_us") / 1000.0, jf(s, "nodes")))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // ── Main entry ──
 
 pub fn export_html(
@@ -506,8 +484,11 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
 
     // ── Memory ──
     let scope = full_scope();
-    let (_, mem) = inspect::memory_section(events_a, &scope, 700, min_ts_a);
-    let summary = &mem["summary"];
+    // Lean chart data (summary scalars + decimated-ready points): the full
+    // section would also materialize the markdown table and 79K per-sample
+    // JSON rows that HTML never reads.
+    let mem = inspect::memory_chart_data(events_a, &scope, min_ts_a);
+    let summary = &mem.summary;
     if jf(summary, "samples") > 0.0 {
         section(o, "Memory timeline");
         o.push_str("<div class=\"metrics\">");
@@ -542,13 +523,13 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
         o.push_str("</div>");
         o.push_str(&line_chart(
             "JS heap (MB)",
-            &memory_points(&mem["samples"]),
+            &mem.heap,
             "",
             "#3b82f6",
         ));
         o.push_str(&line_chart(
             "DOM nodes",
-            &nodes_points(&mem["samples"]),
+            &mem.nodes,
             "",
             "#10b981",
         ));
@@ -1375,10 +1356,10 @@ fn render_compare_detail(
         // Memory comparison: B timeline next to A (A summary recomputed
         // here; the per-section bodies above own their local copies).
         let scope = full_scope();
-        let (_, mem_a) = inspect::memory_section(events_a, &scope, 700, min_ts_a);
-        let summary = &mem_a["summary"];
-        let (_, mem_b) = inspect::memory_section(events_b, &scope, 700, min_ts_b);
-        let sum_b = &mem_b["summary"];
+        let mem_a = inspect::memory_chart_data(events_a, &scope, min_ts_a);
+        let summary = &mem_a.summary;
+        let mem_b = inspect::memory_chart_data(events_b, &scope, min_ts_b);
+        let sum_b = &mem_b.summary;
         if jf(summary, "samples") > 0.0 || jf(sum_b, "samples") > 0.0 {
             section(o, "Memory comparison");
             o.push_str("<div class=\"metrics\">");
@@ -1409,13 +1390,13 @@ fn render_compare_detail(
             o.push_str("</div>");
             o.push_str(&line_chart(
                 "JS heap — A (MB)",
-                &memory_points(&mem_a["samples"]),
+                &mem_a.heap,
                 "",
                 "#3b82f6",
             ));
             o.push_str(&line_chart(
                 "JS heap — B (MB)",
-                &memory_points(&mem_b["samples"]),
+                &mem_b.heap,
                 "",
                 "#f59e0b",
             ));
