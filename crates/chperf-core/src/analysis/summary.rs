@@ -391,7 +391,13 @@ fn finish_summary(
             },
         })
         .collect();
-    event_stats.sort_by(|a, b| b.total_time_us.partial_cmp(&a.total_time_us).unwrap());
+    // Total desc; exact ties break by name asc (map order is hash-dependent).
+    event_stats.sort_by(|a, b| {
+        b.total_time_us
+            .partial_cmp(&a.total_time_us)
+            .unwrap()
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     SummaryResult {
         long_task_count,

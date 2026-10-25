@@ -145,9 +145,21 @@ pub fn analyze_raster(events: &[&TraceEvent], main_tid: u64) -> RasterResult {
         }
     }
 
-    // Hottest lane first; hotspots worst first.
-    lanes.sort_by(|a, b| b.total_us.partial_cmp(&a.total_us).unwrap());
-    decode_hotspots.sort_by(|a, b| b.dur_us.partial_cmp(&a.dur_us).unwrap());
+    // Hottest lane first (ties by tid, then name); hotspots worst first
+    // (ties by ts). Lane order otherwise follows map iteration (hash order).
+    lanes.sort_by(|a, b| {
+        b.total_us
+            .partial_cmp(&a.total_us)
+            .unwrap()
+            .then_with(|| a.tid.cmp(&b.tid))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    decode_hotspots.sort_by(|a, b| {
+        b.dur_us
+            .partial_cmp(&a.dur_us)
+            .unwrap()
+            .then_with(|| a.ts_us.partial_cmp(&b.ts_us).unwrap())
+    });
 
     RasterResult {
         lanes,

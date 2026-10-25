@@ -279,6 +279,11 @@ pub fn events_section(
                 .unwrap_or(0.0)
                 .partial_cmp(&a.dur.unwrap_or(0.0))
                 .unwrap()
+                // Deterministic tie-breaks: exact-duration ties keep
+                // ts, then name, then tid order (not sort-algorithm order).
+                .then_with(|| a.ts.partial_cmp(&b.ts).unwrap())
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.tid.cmp(&b.tid))
         }),
         Sort::Name => {
             rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.ts.partial_cmp(&b.ts).unwrap()))
@@ -377,7 +382,12 @@ pub fn stats_section(
             (name, durs, total)
         })
         .collect();
-    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Total desc; exact ties break by name asc (rows come from a map).
+    rows.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -656,7 +666,9 @@ pub fn gaps_section(
             label_stats.push((lbl, count, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
         }
     }
-    label_stats.sort_by_key(|a| std::cmp::Reverse(a.1));
+    // Count desc; exact ties break by label asc (map iteration order
+    // is otherwise hash-dependent).
+    label_stats.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     out.push_str("### Cadence by event type\n\n");
     out.push_str("| event / type | count | median gap(ms) | cadence | min(ms) | p90(ms) | max(ms) | jitter(ms) |\n");
@@ -793,7 +805,14 @@ pub fn functions_section(
         })
         .filter(|(n, _, _)| matcher.matches(n))
         .collect();
-    funcs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Self-time desc; exact ties break by name, then url (map order is
+    // hash-dependent and varies with thread count in parallel scans).
+    funcs.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
 
     let matched_total: f64 = funcs.iter().map(|(_, _, t)| *t).sum();
 
@@ -926,7 +945,12 @@ pub fn stacks_section(
             None => true,
         })
         .collect();
-    leaves.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // Weight desc; exact ties break by node id (map order is hash-dependent).
+    leaves.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut out = String::new();
     let filter_desc = match matcher {
@@ -1026,7 +1050,12 @@ pub fn stacks_folded(
         })
         .map(|(id, t)| (*id, *t))
         .collect();
-    leaves.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // Weight desc; exact ties break by node id (map order is hash-dependent).
+    leaves.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut out = String::new();
     for (id, t) in &leaves {
@@ -1154,7 +1183,14 @@ pub fn find_section(
         .filter_map(|(id, t)| node_map.get(id).map(|(n, u, _)| (n.clone(), u.clone(), *t)))
         .filter(|(n, u, _)| matcher.matches(n) || matcher.matches(u))
         .collect();
-    cpu_matches.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Self-time desc; exact ties break by name, then url (map order is
+    // hash-dependent).
+    cpu_matches.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
 
     out.push_str(&format!(
         "### CPU profile matches ({} functions/URLs)\n\n",
@@ -1232,7 +1268,9 @@ pub fn names_section(
         .map(|(n, (c, d))| (n.to_string(), c, d))
         .collect();
     match sort {
-        Sort::Count => rows.sort_by_key(|b| std::cmp::Reverse(b.1)),
+        // Count desc; exact ties break by name asc (map iteration order
+        // is otherwise hash-dependent).
+        Sort::Count => rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
         Sort::Name => rows.sort_by(|a, b| a.0.cmp(&b.0)),
         _ => rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0))),
     }
@@ -1309,15 +1347,22 @@ pub fn threads_section(
     let mut rows: Vec<(u64, usize, f64, String)> = tids
         .into_iter()
         .map(|(tid, (count, runtask, names))| {
+            // Most frequent event; exact-count ties pick the
+            // alphabetically first name (map order is hash-dependent).
             let top_name = names
                 .into_iter()
-                .max_by_key(|(_, c)| *c)
+                .max_by(|(n1, c1), (n2, c2)| c1.cmp(c2).then_with(|| n2.cmp(n1)))
                 .map(|(n, _)| n.to_string())
                 .unwrap_or_default();
             (tid, count, runtask, top_name)
         })
         .collect();
-    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Total desc; exact ties break by name asc (rows come from a map).
+    rows.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let total = rows.len();
 
     let mut out = String::new();
@@ -1478,10 +1523,13 @@ pub fn task_section(
             (e, eff)
         })
         .collect();
+    // Effective-dur desc, then raw dur; exact ties break by ts, then tid.
     tasks.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap()
             .then_with(|| b.0.dur.unwrap().partial_cmp(&a.0.dur.unwrap()).unwrap())
+            .then_with(|| a.0.ts.partial_cmp(&b.0.ts).unwrap())
+            .then_with(|| a.0.tid.cmp(&b.0.tid))
     });
     let total = tasks.len();
 
@@ -2377,7 +2425,13 @@ pub fn input_section(
         by_type_ts.entry(ty.clone()).or_default().push(e.ts);
         worst.push((ty, e.ts, d));
     }
-    worst.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Dur desc; exact ties break by ts, then type name.
+    worst.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap())
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let total_events = worst.len();
 
     struct TypeSummary {
@@ -2438,7 +2492,14 @@ pub fn input_section(
             }
         })
         .collect();
-    rows.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap());
+    // Total desc; exact ties break by type name asc (map order is
+    // hash-dependent).
+    rows.sort_by(|a, b| {
+        b.total
+            .partial_cmp(&a.total)
+            .unwrap()
+            .then_with(|| a.ty.cmp(&b.ty))
+    });
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -2636,7 +2697,7 @@ pub fn frame_tree_section(
         .into_iter()
         .map(|(pid, (cnt, url))| (pid, cnt, url))
         .collect();
-    procs_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+    procs_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     out.push_str(&format!(
         "### Frame Processes ({} distinct pid{})\n\n",
@@ -2771,7 +2832,13 @@ pub fn async_section(
             longest.push((name, start_ts, dur));
         }
     }
-    longest.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Dur desc; exact ties break by start ts, then name.
+    longest.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap())
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let total_tasks = longest.len();
 
     let mut rows: Vec<(crate::trace::SharedStr, usize, f64, f64, f64, f64, f64)> = by_name
@@ -2787,7 +2854,12 @@ pub fn async_section(
             (name, count, total, avg, p50, p99, max)
         })
         .collect();
-    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    // Total desc; exact ties break by name asc (rows come from a map).
+    rows.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -2930,7 +3002,9 @@ pub fn flows_section(
     }
     let mut rows: Vec<(String, Vec<f64>, usize)> =
         by_name.into_iter().map(|(n, (d, u))| (n, d, u)).collect();
-    rows.sort_by_key(|(_, d, _)| std::cmp::Reverse(d.len()));
+    // Chain count desc; exact ties break by name asc (map order is
+    // hash-dependent).
+    rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
     out.push_str("| name | chains | unpaired | avg(ms) | p95(ms) | max(ms) |\n");
     out.push_str("|------|--------|----------|---------|---------|---------|\n");
     let mut json_names: Vec<Value> = Vec::new();

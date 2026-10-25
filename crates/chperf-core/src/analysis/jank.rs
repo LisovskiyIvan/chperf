@@ -334,7 +334,8 @@ fn finish_jank_tid(
     // per-bucket loop above uses the identical predicate, so this equals
     // the bucket sum.
 
-    // Rank: dropped frames first, then worst spike, then busy.
+    // Rank: dropped frames first, then worst spike, then busy, then
+    // earliest bucket (bucket order is deterministic but positional).
     accs.sort_by(|a, b| {
         b.dropped
             .cmp(&a.dropped)
@@ -348,6 +349,7 @@ fn finish_jank_tid(
                     .partial_cmp(&a.busy)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| a.start.cmp(&b.start))
     });
     let top = accs.into_iter().take(8).collect::<Vec<_>>();
 
@@ -396,7 +398,11 @@ fn finish_jank_tid(
         .map(|(ci, a)| {
             let mut top_calls: Vec<(String, f64)> =
                 std::mem::take(&mut calls[ci]).into_iter().collect();
-            top_calls.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+            top_calls.sort_by(|x, y| {
+                y.1.partial_cmp(&x.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| x.0.cmp(&y.0))
+            });
             top_calls.truncate(5);
             JankCluster {
                 start_us: min_ts + a.start as f64 * bucket_us,

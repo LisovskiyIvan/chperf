@@ -52,7 +52,13 @@ pub fn analyze_layout_dirty(events: &[TraceEvent], main_tid: u64) -> LayoutDirty
         });
     }
 
-    entries.sort_by_key(|b| std::cmp::Reverse(b.dirty_count));
+    // Dirty-count desc; exact ties break by ts (scan order is
+    // deterministic but not a meaningful key).
+    entries.sort_by(|a, b| {
+        b.dirty_count
+            .cmp(&a.dirty_count)
+            .then_with(|| a.ts.partial_cmp(&b.ts).unwrap())
+    });
 
     let n = entries.len().max(1) as f64;
     let avg_dirty = entries.iter().map(|e| e.dirty_count as f64).sum::<f64>() / n;

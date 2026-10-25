@@ -185,7 +185,12 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
         if *t == f64::INFINITY || !matcher.matches(name) {
             continue;
         }
-        if cpu_best.as_ref().is_none_or(|b| *t < b.ts) {
+        // Earliest sample wins; exact-ts ties pick the alphabetically
+        // first name (map order is hash-dependent).
+        if cpu_best
+            .as_ref()
+            .is_none_or(|b| *t < b.ts || (*t == b.ts && *name < b.label))
+        {
             cpu_best = Some(Anchor {
                 ts: *t,
                 kind: "cpu-profile",
@@ -198,7 +203,12 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             if *t == f64::INFINITY || !matcher.matches(url) {
                 continue;
             }
-            if cpu_best.as_ref().is_none_or(|b| *t < b.ts) {
+            // Earliest sample wins; exact-ts ties pick the alphabetically
+            // first url (map order is hash-dependent).
+            if cpu_best
+                .as_ref()
+                .is_none_or(|b| *t < b.ts || (*t == b.ts && *url < b.label))
+            {
                 cpu_best = Some(Anchor {
                     ts: *t,
                     kind: "cpu-profile",
@@ -617,12 +627,15 @@ pub fn calltree_section(
         order.push(id);
         if let Some(ch) = children.get(&id) {
             let mut ch = ch.clone();
+            // Self-time desc; exact ties break by node id (map order is
+            // hash-dependent).
             ch.sort_by(|a, b| {
                 self_time
                     .get(b)
                     .unwrap_or(&0.0)
                     .partial_cmp(self_time.get(a).unwrap_or(&0.0))
                     .unwrap()
+                    .then_with(|| a.cmp(b))
             });
             for c in ch.into_iter().rev() {
                 stack.push(c);
@@ -675,12 +688,15 @@ pub fn calltree_section(
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut roots_sorted = roots.clone();
+    // Inclusive desc; exact ties break by node id (map order is
+    // hash-dependent).
     roots_sorted.sort_by(|a, b| {
         inclusive
             .get(b)
             .unwrap_or(&0.0)
             .partial_cmp(inclusive.get(a).unwrap_or(&0.0))
             .unwrap()
+            .then_with(|| a.cmp(b))
     });
     let mut stack: Vec<(crate::analysis::NodeKey, usize)> =
         roots_sorted.into_iter().map(|r| (r, 0)).collect();
@@ -704,6 +720,7 @@ pub fn calltree_section(
                     .unwrap_or(&0.0)
                     .partial_cmp(inclusive.get(a).unwrap_or(&0.0))
                     .unwrap()
+                    .then_with(|| a.cmp(b))
             });
             for c in ch.into_iter().rev() {
                 stack.push((c, depth + 1));
@@ -954,7 +971,13 @@ fn delta_windows_stats(
             .filter_map(|(id, t)| node_map.get(id).map(|(n, _, _)| (n.clone(), *t)))
             .filter(|(n, _)| !n.is_empty())
             .collect();
-        top_cpu.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Self-time desc; exact ties break by name asc (map order is
+        // hash-dependent).
+        top_cpu.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap()
+                .then_with(|| a.0.cmp(&b.0))
+        });
         top_cpu.truncate(3);
         out[wi] = window_stats_from_acc(&accs[wi], &frame_wins[wi], cpu_us, top_cpu);
     }

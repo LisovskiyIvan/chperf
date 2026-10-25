@@ -413,8 +413,13 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
 
     // Worst-first: consumers render "Worst Scroll Tasks" with take(10/15),
     // and every sibling analysis (layout/style/reflow) also returns sorted.
-    // avg/percentiles are order-independent.
-    tasks.sort_by(|a, b| b.dur_us.partial_cmp(&a.dur_us).unwrap());
+    // avg/percentiles are order-independent. Exact-dur ties break by ts.
+    tasks.sort_by(|a, b| {
+        b.dur_us
+            .partial_cmp(&a.dur_us)
+            .unwrap()
+            .then_with(|| a.ts.partial_cmp(&b.ts).unwrap())
+    });
 
     ScrollFrameResult {
         tasks,

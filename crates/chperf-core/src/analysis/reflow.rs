@@ -234,7 +234,14 @@ pub fn analyze_forced_reflows(events: &[TraceEvent], main_tid: u64) -> ForcedRef
         });
     }
 
-    entries.sort_by_key(|b| std::cmp::Reverse(b.reflow_count));
+    // Reflow-count desc; exact ties break by layout time, then task dur
+    // (scan order is deterministic but not a meaningful key).
+    entries.sort_by(|a, b| {
+        b.reflow_count
+            .cmp(&a.reflow_count)
+            .then_with(|| b.layout_time_us.partial_cmp(&a.layout_time_us).unwrap())
+            .then_with(|| b.task_dur_us.partial_cmp(&a.task_dur_us).unwrap())
+    });
 
     // Totals are the sums over `entries` (same >=1 gate), so the table and
     // the headline numbers can never disagree.

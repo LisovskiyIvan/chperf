@@ -154,12 +154,15 @@ pub fn analyze_compare(
         })
         .collect();
 
-    // Sort by absolute diff in total time (most impactful time change first)
+    // Sort by absolute diff in total time (most impactful time change
+    // first); exact ties break by event name (input is name-sorted, so this
+    // only pins the rule against future refactors).
     rows.sort_by(|a, b| {
         (b.total_b_us - b.total_a_us)
             .abs()
             .partial_cmp(&(a.total_b_us - a.total_a_us).abs())
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.event_name.cmp(&b.event_name))
     });
 
     // ── Scroll frame ──
@@ -235,8 +238,9 @@ pub fn analyze_compare(
         .collect();
 
     // Sort by absolute diff in self-time (most impactful first),
-    // tie-breaking by percentage point difference. Kept whole: findings
-    // scan the full list; consumers truncate for display (take(20)).
+    // tie-breaking by percentage point difference, then name and url.
+    // Kept whole: findings scan the full list; consumers truncate for
+    // display (take(20)).
     cpu_diff.sort_by(|a, b| {
         b.diff_time_us
             .abs()
@@ -248,6 +252,8 @@ pub fn analyze_compare(
                     .partial_cmp(&(a.pct_b - a.pct_a).abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| a.function_name.cmp(&b.function_name))
+            .then_with(|| a.url.cmp(&b.url))
     });
     // No truncate here: the findings scan below walks the full diff list and
     // display layers (CLI `take(20)`) truncate for rendering.
@@ -662,7 +668,9 @@ pub fn analyze_compare(
         });
     }
 
-    // Sort findings: regressions first, then improvements
+    // Sort findings: regressions first, then improvements; exact ties
+    // break by category, then message (construction order is deterministic
+    // but not a meaningful key).
     findings.sort_by(|a, b| {
         let ord_a = match a.severity {
             FindingSeverity::Regressed => 0,
@@ -674,7 +682,10 @@ pub fn analyze_compare(
             FindingSeverity::Improved => 1,
             FindingSeverity::Neutral => 2,
         };
-        ord_a.cmp(&ord_b)
+        ord_a
+            .cmp(&ord_b)
+            .then_with(|| a.category.cmp(&b.category))
+            .then_with(|| a.message.cmp(&b.message))
     });
 
     CompareResult {
@@ -933,12 +944,10 @@ mod tests {
             &dummy_jank(0),
             &dummy_jank(0),
         );
-        assert!(
-            quiet_zero
-                .findings
-                .iter()
-                .all(|f| f.category != "Long Tasks")
-        );
+        assert!(quiet_zero
+            .findings
+            .iter()
+            .all(|f| f.category != "Long Tasks"));
         let loud = cmp_with(
             &dummy_summary(0.0, 0.0, 0, vec![]),
             &dummy_summary(0.0, 0.0, 2, vec![]),
@@ -961,12 +970,10 @@ mod tests {
             &dummy_jank(5),
             &dummy_jank(6),
         );
-        assert!(
-            quiet
-                .findings
-                .iter()
-                .all(|f| f.category != "Dropped Frames")
-        );
+        assert!(quiet
+            .findings
+            .iter()
+            .all(|f| f.category != "Dropped Frames"));
         let loud = cmp_with(
             &dummy_summary(0.0, 0.0, 0, vec![]),
             &dummy_summary(0.0, 0.0, 0, vec![]),
@@ -1161,11 +1168,10 @@ mod tests {
         );
 
         // Neither TBT nor Dropped Frames should generate a finding
-        assert!(
-            cmp.findings
-                .iter()
-                .all(|f| f.category != "Total Blocking Time")
-        );
+        assert!(cmp
+            .findings
+            .iter()
+            .all(|f| f.category != "Total Blocking Time"));
         assert!(cmp.findings.iter().all(|f| f.category != "Dropped Frames"));
     }
 }

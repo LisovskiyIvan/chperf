@@ -637,7 +637,15 @@ fn build_cpu_profile_result(
         .filter(|f| f.self_time_us > 0.0)
         .collect();
 
-    functions.sort_by(|a, b| b.self_time_us.partial_cmp(&a.self_time_us).unwrap());
+    // Self-time desc; exact ties break by name, then url (map order is
+    // hash-dependent and varies with thread count in parallel scans).
+    functions.sort_by(|a, b| {
+        b.self_time_us
+            .partial_cmp(&a.self_time_us)
+            .unwrap()
+            .then_with(|| a.function_name.cmp(&b.function_name))
+            .then_with(|| a.url.cmp(&b.url))
+    });
 
     let total_sample_time_us: f64 = functions.iter().map(|f| f.self_time_us).sum();
     let app_time_us: f64 = functions

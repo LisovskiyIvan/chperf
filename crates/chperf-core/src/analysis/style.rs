@@ -38,7 +38,13 @@ pub fn analyze_style_recalc(events: &[TraceEvent], main_tid: u64) -> StyleRecalc
         }
     }
 
-    entries.sort_by_key(|b| std::cmp::Reverse(b.element_count));
+    // Element-count desc; exact ties break by dur desc (scan order is
+    // deterministic but not a meaningful key).
+    entries.sort_by(|a, b| {
+        b.element_count
+            .cmp(&a.element_count)
+            .then_with(|| b.dur_us.partial_cmp(&a.dur_us).unwrap())
+    });
 
     let n = entries.len().max(1) as f64;
     let avg_elements = entries.iter().map(|e| e.element_count as f64).sum::<f64>() / n;

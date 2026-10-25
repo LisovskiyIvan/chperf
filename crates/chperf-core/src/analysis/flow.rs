@@ -82,7 +82,9 @@ pub fn flow_chains(events: &[&TraceEvent]) -> Vec<FlowChain> {
                     }
                     counts
                         .into_iter()
-                        .max_by_key(|(_, c)| *c)
+                        // Exact-count ties pick the alphabetically first
+                        // name (map order is hash-dependent).
+                        .max_by(|(n1, c1), (n2, c2)| c1.cmp(c2).then_with(|| n2.cmp(n1)))
                         .map(|(n, _)| n.to_string())
                         .unwrap_or_default()
                 }

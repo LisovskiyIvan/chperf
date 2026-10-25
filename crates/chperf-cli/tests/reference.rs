@@ -450,7 +450,13 @@ fn find_anchor(events: &[Event], scan: &CpuScan, pattern: &str) -> Option<Anchor
                 continue;
             };
             let hay = if name == "functionName" { n } else { u };
-            if matches_ignore_case(hay, pattern) && b.as_ref().is_none_or(|old| *t < old.0) {
+            // Earliest sample wins; exact-ts ties pick the alphabetically
+            // first label, mirroring the binary's deterministic tie-break
+            // (map iteration order is hash-dependent on both sides).
+            if matches_ignore_case(hay, pattern)
+                && b.as_ref()
+                    .is_none_or(|old| *t < old.0 || (*t == old.0 && *hay < old.1))
+            {
                 b = Some((*t, hay.clone()));
             }
         }

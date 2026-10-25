@@ -298,15 +298,21 @@ pub fn analyze_network(events: &[&TraceEvent], main_tid: u64) -> NetworkResult {
         .collect();
 
     // Slowest first so `slowest(n)` is a prefix slice; entries without a
-    // total sort last, ties by start.
+    // total sort last, ties by start, then request id (insertion order is
+    // deterministic but not a meaningful key).
     requests.sort_by(|a, b| match (a.total_us, b.total_us) {
         (Some(x), Some(y)) => y
             .partial_cmp(&x)
             .unwrap()
-            .then_with(|| a.start_us.partial_cmp(&b.start_us).unwrap()),
+            .then_with(|| a.start_us.partial_cmp(&b.start_us).unwrap())
+            .then_with(|| a.request_id.cmp(&b.request_id)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+        (None, None) => a
+            .start_us
+            .partial_cmp(&b.start_us)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.request_id.cmp(&b.request_id)),
     });
 
     let request_count = requests.len();
