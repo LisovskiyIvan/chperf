@@ -74,7 +74,7 @@ pub fn flow_chains(events: &[&TraceEvent]) -> Vec<FlowChain> {
             steps.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
             let open_name = steps.iter().find(|e| is_open(e.ph)).map(|e| e.name.clone());
             let name = match open_name {
-                Some(n) => n,
+                Some(n) => n.to_string(),
                 None => {
                     let mut counts: HashMap<&str, usize> = HashMap::new();
                     for e in &steps {
@@ -150,7 +150,7 @@ mod tests {
 
     fn ev(name: &str, ph: u8, id: u64, has_id: bool, ts: f64, pid: u64, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id,
             has_id,
             ph,

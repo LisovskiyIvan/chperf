@@ -2750,10 +2750,11 @@ pub fn async_section(
     // (pid, id), `f` consumes it. Chrome recycles flow ids, so entries must
     // not survive their finish — a two-pass or_insert kept the FIRST start
     // and reused ids measured against a stale begin.
-    let mut starts: rustc_hash::FxHashMap<(u64, u64), (String, f64)> =
+    let mut starts: rustc_hash::FxHashMap<(u64, u64), (crate::trace::SharedStr, f64)> =
         rustc_hash::FxHashMap::default();
-    let mut by_name: rustc_hash::FxHashMap<String, Vec<f64>> = rustc_hash::FxHashMap::default();
-    let mut longest: Vec<(String, f64, f64)> = Vec::new(); // (name, start ts, dur)
+    let mut by_name: rustc_hash::FxHashMap<crate::trace::SharedStr, Vec<f64>> =
+        rustc_hash::FxHashMap::default();
+    let mut longest: Vec<(crate::trace::SharedStr, f64, f64)> = Vec::new(); // (name, start ts, dur)
     for e in events {
         if !e.has_id {
             continue;
@@ -2773,7 +2774,7 @@ pub fn async_section(
     longest.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     let total_tasks = longest.len();
 
-    let mut rows: Vec<(String, usize, f64, f64, f64, f64, f64)> = by_name
+    let mut rows: Vec<(crate::trace::SharedStr, usize, f64, f64, f64, f64, f64)> = by_name
         .into_iter()
         .map(|(name, mut durs)| {
             durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -3653,7 +3654,7 @@ mod tests {
 
     fn ev(ts: f64, name: &str, cat: Option<&str>) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -3661,14 +3662,14 @@ mod tests {
             dur: None,
             tid: 1,
             pid: 1,
-            cat: cat.map(str::to_owned),
+            cat: cat.map(|c| c.into()),
             args: None,
         }
     }
 
     fn flow(ph: u8, id: u64, ts: f64) -> TraceEvent {
         TraceEvent {
-            name: "AnimationFrame".to_owned(),
+            name: "AnimationFrame".into(),
             id,
             has_id: true,
             ph,
@@ -3740,7 +3741,7 @@ mod tests {
         args: Option<serde_json::Value>,
     ) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id,
             has_id,
             ph,
@@ -4159,7 +4160,7 @@ mod tests {
 
     fn ev_rt(ts: f64, dur: f64, tid: u64, pid: u64) -> TraceEvent {
         TraceEvent {
-            name: "RunTask".to_owned(),
+            name: "RunTask".into(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -4174,7 +4175,7 @@ mod tests {
 
     fn ev_tn(pid: u64, tid: u64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: "thread_name".to_owned(),
+            name: "thread_name".into(),
             id: 0,
             has_id: false,
             ph: b'M',
@@ -4182,7 +4183,7 @@ mod tests {
             dur: None,
             tid,
             pid,
-            cat: Some("__metadata".to_owned()),
+            cat: Some("__metadata".into()),
             args: crate::trace::test_args(json!({"name": name})),
         }
     }

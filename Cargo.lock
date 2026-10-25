@@ -74,6 +74,7 @@ dependencies = [
  "chperf-core",
  "clap",
  "flate2",
+ "rustc-hash",
  "serde_json",
 ]
 

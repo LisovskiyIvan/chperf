@@ -609,11 +609,12 @@ fn glob_match(pat: &str, s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::detect_main_thread;
+    use crate::trace::ArgsText;
     use crate::trace::TraceEvent;
 
     fn ev(name: &str, ph: u8, tid: u64, dur: Option<f64>, args: Option<String>) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,
@@ -622,7 +623,7 @@ mod tests {
             tid,
             pid: 1,
             cat: None,
-            args: args.map(|s| s.into_boxed_str()),
+            args: args.map(|s| ArgsText::copy(&s)),
         }
     }
 
@@ -790,7 +791,7 @@ mod tests {
 
     fn be(name: &str, ph: u8, tid: u64, pid: u64, dur: Option<f64>) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,
@@ -805,7 +806,7 @@ mod tests {
 
     fn tn(pid: u64, tid: u64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: "thread_name".to_owned(),
+            name: "thread_name".into(),
             id: 0,
             has_id: false,
             ph: b'M',
@@ -814,7 +815,7 @@ mod tests {
             tid,
             pid,
             cat: None,
-            args: Some(format!(r#"{{"name":"{name}"}}"#).into_boxed_str()),
+            args: Some(ArgsText::copy(&format!(r#"{{"name":"{name}"}}"#))),
         }
     }
 

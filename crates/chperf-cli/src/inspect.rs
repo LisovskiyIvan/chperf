@@ -107,7 +107,7 @@ pub(crate) fn inspect_compare_output(
     if cli.json {
         cap_memory_json(&mut sections_a, cli.top);
         cap_memory_json(&mut sections_b, cli.top);
-        let mut obj = serde_json::Map::new();
+        let mut obj = serde_json::Map::with_capacity(4);
         obj.insert("trace_a".into(), serde_json::json!(name_a));
         obj.insert("trace_b".into(), serde_json::json!(name_b));
         if let Some(ref note) = ws_a.anchor_note {
@@ -116,11 +116,11 @@ pub(crate) fn inspect_compare_output(
         if let Some(ref note) = ws_b.anchor_note {
             obj.insert("anchor_b".into(), serde_json::json!(note));
         }
-        let mut secs_a = serde_json::Map::new();
+        let mut secs_a = serde_json::Map::with_capacity(sections_a.len());
         for (k, _, j) in &sections_a {
             secs_a.insert((*k).into(), j.clone());
         }
-        let mut secs_b = serde_json::Map::new();
+        let mut secs_b = serde_json::Map::with_capacity(sections_b.len());
         for (k, _, j) in &sections_b {
             secs_b.insert((*k).into(), j.clone());
         }
@@ -144,7 +144,7 @@ pub(crate) fn inspect_compare_output(
         return Ok(());
     }
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(16 * 1024);
     out.push_str(&format!(
         "# chperf inspect compare: {} vs {}\n\n",
         name_a, name_b
@@ -774,9 +774,9 @@ fn dispatch_output(
     ws: &WindowState,
     cli: &Cli,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut out = String::new();
+    let mut out = String::with_capacity(16 * 1024);
     if cli.json {
-        let mut obj = serde_json::Map::new();
+        let mut obj = serde_json::Map::with_capacity(4);
         obj.insert("trace".into(), serde_json::json!(trace_name));
         if let Some(ref note) = ws.anchor_note {
             obj.insert("anchor".into(), serde_json::json!(note));
@@ -791,7 +791,7 @@ fn dispatch_output(
                 None => serde_json::Value::Null,
             },
         );
-        let mut secs = serde_json::Map::new();
+        let mut secs = serde_json::Map::with_capacity(sections.len());
         for (k, _, j) in sections {
             secs.insert((*k).into(), j.clone());
         }

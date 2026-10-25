@@ -42,56 +42,97 @@ pub(crate) fn load_and_analyze(
     let min_ts = chperf_core::inspect::trace_start_us(&trace.trace_events);
     let events = &trace.trace_events;
     eprintln!("  {} events, main thread tid={}", events.len(), main_tid);
-    // The six analysis passes are independent and read-only, so on large
+    // Renderer setup first and serially: the per-renderer passes join the
+    // parallel section below, so the budget/model must be ready before it.
+    // (Both are full-event scans; ~25ms on big traces, sub-ms on small.)
+    let frame_budget_us = chperf_core::windowed::detect_frame_budget_us(events);
+    let thread_model = trace::detect_thread_model(events);
+    // The analysis passes are independent and read-only, so on large
     // traces they run concurrently (each pass itself parallelizes hot work).
+    // Per-renderer summary/jank ride the same scope: they hide under the
+    // slowest of the seven instead of serializing after them.
     const PARALLEL_THRESHOLD: usize = 20_000;
-    let (summary, scroll_frames, layout_dirty, style_recalc, forced_reflows, jank, cpu_profile) =
-        if events.len() >= PARALLEL_THRESHOLD {
-            std::thread::scope(|s| {
-                let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
-                let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
-                let c = s.spawn(|| analysis::analyze_cpu_profile_full(events).0);
-                let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
-                let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
-                let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
-                let g = s.spawn(|| analysis::analyze_jank(events, main_tid, None));
-                (
-                    a.join().unwrap(),
-                    b.join().unwrap(),
-                    d.join().unwrap(),
-                    e.join().unwrap(),
-                    f.join().unwrap(),
-                    g.join().unwrap(),
-                    c.join().unwrap(),
-                )
-            })
-        } else {
+    let (
+        summary,
+        scroll_frames,
+        layout_dirty,
+        style_recalc,
+        forced_reflows,
+        jank,
+        cpu_profile,
+        renderer_summaries,
+        renderer_janks,
+        thread_count,
+    ) = if events.len() >= PARALLEL_THRESHOLD {
+        std::thread::scope(|s| {
+            let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
+            let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
+            let c = s.spawn(|| analysis::analyze_cpu_profile_full(events).0);
+            let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
+            let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
+            let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
+            let g = s.spawn(|| analysis::analyze_jank(events, main_tid, None));
+            let h = s.spawn(|| analysis::analyze_summary_per_renderer(events, &thread_model));
+            let i = s.spawn(|| {
+                analysis::analyze_jank_per_renderer(events, &thread_model, Some(frame_budget_us))
+            });
+            // FxHash: tids are u64s counted once per run; SipHash would dominate.
+            let j = s.spawn(|| {
+                let mut tids = rustc_hash::FxHashSet::default();
+                tids.reserve(256);
+                for e in events {
+                    tids.insert(e.tid);
+                }
+                tids.len()
+            });
             (
-                analysis::analyze_summary(events, main_tid),
-                analysis::analyze_scroll_frames(events, main_tid),
-                analysis::analyze_layout_dirty(events, main_tid),
-                analysis::analyze_style_recalc(events, main_tid),
-                analysis::analyze_forced_reflows(events, main_tid),
-                analysis::analyze_jank(events, main_tid, None),
-                analysis::analyze_cpu_profile_full(events).0,
+                a.join().unwrap(),
+                b.join().unwrap(),
+                d.join().unwrap(),
+                e.join().unwrap(),
+                f.join().unwrap(),
+                g.join().unwrap(),
+                c.join().unwrap(),
+                h.join().unwrap(),
+                i.join().unwrap(),
+                j.join().unwrap(),
             )
-        };
+        })
+    } else {
+        let mut tids = rustc_hash::FxHashSet::default();
+        for e in events {
+            tids.insert(e.tid);
+        }
+        (
+            analysis::analyze_summary(events, main_tid),
+            analysis::analyze_scroll_frames(events, main_tid),
+            analysis::analyze_layout_dirty(events, main_tid),
+            analysis::analyze_style_recalc(events, main_tid),
+            analysis::analyze_forced_reflows(events, main_tid),
+            analysis::analyze_jank(events, main_tid, None),
+            analysis::analyze_cpu_profile_full(events).0,
+            analysis::analyze_summary_per_renderer(events, &thread_model),
+            analysis::analyze_jank_per_renderer(events, &thread_model, Some(frame_budget_us)),
+            tids.len(),
+        )
+    };
     // Single-trace report sections (also used uncompared in compare mode).
     // Scope-filtered passes borrow event refs instead of cloning the trace.
     let refs: Vec<&trace::TraceEvent> = events.iter().collect();
-    let loading = analysis::analyze_loading(&refs);
-    let network = analysis::analyze_network(&refs, main_tid);
-    let raster = analysis::analyze_raster(&refs, main_tid);
-    let official_long_tasks = analysis::analyze_long_tasks_official(&refs, main_tid);
-    let mut tids = std::collections::HashSet::new();
-    for e in events {
-        tids.insert(e.tid);
-    }
-    let frame_budget_us = chperf_core::windowed::detect_frame_budget_us(events);
-    let thread_model = trace::detect_thread_model(events);
-    let renderer_summaries = analysis::analyze_summary_per_renderer(events, &thread_model);
-    let renderer_janks =
-        analysis::analyze_jank_per_renderer(events, &thread_model, Some(frame_budget_us));
+    // Independent and read-only: run concurrently (each is 10-25ms on big
+    // traces; the scope join costs microseconds).
+    let (loading, network, raster, official_long_tasks) = std::thread::scope(|s| {
+        let a = s.spawn(|| analysis::analyze_loading(&refs));
+        let b = s.spawn(|| analysis::analyze_network(&refs, main_tid));
+        let c = s.spawn(|| analysis::analyze_raster(&refs, main_tid));
+        let d = s.spawn(|| analysis::analyze_long_tasks_official(&refs, main_tid));
+        (
+            a.join().unwrap(),
+            b.join().unwrap(),
+            c.join().unwrap(),
+            d.join().unwrap(),
+        )
+    });
 
     let metadata = trace.metadata.clone();
     let trace_span_us = summary.total_trace_duration_us;
@@ -111,7 +152,7 @@ pub(crate) fn load_and_analyze(
         renderer_summaries,
         renderer_janks,
         trace.stats.clone(),
-        tids.len(),
+        thread_count,
         trace_span_us,
         frame_budget_us,
         main_tid,

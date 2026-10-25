@@ -347,7 +347,7 @@ mod tests {
 
     fn ev(name: &str, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'I',
@@ -362,7 +362,7 @@ mod tests {
 
     fn ev_args(name: &str, ts: f64, tid: u64, args: serde_json::Value) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'I',

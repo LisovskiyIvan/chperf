@@ -92,13 +92,13 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
     // Sessions (workers, multiple processes, reused pid+tid) have
     // independent node id spaces and walks, keyed by `assign_sessions` exactly
     // like the CPU scan, so anchor times agree with `scan_profile_chunks`.
-    let sessions = crate::analysis::assign_sessions(events);
+    let (session_idx, session_table) = crate::analysis::assign_sessions(events);
     // Profile-head anchor per session (same resolution as
     // `profile_chunk_bases`): id-less chunks attach to the latest Profile
     // on their tid via the session assignment.
-    let mut starts: rustc_hash::FxHashMap<crate::analysis::SessionKey, f64> =
+    let mut starts: rustc_hash::FxHashMap<u32, f64> =
         rustc_hash::FxHashMap::default();
-    for (e, s) in events.iter().zip(sessions.iter()) {
+    for (e, s) in events.iter().zip(session_idx.iter()) {
         if e.name == "Profile" && e.ph == b'P' {
             starts.entry(*s).or_insert(e.ts);
         }
@@ -107,7 +107,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
         (crate::analysis::SessionKey, u64),
         (f64, String, String),
     > = rustc_hash::FxHashMap::default();
-    let mut prev_last: rustc_hash::FxHashMap<crate::analysis::SessionKey, f64> =
+    let mut prev_last: rustc_hash::FxHashMap<u32, f64> =
         rustc_hash::FxHashMap::default();
     for (idx, e) in events.iter().enumerate() {
         if e.name != "ProfileChunk" {
@@ -125,7 +125,10 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             Some(cp) => cp,
             None => continue,
         };
-        let sess = sessions[idx];
+        let sess_idx = session_idx[idx];
+        // Node ids live in SessionKey space (kept for identical iteration
+        // order); the u32 index only keys the query-only time maps.
+        let sess = session_table[sess_idx as usize];
         for node in cpu_profile
             .get("nodes")
             .and_then(|n| n.as_array())
@@ -158,9 +161,9 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
             // before recording so the first sample lands on `prev_last +
             // delta[0]` (same walk as `profile_chunk_bases`).
             let mut sample_ts = prev_last
-                .get(&sess)
+                .get(&sess_idx)
                 .copied()
-                .unwrap_or_else(|| starts.get(&sess).copied().unwrap_or(0.0));
+                .unwrap_or_else(|| starts.get(&sess_idx).copied().unwrap_or(0.0));
             for (i, s) in samples.iter().enumerate().take(n) {
                 sample_ts += deltas[i].as_f64().unwrap_or(0.0);
                 let id = s.as_u64().unwrap_or(0);
@@ -171,7 +174,7 @@ pub fn find_anchor(events: &[TraceEvent], matcher: &Matcher) -> Option<Anchor> {
                     entry.0 = sample_ts;
                 }
             }
-            prev_last.insert(sess, sample_ts);
+            prev_last.insert(sess_idx, sample_ts);
         }
     }
     // Prefer function-name matches over URL-only matches: a substring like
@@ -1337,7 +1340,7 @@ mod tests {
         args: Option<serde_json::Value>,
     ) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: ph.as_bytes().first().copied().unwrap_or(0),

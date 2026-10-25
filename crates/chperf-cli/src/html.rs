@@ -10,10 +10,25 @@ use serde_json::Value;
 // ── Formatting helpers ──
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    // Single pass: the chained-replace version scanned + reallocated 4x.
+    // Byte-identical: replacements introduce no escapable chars ('&' is
+    // emitted only as part of an entity, after the '&' arm already ran —
+    // same as replacing '&' first), and '"' is only special in attributes,
+    // escaped uniformly here as before.
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn dur(us: f64) -> String {
@@ -35,11 +50,8 @@ fn jf(v: &Value, key: &str) -> f64 {
 fn ji(v: &Value, key: &str) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
 }
-fn js(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
+fn js<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
 }
 
 // ── HTML building blocks ──
@@ -252,7 +264,9 @@ pub fn export_html(
     min_ts_a: f64,
     b: Option<(&App, &[trace::TraceEvent], f64)>,
 ) -> String {
-    let mut o = String::new();
+    // Full report is ~90KB on large traces; reserve up front so the
+    // section renderers below append without repeated regrowth.
+    let mut o = String::with_capacity(96 * 1024);
     o.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     o.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
     let title = match &b {
@@ -642,8 +656,8 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
             .iter()
             .map(|t| {
                 vec![
-                    esc(&js(t, "type")),
-                    format!("{}", ji(t, "count")),
+                    esc(js(t, "type")),
+                    ji(t, "count").to_string(),
                     dur(jf(t, "total_us")),
                     dur(jf(t, "avg_us")),
                     dur(jf(t, "p50_us")),
@@ -668,7 +682,7 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
                     vec![
                         format!("{:.2}ms", jf(w, "t_us") / 1000.0),
                         dur(jf(w, "dur_us")),
-                        esc(&js(w, "type")),
+                        esc(js(w, "type")),
                     ]
                 })
                 .collect();
@@ -687,8 +701,8 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
             .iter()
             .map(|t| {
                 vec![
-                    esc(&js(t, "name")),
-                    format!("{}", ji(t, "count")),
+                    esc(js(t, "name")),
+                    ji(t, "count").to_string(),
                     dur(jf(t, "total_us")),
                     dur(jf(t, "avg_us")),
                     dur(jf(t, "p50_us")),
@@ -713,7 +727,7 @@ fn render_trace_body(o: &mut String, app: &App, events_a: &[trace::TraceEvent], 
                     vec![
                         format!("{:.2}ms", jf(w, "t_us") / 1000.0),
                         dur(jf(w, "dur_us")),
-                        esc(&js(w, "name")),
+                        esc(js(w, "name")),
                     ]
                 })
                 .collect();

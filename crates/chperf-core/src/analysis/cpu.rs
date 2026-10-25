@@ -24,8 +24,9 @@ pub type ProfileNodes = rustc_hash::FxHashMap<NodeKey, (String, String, Option<u
 /// CPU-profile node -> sampled self-time (µs).
 pub type ProfileSelfTimes = rustc_hash::FxHashMap<NodeKey, f64>;
 
-/// Session assignment for a whole event list: one [`SessionKey`] per event,
-/// in order.
+/// Session assignment for a whole event list: one table index per event
+/// plus the interned [`SessionKey`] table. Indices are `u32` (4B/event, not
+/// 24B): sessions number in the dozens, so the table is tiny.
 ///
 /// The session key is `(pid, id)` when the event carries the
 /// Profile/ProfileChunk head's `id`, else `(pid, tid)` — and a fresh
@@ -36,25 +37,50 @@ pub type ProfileSelfTimes = rustc_hash::FxHashMap<NodeKey, f64>;
 ///
 /// Id-less chunks attach to the latest `Profile` on their tid (a head with
 /// an `id` still anchors its tid's chunks).
-pub(crate) fn assign_sessions(events: &[TraceEvent]) -> Vec<SessionKey> {
+pub(crate) fn assign_sessions(events: &[TraceEvent]) -> (Vec<u32>, Vec<SessionKey>) {
     let mut generation: rustc_hash::FxHashMap<(u64, u64), u32> = rustc_hash::FxHashMap::default();
     let mut cur: rustc_hash::FxHashMap<(u64, u64), SessionKey> = rustc_hash::FxHashMap::default();
-    events
-        .iter()
-        .map(|e| {
-            let base = (e.pid, if e.has_id { e.id } else { e.tid });
-            if e.name == "Profile" && e.ph == b'P' {
-                let g = generation.entry(base).or_insert(0);
-                *g += 1;
-                let s = (base.0, base.1, *g);
-                cur.insert(base, s);
-                cur.insert((e.pid, e.tid), s);
-                s
-            } else {
-                *cur.get(&base).unwrap_or(&(base.0, base.1, 0))
+    let mut table: Vec<SessionKey> = Vec::new();
+    let mut index: rustc_hash::FxHashMap<SessionKey, u32> = rustc_hash::FxHashMap::default();
+    let mut out: Vec<u32> = Vec::with_capacity(events.len());
+    // Consecutive events usually share (pid, id/tid): 1-entry caches skip
+    // both hash lookups on the hot path (same-thread runs dominate traces).
+    let mut last_base = (u64::MAX, u64::MAX);
+    let mut last_sess: SessionKey = (u64::MAX, u64::MAX, u32::MAX);
+    let mut last_idx = u32::MAX;
+    for e in events {
+        let base = (e.pid, if e.has_id { e.id } else { e.tid });
+        let sess = if e.name == "Profile" && e.ph == b'P' {
+            let g = generation.entry(base).or_insert(0);
+            *g += 1;
+            let s = (base.0, base.1, *g);
+            cur.insert(base, s);
+            cur.insert((e.pid, e.tid), s);
+            s
+        } else if base == last_base {
+            last_sess
+        } else {
+            *cur.get(&base).unwrap_or(&(base.0, base.1, 0))
+        };
+        let idx = if sess == last_sess {
+            last_idx
+        } else {
+            match index.get(&sess) {
+                Some(&i) => i,
+                None => {
+                    let i = table.len() as u32;
+                    table.push(sess);
+                    index.insert(sess, i);
+                    i
+                }
             }
-        })
-        .collect()
+        };
+        out.push(idx);
+        last_base = base;
+        last_sess = sess;
+        last_idx = idx;
+    }
+    (out, table)
 }
 
 #[derive(Clone)]
@@ -100,13 +126,13 @@ fn classify_url(url: &str) -> SourceType {
     if url.is_empty() {
         return SourceType::Native;
     }
-    let lower = url.to_lowercase();
-    if lower.contains("node_modules")
-        || lower.contains("svelte")
-        || lower.contains("react")
-        || lower.contains("vue")
-        || lower.contains("angular")
-        || lower.contains("polyfill")
+    // Allocation-free ASCII matching (all markers are lowercase ASCII).
+    if crate::inspect::contains_ignore_case(url, "node_modules")
+        || crate::inspect::contains_ignore_case(url, "svelte")
+        || crate::inspect::contains_ignore_case(url, "react")
+        || crate::inspect::contains_ignore_case(url, "vue")
+        || crate::inspect::contains_ignore_case(url, "angular")
+        || crate::inspect::contains_ignore_case(url, "polyfill")
     {
         SourceType::Runtime
     } else {
@@ -140,8 +166,9 @@ pub fn scan_profile_chunks(
 ) -> (ProfileNodes, ProfileSelfTimes) {
     let windows = [scope.and_then(|s| s.window)];
     let threads = scan_threads(reserve_threads);
-    let sessions = assign_sessions(events);
-    let (nodes, mut times) = scan_profile_chunks_core(events, scope, &windows, &sessions, threads);
+    let (sessions, session_table) = assign_sessions(events);
+    let (nodes, mut times) =
+        scan_profile_chunks_core(events, scope, &windows, &sessions, &session_table, threads);
     (nodes, times.remove(0))
 }
 
@@ -154,12 +181,13 @@ pub fn scan_profile_chunks_windows(
     windows: &[Option<(f64, f64)>],
     reserve_threads: usize,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
-    let sessions = assign_sessions(events);
+    let (sessions, session_table) = assign_sessions(events);
     scan_profile_chunks_core(
         events,
         scope,
         windows,
         &sessions,
+        &session_table,
         scan_threads(reserve_threads),
     )
 }
@@ -228,7 +256,8 @@ fn scan_profile_chunks_core(
     events: &[TraceEvent],
     scope: Option<&Scope>,
     windows: &[Option<(f64, f64)>],
-    sessions: &[SessionKey],
+    sessions: &[u32],
+    session_table: &[SessionKey],
     threads: usize,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     const MIN_CHUNK_WORK: usize = 64_000;
@@ -237,8 +266,11 @@ fn scan_profile_chunks_core(
     let bases = &bases;
     let first_chunks = &first_chunks;
     let sessions = &sessions;
+    let session_table = &session_table;
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
-        return scan_profile_chunk(events, 0, scope, bases, first_chunks, sessions, windows);
+        return scan_profile_chunk(
+            events, 0, scope, bases, first_chunks, sessions, session_table, windows,
+        );
     }
     let chunk = events.len().div_ceil(threads);
     std::thread::scope(|s| {
@@ -247,7 +279,16 @@ fn scan_profile_chunks_core(
             .enumerate()
             .map(|(ci, c)| {
                 s.spawn(move || {
-                    scan_profile_chunk(c, ci * chunk, scope, bases, first_chunks, sessions, windows)
+                    scan_profile_chunk(
+                        c,
+                        ci * chunk,
+                        scope,
+                        bases,
+                        first_chunks,
+                        sessions,
+                        session_table,
+                        windows,
+                    )
                 })
             })
             .collect();
@@ -292,14 +333,14 @@ fn scan_profile_chunks_core(
 /// semantics, the drift shows up here instead of silently skewing windows.
 fn profile_chunk_bases(
     events: &[TraceEvent],
-    sessions: &[SessionKey],
+    session_idx: &[u32],
     collect_bases: bool,
 ) -> (HashMap<usize, f64>, rustc_hash::FxHashSet<usize>) {
     // Profile heads register their anchor under their assigned session; the
     // per-event session assignment already resolved id-less chunks to the
     // latest Profile on their tid, so no (pid, tid) aliasing is needed here.
-    let mut starts: rustc_hash::FxHashMap<SessionKey, f64> = rustc_hash::FxHashMap::default();
-    for (e, s) in events.iter().zip(sessions.iter()) {
+    let mut starts: rustc_hash::FxHashMap<u32, f64> = rustc_hash::FxHashMap::default();
+    for (e, s) in events.iter().zip(session_idx.iter()) {
         if e.name == "Profile" && e.ph == b'P' {
             starts.entry(*s).or_insert(e.ts);
         }
@@ -308,7 +349,7 @@ fn profile_chunk_bases(
     let mut first_chunks: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     // Last sample time per session; concurrent sessions (workers, multiple
     // processes) must not continue each other's walks.
-    let mut prev_last: rustc_hash::FxHashMap<SessionKey, f64> = rustc_hash::FxHashMap::default();
+    let mut prev_last: rustc_hash::FxHashMap<u32, f64> = rustc_hash::FxHashMap::default();
     // Sample-time bounds (first sample of the walk, last sample per pid) for
     // the CHPERF_CHECK sanity pass.
     let mut sample_min = f64::INFINITY;
@@ -318,7 +359,7 @@ fn profile_chunk_bases(
         if e.name != "ProfileChunk" {
             continue;
         }
-        let sess = sessions[idx];
+        let sess = session_idx[idx];
         if !collect_bases && !do_check && prev_last.contains_key(&sess) {
             continue;
         }
@@ -410,7 +451,8 @@ fn scan_profile_chunk(
     scope: Option<&Scope>,
     bases: &HashMap<usize, f64>,
     first_chunks: &rustc_hash::FxHashSet<usize>,
-    sessions: &[SessionKey],
+    sessions: &[u32],
+    session_table: &[SessionKey],
     windows: &[Option<(f64, f64)>],
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     let mut node_map: ProfileNodes = ProfileNodes::default();
@@ -422,7 +464,7 @@ fn scan_profile_chunk(
         if e.name != "ProfileChunk" {
             continue;
         }
-        let sess = sessions[global_offset + i];
+        let sess = session_table[sessions[global_offset + i] as usize];
         let Some(raw) = e.args_raw() else {
             continue;
         };
@@ -665,7 +707,7 @@ mod tests {
 
     fn profile_event(ts: f64) -> TraceEvent {
         TraceEvent {
-            name: "Profile".to_owned(),
+            name: "Profile".into(),
             id: 0,
             has_id: false,
             ph: b'P',
@@ -691,7 +733,7 @@ mod tests {
             })
             .collect();
         TraceEvent {
-            name: "ProfileChunk".to_owned(),
+            name: "ProfileChunk".into(),
             id: 0,
             has_id: false,
             ph: b'P',
@@ -711,7 +753,7 @@ mod tests {
 
     fn plain_event(ts: f64, name: &str) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -844,8 +886,13 @@ mod tests {
         ];
         let sessions = assign_sessions(&events);
         // Profile, chunk, Profile, chunk: generations 1, 1, 2, 2.
+        let keys: Vec<SessionKey> = sessions
+            .0
+            .iter()
+            .map(|&i| sessions.1[i as usize])
+            .collect();
         assert_eq!(
-            sessions,
+            keys,
             vec![(2, 65, 1), (2, 65, 1), (2, 65, 2), (2, 65, 2)]
         );
         let (nodes, times) = scan_profile_chunks(&events, None, 0);
@@ -1101,8 +1148,9 @@ mod tests {
 
         let sessions = assign_sessions(&events);
         let (nodes_serial, times_serial) =
-            scan_profile_chunks_core(&events, None, &[None], &sessions, 1);
-        let (nodes_par, times_par) = scan_profile_chunks_core(&events, None, &[None], &sessions, 8);
+            scan_profile_chunks_core(&events, None, &[None], &sessions.0, &sessions.1, 1);
+        let (nodes_par, times_par) =
+            scan_profile_chunks_core(&events, None, &[None], &sessions.0, &sessions.1, 8);
         assert_eq!(nodes_serial.len(), nodes_par.len());
         for (id, v) in &nodes_serial {
             assert_eq!(nodes_par.get(id), Some(v));

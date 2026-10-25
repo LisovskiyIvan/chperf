@@ -43,7 +43,7 @@ fn fmt_change_count(a: f64, b: f64) -> String {
 }
 
 pub fn export_summary_only(app: &App) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(2048);
 
     if let Some(ref cmp) = app.compare {
         let name_a = &app.trace_name_a;
@@ -57,7 +57,9 @@ pub fn export_summary_only(app: &App) -> String {
 }
 
 pub fn export_markdown(app: &App) -> String {
-    let mut out = String::new();
+    // Full report is ~15KB on large traces; reserve up front so the ~20
+    // section renderers below append without repeated regrowth.
+    let mut out = String::with_capacity(16 * 1024);
 
     out.push_str(&format!(
         "# Chrome Trace Analysis: {}\n\n",

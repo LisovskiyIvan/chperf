@@ -300,7 +300,7 @@ mod tests {
 
     fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,
@@ -321,7 +321,7 @@ mod tests {
         args: serde_json::Value,
     ) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,
@@ -343,7 +343,7 @@ mod tests {
         args: serde_json::Value,
     ) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,
@@ -351,7 +351,7 @@ mod tests {
             dur,
             tid: 1,
             pid: 1,
-            cat: Some(cat.to_owned()),
+            cat: Some(cat.into()),
             args: crate::trace::test_args(args),
         }
     }
@@ -427,11 +427,10 @@ mod tests {
         assert!(r.lcp.is_empty());
         assert!(r.user_timing.is_empty());
         assert_eq!(r.entries.len(), MILESTONES.len());
-        assert!(
-            r.entries
-                .iter()
-                .all(|e| e.ts_us.is_none() && e.rel_us.is_none())
-        );
+        assert!(r
+            .entries
+            .iter()
+            .all(|e| e.ts_us.is_none() && e.rel_us.is_none()));
         // No navigationStart: absolute times, no rel.
         let r = analyze_loading(&[&ev("firstContentfulPaint", b'R', 500_000.0, None)]);
         assert_eq!(r.navigation_start_us, None);

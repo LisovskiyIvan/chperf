@@ -9,6 +9,8 @@ mod meta;
 mod parse;
 mod profiler;
 
+pub use event::ArgsText;
+pub use event::SharedStr;
 pub use event::TraceEvent;
 pub use event::normalize_be_pairs;
 #[cfg(test)]

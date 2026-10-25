@@ -10,7 +10,26 @@
 //! the output honestly.
 
 use super::summary::correct_event_dur;
-use crate::trace::{TraceEvent, find_profiler_overhead};
+use crate::trace::{find_profiler_overhead, TraceEvent};
+
+/// Case-insensitive ASCII substring search: SIMD first-byte scan (`memchr2`
+/// over both cases), then an exact compare at each candidate. All scroll
+/// markers are lowercase ASCII, so this agrees with
+/// `to_lowercase().contains` on real traces with no per-event allocation.
+fn contains_ci(hay: &str, needle: &[u8]) -> bool {
+    let h = hay.as_bytes();
+    if h.len() < needle.len() {
+        return false;
+    }
+    let lo = needle[0].to_ascii_lowercase();
+    let hi = needle[0].to_ascii_uppercase();
+    for i in memchr::memchr2_iter(lo, hi, h) {
+        if h.len() - i >= needle.len() && h[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+    }
+    false
+}
 
 /// One frame budget at 60fps. Sub-tasks longer than this can drop a frame,
 /// so this — not the 50ms long-task threshold — is the inclusion gate.
@@ -95,27 +114,24 @@ pub struct ScrollFrameResult {
 /// (`"scroll"`, `"GestureScrollUpdate"`, `"GestureScrollBegin/End"`,
 /// `"MouseWheel"`, all matched case-insensitively).
 fn is_scroll_input(e: &TraceEvent) -> bool {
-    let lower = e.name.to_lowercase();
-    if lower.contains("gesturescrollupdate")
-        || lower.contains("gesturescrollbegin")
-        || lower.contains("gesturescrollend")
-        || lower.contains("mousewheel")
-    {
+    // All patterns are lowercase ASCII; `contains_ci` agrees with the old
+    // `to_lowercase().contains` on real traces with no per-event allocation.
+    // Every gesture pattern contains "scroll", so check that first.
+    let name = &e.name;
+    // A scroll-named event counts even without parseable args, so no args
+    // scan here: the result is `true` regardless.
+    if contains_ci(name, b"scroll") {
         return true;
     }
-    let is_dispatch = e.name == "EventDispatch" || e.name == "InputLatency";
-    let has_scroll_name = lower.contains("scroll");
-    if is_dispatch || has_scroll_name {
+    if contains_ci(name, b"mousewheel") {
+        return true;
+    }
+    if name == "EventDispatch" || name == "InputLatency" {
         if let Some(raw) = e.args_raw() {
-            let raw_lower = raw.to_lowercase();
-            // `args.data.type` values flow through here; a bare substring
-            // check on the raw args keeps this O(1) per event (no JSON DOM).
-            if raw_lower.contains("scroll") || raw_lower.contains("mousewheel") {
+            if contains_ci(raw, b"scroll") || contains_ci(raw, b"mousewheel") {
                 return true;
             }
         }
-        // A scroll-named event without parseable args still counts.
-        return has_scroll_name;
     }
     false
 }
@@ -136,12 +152,24 @@ fn bucket_of(name: &str) -> Option<usize> {
 
 pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFrameResult {
     let overheads = find_profiler_overhead(events);
-    let mut main_x: Vec<usize> = events
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.tid == main_tid && e.ph == b'X')
-        .map(|(i, _)| i)
-        .collect();
+    // One fused pass: main-thread X indices (+ their corrected durations)
+    // and scroll/input timestamps. Three separate filters here would read
+    // the whole events vec three times (~450MB on big traces).
+    let mut main_x: Vec<usize> = Vec::with_capacity(events.len() / 8);
+    let mut input_ts: Vec<f64> = Vec::with_capacity(4096);
+    // Overhead-corrected duration per event index (children inside a
+    // profiler-freeze span correct toward 0 so the artifact spike lands in
+    // no category).
+    let mut dur_of: Vec<f64> = vec![0.0f64; events.len()];
+    for (i, e) in events.iter().enumerate() {
+        if e.tid == main_tid && e.ph == b'X' {
+            main_x.push(i);
+            dur_of[i] = correct_event_dur(e, &overheads);
+        }
+        if is_scroll_input(e) {
+            input_ts.push(e.ts);
+        }
+    }
     main_x.sort_by(|&a, &b| events[a].ts.partial_cmp(&events[b].ts).unwrap());
 
     let run_tasks: Vec<usize> = main_x
@@ -153,31 +181,12 @@ pub fn analyze_scroll_frames(events: &[TraceEvent], main_tid: u64) -> ScrollFram
     // Scroll/input evidence anywhere in the trace decides the gate: with
     // evidence, a task must overlap one; without, fall back to the workload
     // heuristic and say so (`heuristic_fallback`).
-    let mut input_ts: Vec<f64> = events
-        .iter()
-        .filter(|e| is_scroll_input(e))
-        .map(|e| e.ts)
-        .collect();
     input_ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let trace_has_input = !input_ts.is_empty();
     let task_has_input = |lo: f64, hi: f64| -> bool {
         let start = input_ts.partition_point(|&t| t < lo);
         input_ts.get(start).is_some_and(|&t| t <= hi)
     };
-
-    // Overhead-corrected duration per event index (children inside a
-    // profiler-freeze span correct toward 0 so the artifact spike lands in
-    // no category).
-    let dur_of: Vec<f64> = events
-        .iter()
-        .map(|e| {
-            if e.tid == main_tid && e.ph == b'X' {
-                correct_event_dur(e, &overheads)
-            } else {
-                0.0
-            }
-        })
-        .collect();
 
     let mut tasks = Vec::new();
 
@@ -421,7 +430,7 @@ mod tests {
 
     fn ev(name: &str, ts: f64, dur: f64) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -436,7 +445,7 @@ mod tests {
 
     fn ev_args(name: &str, ts: f64, dur: f64, args: serde_json::Value) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -542,7 +551,7 @@ mod tests {
 
     fn ev_tid(name: &str, ts: f64, dur: f64, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'X',

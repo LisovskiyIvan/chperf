@@ -236,35 +236,36 @@ fn target_key(name: &str) -> Option<&'static str> {
 }
 
 pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
+    analyze_summary_multi(events, &[main_tid])
+        .into_iter()
+        .next()
+        .expect("one tid in, one result out")
+}
+
+/// Per-tid accumulators for one summary pass (see `analyze_summary_multi`).
+#[derive(Default)]
+struct SummaryTidAccum {
+    long_task_durs: Vec<f64>,
+    total_blocking_time_us: f64,
+    long_tasks_total_us: f64,
+    stats_map: rustc_hash::FxHashMap<&'static str, (f64, f64, usize)>,
+    runtask_total_us: f64,
+    busy_intervals: Vec<(f64, f64)>,
+}
+
+/// One `analyze_summary` per tid, sharing the profiler-overhead scan and
+/// the trace-bounds pass across tids. Per-tid durations, self times and
+/// accumulators are computed tid-by-tid (not fused into one loop) so peak
+/// transient stays one `dur_of`/`self` pair, and every per-tid accumulation
+/// visits events in the same order as `analyze_summary` — results are
+/// identical, including float summation order and map iteration order.
+pub fn analyze_summary_multi(events: &[TraceEvent], main_tids: &[u64]) -> Vec<SummaryResult> {
     let overheads = find_profiler_overhead(events);
-    // Single pass over the trace: duration bounds, long tasks, busy time, stats.
-    let mut long_task_durs: Vec<f64> = Vec::new();
-    let mut total_blocking_time_us = 0.0f64;
-    let mut long_tasks_total_us = 0.0f64;
-    let mut stats_map: rustc_hash::FxHashMap<&'static str, (f64, f64, usize)> =
-        rustc_hash::FxHashMap::default();
-    let mut runtask_total_us = 0.0f64;
-    let mut busy_intervals: Vec<(f64, f64)> = Vec::new();
+    // Trace bounds are tid-independent: one shared pass (metadata excluded,
+    // exactly like the single-tid loop below).
     let mut min_ts = f64::INFINITY;
     let mut max_ts = 0.0f64;
-
-    // Overhead-corrected duration per event index, then overlap-safe self
-    // time per main-thread X event (children inside profiler-freeze spans
-    // correct toward 0 via `correct_event_dur`, so the artifact spike lands
-    // in neither the inclusive nor the self column).
-    let dur_of: Vec<f64> = events
-        .iter()
-        .map(|e| {
-            if e.tid == main_tid && e.ph == b'X' {
-                correct_event_dur(e, &overheads)
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let self_of_all = main_thread_self_times(events, main_tid, &dur_of);
-
-    for (idx, e) in events.iter().enumerate() {
+    for e in events {
         if is_metadata_event(e) {
             continue;
         }
@@ -275,35 +276,71 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
         if end > max_ts {
             max_ts = end;
         }
-        if e.tid != main_tid || e.ph != b'X' {
-            continue;
-        }
-        if e.name == "RunTask" && e.dur.is_some() {
-            let eff = dur_of[idx];
-            runtask_total_us += eff;
-            if eff > 0.0 {
-                busy_intervals.push((e.ts, e.ts + eff));
-            }
-            if eff > 50_000.0 {
-                long_task_durs.push(eff);
-                total_blocking_time_us += eff - 50_000.0;
-                long_tasks_total_us += eff;
-            }
-        }
-        if let Some(key) = target_key(&e.name)
-            && e.dur.is_some()
-        {
-            let entry = stats_map.entry(key).or_default();
-            entry.0 += dur_of[idx];
-            entry.1 += self_of_all[idx];
-            entry.2 += 1;
-        }
     }
+    let total_trace_duration_us = (max_ts - min_ts).max(0.0);
 
+    main_tids
+        .iter()
+        .map(|&main_tid| {
+            let dur_of: Vec<f64> = events
+                .iter()
+                .map(|e| {
+                    if e.tid == main_tid && e.ph == b'X' {
+                        correct_event_dur(e, &overheads)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let self_of_all = main_thread_self_times(events, main_tid, &dur_of);
+            let mut acc = SummaryTidAccum::default();
+            for (idx, e) in events.iter().enumerate() {
+                if e.tid != main_tid || e.ph != b'X' {
+                    continue;
+                }
+                if e.name == "RunTask" && e.dur.is_some() {
+                    let eff = dur_of[idx];
+                    acc.runtask_total_us += eff;
+                    if eff > 0.0 {
+                        acc.busy_intervals.push((e.ts, e.ts + eff));
+                    }
+                    if eff > 50_000.0 {
+                        acc.long_task_durs.push(eff);
+                        acc.total_blocking_time_us += eff - 50_000.0;
+                        acc.long_tasks_total_us += eff;
+                    }
+                }
+                if let Some(key) = target_key(&e.name)
+                    && e.dur.is_some()
+                {
+                    let entry = acc.stats_map.entry(key).or_default();
+                    entry.0 += dur_of[idx];
+                    entry.1 += self_of_all[idx];
+                    entry.2 += 1;
+                }
+            }
+            finish_summary(acc, total_trace_duration_us)
+        })
+        .collect()
+}
+/// Finish one tid's summary: longest-task ranking, busy union, per-name
+/// stats. Split from the accumulation loop so single- and multi-tid paths
+/// share it exactly.
+fn finish_summary(
+    acc: SummaryTidAccum,
+    total_trace_duration_us: f64,
+) -> SummaryResult {
+    let SummaryTidAccum {
+        mut long_task_durs,
+        total_blocking_time_us,
+        long_tasks_total_us,
+        stats_map,
+        runtask_total_us,
+        mut busy_intervals,
+    } = acc;
     long_task_durs.sort_by(|a, b| b.partial_cmp(a).unwrap());
     let long_task_count = long_task_durs.len();
     let long_tasks_top: Vec<f64> = long_task_durs.into_iter().take(10).collect();
-    let total_trace_duration_us = (max_ts - min_ts).max(0.0);
 
     // Honest busy: union of effective RunTask intervals (sweep-merge,
     // O(n log n) via the sort; the linear merge keeps nesting/overlap from
@@ -368,7 +405,9 @@ pub fn analyze_summary(events: &[TraceEvent], main_tid: u64) -> SummaryResult {
     }
 }
 
-/// Per-renderer summaries: one `analyze_summary` per `ThreadModel` renderer.
+/// Per-renderer summaries: one summary per `ThreadModel` renderer, sharing
+/// the overhead scan and bounds pass across tids (see
+/// `analyze_summary_multi`).
 /// The full event list is passed each time with that renderer's tid as the
 /// main thread (events are NOT pre-filtered, so the trace window stays
 /// global while busy/long-task attribution is per-renderer). Tids are
@@ -377,14 +416,13 @@ pub fn analyze_summary_per_renderer(
     events: &[TraceEvent],
     model: &crate::trace::ThreadModel,
 ) -> Vec<(crate::trace::RendererThread, SummaryResult)> {
+    let tids: Vec<u64> = model.renderers.iter().map(|r| r.tid).collect();
+    let results = analyze_summary_multi(events, &tids);
     model
         .renderers
         .iter()
         .cloned()
-        .map(|r| {
-            let res = analyze_summary(events, r.tid);
-            (r, res)
-        })
+        .zip(results)
         .collect()
 }
 
@@ -394,7 +432,7 @@ mod tests {
 
     fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,

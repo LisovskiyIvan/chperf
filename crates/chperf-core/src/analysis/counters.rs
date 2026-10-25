@@ -106,7 +106,7 @@ mod tests {
 
     fn cev(ts: f64, name: &str, args: serde_json::Value) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'C',

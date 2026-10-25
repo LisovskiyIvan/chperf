@@ -125,6 +125,23 @@ pub fn analyze_jank_with_budget_and_bucket(
     budget_us: f64,
     bucket_ms: Option<f64>,
 ) -> JankResult {
+    analyze_jank_multi(events, &[main_tid], scope, budget_us, bucket_ms)
+        .into_iter()
+        .next()
+        .expect("one tid in, one result out")
+}
+
+/// One jank detection per tid, sharing the profiler-overhead scan, bounds,
+/// bucket attribution pass and dropped-frame total across tids. Per-tid
+/// busy/spike attribution visits events in the same order as the single-tid
+/// path, so results are identical.
+pub fn analyze_jank_multi(
+    events: &[TraceEvent],
+    main_tids: &[u64],
+    scope: Option<&Scope>,
+    budget_us: f64,
+    bucket_ms: Option<f64>,
+) -> Vec<JankResult> {
     let overheads = find_profiler_overhead(events);
     // One pass for both bounds: min_ts skips metadata events (their ts is the
     // process start), max_ts includes everything.
@@ -146,11 +163,19 @@ pub fn analyze_jank_with_budget_and_bucket(
         .unwrap_or(DEFAULT_BUCKET_MS);
     let bucket_us = (bucket_ms * 1000.0).max(1.0);
     let n = ((span_us / bucket_us).ceil() as usize).max(1);
-    let mut busy = vec![0.0f64; n];
-    let mut max_run = vec![0.0f64; n];
-    let mut max_faf = vec![0.0f64; n];
+    // Per-tid attribution plus global GPU/dropped buckets, filled in one
+    // shared event pass below (instead of one pass per tid).
+    let mut busy: Vec<Vec<f64>> = main_tids.iter().map(|_| vec![0.0f64; n]).collect();
+    let mut max_run: Vec<Vec<f64>> = main_tids.iter().map(|_| vec![0.0f64; n]).collect();
+    let mut max_faf: Vec<Vec<f64>> = main_tids.iter().map(|_| vec![0.0f64; n]).collect();
     let mut max_gpu = vec![0.0f64; n];
     let mut dropped = vec![0u32; n];
+    let mut tid_slot: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
+    for (slot, &tid) in main_tids.iter().enumerate() {
+        // First wins: a repeated tid must attribute to the same slot every
+        // time, matching repeated single-tid calls.
+        tid_slot.entry(tid).or_insert(slot);
+    }
 
     // When scoped, events outside the window are ignored entirely: hot-bucket
     // merging must not cross the window boundary either.
@@ -168,22 +193,25 @@ pub fn analyze_jank_with_budget_and_bucket(
         }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
         match e.name.as_str() {
-            "RunTask" if e.ph == b'X' && e.tid == main_tid => {
-                if e.dur.is_some() {
+            "RunTask" if e.ph == b'X' => {
+                if e.dur.is_some()
+                    && let Some(&slot) = tid_slot.get(&e.tid)
+                {
                     let eff = effective_runtask_dur(e, &overheads);
                     // Work-to-frame: smear busy across overlapped buckets;
                     // the max spike stays with the start bucket.
-                    attribute_busy(&mut busy, min_ts, bucket_us, e.ts, eff);
-                    if eff > max_run[b] {
-                        max_run[b] = eff;
+                    attribute_busy(&mut busy[slot], min_ts, bucket_us, e.ts, eff);
+                    if eff > max_run[slot][b] {
+                        max_run[slot][b] = eff;
                     }
                 }
             }
-            "FireAnimationFrame" if e.ph == b'X' && e.tid == main_tid => {
+            "FireAnimationFrame" if e.ph == b'X' => {
                 if let Some(d) = e.dur
-                    && d > max_faf[b]
+                    && let Some(&slot) = tid_slot.get(&e.tid)
+                    && d > max_faf[slot][b]
                 {
-                    max_faf[b] = d;
+                    max_faf[slot][b] = d;
                 }
             }
             "GPUTask" if e.ph == b'X' => {
@@ -200,6 +228,59 @@ pub fn analyze_jank_with_budget_and_bucket(
         }
     }
 
+    // Single source of truth for the total: the shared counter. The
+    // per-bucket loop above uses the identical predicate, so this equals
+    // the bucket sum.
+    let total_dropped: usize = crate::windowed::dropped_frames(events, scope);
+
+    main_tids
+        .iter()
+        .map(|&tid| {
+            // Slot lookup (not the position): repeated tids share the first
+            // slot's attribution, matching repeated single-tid calls.
+            let slot = tid_slot[&tid];
+            finish_jank_tid(
+                events,
+                scope,
+                win_lo,
+                win_hi,
+                min_ts,
+                bucket_us,
+                n,
+                budget_us,
+                bucket_ms,
+                &busy[slot],
+                &max_run[slot],
+                &max_faf[slot],
+                &max_gpu,
+                &dropped,
+                total_dropped,
+            )
+        })
+        .collect()
+}
+
+/// Per-tid tail of jank detection: merge hot buckets, rank clusters,
+/// attribute dominating FunctionCalls, build the result. Split from the
+/// shared attribution pass so single- and multi-tid paths share it exactly.
+#[allow(clippy::too_many_arguments)]
+fn finish_jank_tid(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    win_lo: Option<f64>,
+    win_hi: Option<f64>,
+    min_ts: f64,
+    bucket_us: f64,
+    n: usize,
+    budget_us: f64,
+    bucket_ms: f64,
+    busy: &[f64],
+    max_run: &[f64],
+    max_faf: &[f64],
+    max_gpu: &[f64],
+    dropped: &[u32],
+    total_dropped: usize,
+) -> JankResult {
     // Merge adjacent hot buckets into clusters.
     struct Acc {
         start: usize,
@@ -249,10 +330,9 @@ pub fn analyze_jank_with_budget_and_bucket(
         }
     }
 
-    // Single source of truth for the total: the shared counter. The
+    // `total_dropped` is the shared counter computed once by the caller: the
     // per-bucket loop above uses the identical predicate, so this equals
     // the bucket sum.
-    let total_dropped: usize = crate::windowed::dropped_frames(events, scope);
 
     // Rank: dropped frames first, then worst spike, then busy.
     accs.sort_by(|a, b| {
@@ -290,14 +370,20 @@ pub fn analyze_jank_with_budget_and_bucket(
             continue;
         }
         let b = (((e.ts - min_ts) / bucket_us) as usize).min(n - 1);
+        // Cheap gates first: most FunctionCalls fall outside the top
+        // clusters, so only parse args (a serde DOM build) for candidates.
+        let Some(ci) = in_cluster[b] else {
+            continue;
+        };
+        let Some(d) = e.dur else {
+            continue;
+        };
         let args = e.args_value();
-        if let Some(ci) = in_cluster[b]
-            && let Some(d) = e.dur
-            && let Some(name) = args
-                .as_ref()
-                .and_then(|a| a.get("data"))
-                .and_then(|d| d.get("functionName"))
-                .and_then(|v| v.as_str())
+        if let Some(name) = args
+            .as_ref()
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.get("functionName"))
+            .and_then(|v| v.as_str())
             && !name.is_empty()
         {
             *calls[ci].entry(name.to_string()).or_default() += d;
@@ -332,7 +418,9 @@ pub fn analyze_jank_with_budget_and_bucket(
     }
 }
 
-/// Per-renderer jank: one `analyze_jank` per `ThreadModel` renderer.
+/// Per-renderer jank: one detection per `ThreadModel` renderer, sharing
+/// the overhead scan, bounds, attribution pass and dropped total across
+/// tids (see `analyze_jank_multi`).
 /// The full event list is passed each time with that renderer's tid as the
 /// main thread (events are NOT pre-filtered, so buckets and the trace window
 /// stay global while busy/spike attribution is per-renderer). The budget is
@@ -343,14 +431,13 @@ pub fn analyze_jank_per_renderer(
     budget_us: Option<f64>,
 ) -> Vec<(crate::trace::RendererThread, JankResult)> {
     let budget = budget_us.unwrap_or_else(|| crate::windowed::detect_frame_budget_us(events));
+    let tids: Vec<u64> = model.renderers.iter().map(|r| r.tid).collect();
+    let results = analyze_jank_multi(events, &tids, None, budget, None);
     model
         .renderers
         .iter()
         .cloned()
-        .map(|r| {
-            let res = analyze_jank_with_budget(events, r.tid, None, budget);
-            (r, res)
-        })
+        .zip(results)
         .collect()
 }
 
@@ -360,7 +447,7 @@ mod tests {
 
     fn ev(name: &str, ph: u8, ts: f64, dur: Option<f64>, tid: u64) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph,

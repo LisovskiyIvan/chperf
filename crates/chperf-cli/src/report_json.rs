@@ -3,8 +3,9 @@
 //! inspect JSON conventions.
 
 use crate::app::App;
+use chperf_core::analysis::FindingSeverity;
 use chperf_core::{inspect, trace};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn ms(us: f64) -> f64 {
     (us / 1000.0 * 100.0).round() / 100.0
@@ -29,7 +30,7 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
         .unwrap_or(0)
         > 0;
 
-    let mut obj = serde_json::Map::new();
+    let mut obj = serde_json::Map::with_capacity(11);
     obj.insert("trace".into(), json!(app.trace_name_a));
     obj.insert(
         "trace_health".into(),
@@ -185,34 +186,33 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
     );
     obj.insert(
         "renderers".into(),
-        json!(
-            app.thread_model
-                .renderers
-                .iter()
-                .map(|r| {
-                    let sum = app
-                        .renderer_summaries
-                        .iter()
-                        .find(|(x, _)| x.tid == r.tid)
-                        .map(|(_, s)| s);
-                    let jk = app
-                        .renderer_janks
-                        .iter()
-                        .find(|(x, _)| x.tid == r.tid)
-                        .map(|(_, j)| j);
-                    json!({
-                        "pid": r.pid, "tid": r.tid, "name": r.name,
-                        "is_primary": r.tid == app.thread_model.primary.tid,
-                        "main_busy_us": sum.map(|s| s.main_thread_busy_us.round()),
-                        "runtask_total_us": sum.map(|s| s.runtask_total_us.round()),
-                        "long_task_count": sum.map(|s| s.long_task_count),
-                        "long_tasks_total_us": sum.map(|s| s.long_tasks_total_us.round()),
-                        "dropped_frames": jk.map(|j| j.total_dropped),
-                        "jank_clusters": jk.map(|j| j.clusters.len()),
-                    })
+        json!(app
+            .thread_model
+            .renderers
+            .iter()
+            .map(|r| {
+                let sum = app
+                    .renderer_summaries
+                    .iter()
+                    .find(|(x, _)| x.tid == r.tid)
+                    .map(|(_, s)| s);
+                let jk = app
+                    .renderer_janks
+                    .iter()
+                    .find(|(x, _)| x.tid == r.tid)
+                    .map(|(_, j)| j);
+                json!({
+                    "pid": r.pid, "tid": r.tid, "name": r.name,
+                    "is_primary": r.tid == app.thread_model.primary.tid,
+                    "main_busy_us": sum.map(|s| s.main_thread_busy_us.round()),
+                    "runtask_total_us": sum.map(|s| s.runtask_total_us.round()),
+                    "long_task_count": sum.map(|s| s.long_task_count),
+                    "long_tasks_total_us": sum.map(|s| s.long_tasks_total_us.round()),
+                    "dropped_frames": jk.map(|j| j.total_dropped),
+                    "jank_clusters": jk.map(|j| j.clusters.len()),
                 })
-                .collect::<Vec<_>>()
-        ),
+            })
+            .collect::<Vec<_>>()),
     );
     if has_memory {
         obj.insert("memory".into(), mem_json);
@@ -222,7 +222,11 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
             "compare".into(),
             json!({
                 "findings": cmp.findings.iter().map(|f| json!({
-                    "severity": format!("{:?}", f.severity),
+                    "severity": match &f.severity {
+                        FindingSeverity::Improved => "Improved",
+                        FindingSeverity::Regressed => "Regressed",
+                        FindingSeverity::Neutral => "Neutral",
+                    },
                     "category": f.category, "message": f.message, "detail": f.detail,
                 })).collect::<Vec<_>>(),
             }),

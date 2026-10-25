@@ -254,7 +254,7 @@ mod tests {
 
     fn ev_x(ts: f64, dur: f64, name: &str, args: Option<serde_json::Value>) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: name.into(),
             id: 0,
             has_id: false,
             ph: b'X',

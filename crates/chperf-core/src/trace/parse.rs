@@ -1,9 +1,10 @@
 //! The hand-rolled, block-parallel `traceEvents` tokenizer and `parse_trace`.
 
-use super::event::{normalize_id_bytes, parse_tid_pid_str, take_serde_malformed};
+use super::event::{ArgsText, SharedStr, StrInterner, normalize_id_bytes, parse_tid_pid_str, take_serde_malformed};
 use super::{FrameInfo, TraceEvent, TraceFile, TraceMetadata};
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Counters for how a trace parsed. Filled by `parse_trace` (fast path,
 /// parallel pipeline and serde fallbacks all fold into the same counters):
@@ -26,11 +27,13 @@ pub struct ParseStats {
 /// (escaped strings, unterminated input) — the caller then falls back to a
 /// tolerant per-element serde parse on the pristine bytes. Wrong-typed but
 /// salvageable fields never bail: they coerce (counted in `stats`).
-fn parse_events_fast(
-    bytes: &[u8],
+fn parse_events_fast<'b>(
+    bytes: &'b [u8],
+    shared: &Arc<[u8]>,
     s: usize,
     e: usize,
     stats: &mut ParseStats,
+    ix: &mut StrInterner<'b>,
 ) -> Result<Vec<TraceEvent>, ()> {
     // ~200 bytes per event on Chrome traces: reserve to skip reallocs.
     let mut events: Vec<TraceEvent> = Vec::with_capacity((e - s).max(1) / 200);
@@ -48,7 +51,7 @@ fn parse_events_fast(
             p += 1;
             continue;
         }
-        let (ev, next) = parse_event_fast(bytes, p, stats)?;
+        let (ev, next) = parse_event_fast(bytes, shared, p, stats, ix)?;
         events.push(ev);
         stats.parsed += 1;
         p = next;
@@ -56,10 +59,12 @@ fn parse_events_fast(
     Ok(events)
 }
 
-fn parse_events_array_fast(
-    bytes: &[u8],
+fn parse_events_array_fast<'b>(
+    bytes: &'b [u8],
+    shared: &Arc<[u8]>,
     s: usize,
     stats: &mut ParseStats,
+    ix: &mut StrInterner<'b>,
 ) -> Result<(Vec<TraceEvent>, usize), ()> {
     let len = bytes.len();
     let mut p = skip_ws(bytes, s);
@@ -80,14 +85,14 @@ fn parse_events_array_fast(
             p += 1;
             continue;
         }
-        let (ev, next) = parse_event_fast(bytes, p, stats)?;
+        let (ev, next) = parse_event_fast(bytes, shared, p, stats, ix)?;
         events.push(ev);
         stats.parsed += 1;
         p = next;
     }
 }
 
-fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
+fn parse_trace_fast<'b>(bytes: &'b [u8], shared: &Arc<[u8]>) -> Result<TraceFile, ()> {
     let len = bytes.len();
     let mut p = skip_ws(bytes, 0);
     if p >= len || bytes[p] != b'{' {
@@ -97,6 +102,9 @@ fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
     let mut trace_events: Option<Vec<TraceEvent>> = None;
     let mut metadata_span: Option<(usize, usize)> = None;
     let mut stats = ParseStats::default();
+    // Names + cats share one interner (~350 distinct values per trace):
+    // every repeat event clones instead of allocating.
+    let mut ix = StrInterner::with_capacity(512);
 
     loop {
         p = skip_ws(bytes, p);
@@ -122,7 +130,7 @@ fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
             return Err(());
         }
         if key == b"traceEvents" {
-            let (evs, next_p) = parse_events_array_fast(bytes, p, &mut stats)?;
+            let (evs, next_p) = parse_events_array_fast(bytes, shared, p, &mut stats, &mut ix)?;
             trace_events = Some(evs);
             p = next_p;
         } else if key == b"metadata" {
@@ -151,10 +159,12 @@ fn parse_trace_fast(bytes: &[u8]) -> Result<TraceFile, ()> {
 /// fields coerce in place (numeric strings for ts/dur/pid/tid, clamped
 /// negative dur) and count `malformed`; only constructs the serde fallback
 /// handles (escaped strings, unterminated input) return Err.
-fn parse_event_fast(
-    bytes: &[u8],
+fn parse_event_fast<'b>(
+    bytes: &'b [u8],
+    shared: &Arc<[u8]>,
     p: usize,
     stats: &mut ParseStats,
+    ix: &mut StrInterner<'b>,
 ) -> Result<(TraceEvent, usize), ()> {
     let len = bytes.len();
     let mut i = p;
@@ -162,7 +172,7 @@ fn parse_event_fast(
         return Err(());
     }
     let mut ev = TraceEvent {
-        name: String::new(),
+        name: SharedStr::default(),
         id: 0,
         has_id: false,
         ph: 0,
@@ -198,7 +208,7 @@ fn parse_event_fast(
         }
         match key {
             b"name" => {
-                let (v, a) = parse_string_owned(bytes, i)?;
+                let (v, a) = parse_string_interned(bytes, i, ix)?;
                 ev.name = v;
                 i = a;
             }
@@ -354,7 +364,7 @@ fn parse_event_fast(
                     i = skip_value(bytes, i)?;
                     ev.cat = None;
                 } else {
-                    let (v, a) = parse_string_owned(bytes, i)?;
+                    let (v, a) = parse_string_interned(bytes, i, ix)?;
                     ev.cat = Some(v);
                     i = a;
                 }
@@ -368,10 +378,12 @@ fn parse_event_fast(
                     ev.args = None;
                 } else {
                     let end = skip_value(bytes, i)?;
-                    let s = std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?;
-                    // Owned copy: the file buffer is freed after parsing,
-                    // so events must not borrow from it.
-                    ev.args = Some(Box::<str>::from(s));
+                    // Zero-copy span of the event's `args` slice: the shared
+                    // buffer outlives the events via `Arc` (see `ArgsText`).
+                    // UTF-8 is validated here so a non-UTF-8 `args` bails to
+                    // the tolerant serde path exactly like before.
+                    std::str::from_utf8(&bytes[i..end]).map_err(|_| ())?;
+                    ev.args = Some(ArgsText::shared(shared, i, end));
                     i = end;
                 }
             }
@@ -401,11 +413,40 @@ fn skip_ws(bytes: &[u8], mut p: usize) -> usize {
 
 /// Raw byte slice of a quoted key (without the quotes). Err on escaped or
 /// unterminated keys.
+///
+/// Fast path: trace keys come from a fixed vocabulary, so match the bytes
+/// after the opening quote directly (no `memchr` scan per key). Anything
+/// else — unknown keys, escapes — falls back to the generic scan, which
+/// preserves the exact bail contract (escaped keys go to serde).
 fn parse_key(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
-    let len = bytes.len();
-    if p >= len || bytes[p] != b'"' {
+    if p >= bytes.len() || bytes[p] != b'"' {
         return Err(());
     }
+    let rest = &bytes[p + 1..];
+    // Each arm checks the full `key"` literal: the trailing quote rules out
+    // longer keys with a common prefix (`"pid"` vs `"pi"`, `"id"` vs `"id2"`).
+    // A match also guarantees enough bytes remain for the slice below.
+    let (key, after): (&[u8], usize) = match rest.first() {
+        Some(b'n') if rest.starts_with(b"name\"") => (&bytes[p + 1..p + 5], p + 6),
+        Some(b'p') if rest.starts_with(b"ph\"") => (&bytes[p + 1..p + 3], p + 4),
+        Some(b'p') if rest.starts_with(b"pid\"") => (&bytes[p + 1..p + 4], p + 5),
+        Some(b't') if rest.starts_with(b"ts\"") => (&bytes[p + 1..p + 3], p + 4),
+        Some(b't') if rest.starts_with(b"tid\"") => (&bytes[p + 1..p + 4], p + 5),
+        Some(b'd') if rest.starts_with(b"dur\"") => (&bytes[p + 1..p + 4], p + 5),
+        Some(b'c') if rest.starts_with(b"cat\"") => (&bytes[p + 1..p + 4], p + 5),
+        Some(b'a') if rest.starts_with(b"args\"") => (&bytes[p + 1..p + 5], p + 6),
+        Some(b'i') if rest.starts_with(b"id\"") => (&bytes[p + 1..p + 3], p + 4),
+        Some(b'i') if rest.starts_with(b"id2\"") => (&bytes[p + 1..p + 4], p + 5),
+        _ => return parse_key_generic(bytes, p),
+    };
+    // A backslash inside the matched span is impossible (the literals hold
+    // none), so no escape check is needed on this path.
+    Ok((key, after))
+}
+
+/// Generic key scan: finds the closing quote, bailing on escapes (the serde
+/// fallback handles those). Returns (inner bytes, pos after closing quote).
+fn parse_key_generic(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
     match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
         Some(rel) => {
             let q = p + 1 + rel;
@@ -418,12 +459,16 @@ fn parse_key(bytes: &[u8], p: usize) -> Result<(&[u8], usize), ()> {
     }
 }
 
-/// Unescaped JSON string value (bytes between quotes), owned per event.
-/// Escaped strings are handled by the serde fallback. Returns (owned string,
-/// pos after closing quote).
-fn parse_string_owned(bytes: &[u8], p: usize) -> Result<(String, usize), ()> {
-    let len = bytes.len();
-    if p >= len || bytes[p] != b'"' {
+/// Unescaped JSON string value (bytes between quotes), interned per parse.
+/// Same bail contract as `parse_string_owned` (escaped/unterminated strings
+/// go to the serde fallback); the single allocation per distinct value is
+/// amortized over every event reusing it (see `StrInterner`).
+fn parse_string_interned<'b>(
+    bytes: &'b [u8],
+    p: usize,
+    ix: &mut StrInterner<'b>,
+) -> Result<(SharedStr, usize), ()> {
+    if p >= bytes.len() || bytes[p] != b'"' {
         return Err(());
     }
     match memchr::memchr2(b'"', b'\\', &bytes[p + 1..]) {
@@ -433,7 +478,7 @@ fn parse_string_owned(bytes: &[u8], p: usize) -> Result<(String, usize), ()> {
                 return Err(());
             }
             let s = std::str::from_utf8(&bytes[p + 1..q]).map_err(|_| ())?;
-            Ok((s.to_owned(), q + 1))
+            Ok((ix.intern(s), q + 1))
         }
         None => Err(()),
     }
@@ -859,11 +904,17 @@ fn count_unescaped_quotes(chunk: &[u8], prev_trail: usize) -> (usize, usize) {
 
 fn build_blocks(bytes: &[u8]) -> Blocks {
     let nb = bytes.len().div_ceil(BLOCK);
-    let _threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        .max(1);
-    let chunk_count = 1;
+    // Phase 1/2 are data-parallel across blocks; threads only pay off on
+    // big inputs (spawn + join ≈ 0.5ms). Serial below 4MB.
+    let chunk_count = if bytes.len() >= 4 * 1024 * 1024 {
+        std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(1)
+            .min(nb.max(1))
+            .max(1)
+    } else {
+        1
+    };
 
     // Phase 1: per-block quote parity is independent — count in parallel.
     let mut quote_parity = vec![false; nb];
@@ -1006,7 +1057,17 @@ fn state_at(bytes: &[u8], blocks: &Blocks, pos: usize) -> (i64, bool) {
 /// String-aware walk over a byte range, updating depth and in-string state.
 /// `esc` carries the escape-pending state in/out (a backslash whose escaped
 /// byte may lie past the end of the range).
+///
+/// A plain byte loop, deliberately: trace JSON is dense with structural
+/// bytes (~1 per 8), so SIMD-iterator versions lose (iterator per-hit cost
+/// exceeds the ~1ns per boring byte here; measured 228ms vs 189ms scan on a
+/// 959MB trace). Parallelism across 64KB blocks (see `build_blocks`) is the
+/// scaling lever, not per-byte speed.
 fn walk_range(r: &[u8], d: &mut i64, s: &mut bool, esc: &mut bool) {
+    // Empty ranges leave the state untouched.
+    if r.is_empty() {
+        return;
+    }
     let mut in_str = *s;
     let mut e = *esc;
     for &b in r {
@@ -1218,7 +1279,7 @@ type ParallelResult =
 /// the chunk. The buffer is freed when `parse_trace` returns; events own
 /// their data.
 fn parse_parallel(
-    bytes: &[u8],
+    shared: &Arc<[u8]>,
     layout: &Layout,
     blocks: &Blocks,
     threads: usize,
@@ -1231,13 +1292,13 @@ fn parse_parallel(
 
     // Per-unit: (unit index, chunk parse result).
     let results: Vec<(usize, ChunkResult)> = if threads <= 1 {
-        let r = chunk_work(bytes, blocks, layout.arr_open, layout.arr_close);
+        let r = chunk_work(shared, blocks, layout.arr_open, layout.arr_close);
         vec![(0, r)]
     } else {
         let unit = (span / (threads * 8)).clamp(BLOCK, 4 * 1024 * 1024);
         let n_units = span.div_ceil(unit).max(1);
         if n_units <= 1 {
-            let r = chunk_work(bytes, blocks, layout.arr_open, layout.arr_close);
+            let r = chunk_work(shared, blocks, layout.arr_open, layout.arr_close);
             vec![(0, r)]
         } else {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1250,11 +1311,9 @@ fn parse_parallel(
             let cursor = AtomicUsize::new(0);
             let out: std::sync::Mutex<Vec<(usize, ChunkResult)>> =
                 std::sync::Mutex::new(Vec::with_capacity(n_units));
-            let total_len = bytes.len();
             let arr_open = layout.arr_open;
             let arr_close = layout.arr_close;
             std::thread::scope(|s| {
-                let ptr: usize = bytes.as_ptr() as usize;
                 let cursor_ref = &cursor;
                 let out_ref = &out;
                 for _ in 0..workers {
@@ -1267,11 +1326,10 @@ fn parse_parallel(
                             let from = arr_open + idx * unit;
                             let to = (from + unit).min(arr_close);
                             let t0 = std::time::Instant::now();
-                            // Units are disjoint read-only slices sharing the
-                            // buffer through a raw pointer (scope-confined).
-                            let bytes =
-                                unsafe { std::slice::from_raw_parts(ptr as *const u8, total_len) };
-                            let r = chunk_work(bytes, blocks, from, to);
+                            // Units share the buffer through the `Arc`
+                            // (scope-confined borrow, no raw pointers): each
+                            // event's args span clones it cheaply.
+                            let r = chunk_work(shared, blocks, from, to);
                             if debug {
                                 eprintln!(
                                     "  [parse] chunk {}..{}: {:.1}ms, {} events",
@@ -1337,7 +1395,7 @@ fn parse_parallel(
     }
 
     let metadata = match layout.metadata {
-        Some((s, e)) => serde_json::from_slice::<TraceMetadata>(&bytes[s..e]).ok(),
+        Some((s, e)) => serde_json::from_slice::<TraceMetadata>(&shared[s..e]).ok(),
         None => None,
     };
     Ok((events, metadata, stats))
@@ -1348,11 +1406,12 @@ fn parse_parallel(
 /// walk visits only structural positions (memchr-accelerated), not every
 /// byte. The buffer is never mutated; owned ranges are disjoint per chunk.
 fn chunk_work(
-    bytes: &[u8],
+    shared: &Arc<[u8]>,
     blocks: &Blocks,
     from: usize,
     to: usize,
 ) -> Result<(Vec<TraceEvent>, ParseStats), String> {
+    let bytes: &[u8] = shared;
     let block = from / BLOCK;
     let start = block * BLOCK;
     let mut d = blocks.depth_at[block];
@@ -1462,7 +1521,8 @@ fn chunk_work(
     // coercions are counted in a temp (discarded when the fast path bails).
     let t_fast = std::time::Instant::now();
     let mut fast_stats = ParseStats::default();
-    if let Ok(events) = parse_events_fast(bytes, s, e, &mut fast_stats) {
+    let mut ix = StrInterner::with_capacity(512);
+    if let Ok(events) = parse_events_fast(bytes, shared, s, e, &mut fast_stats, &mut ix) {
         if std::env::var("CHPERF_DEBUG").is_ok() {
             eprintln!(
                 "  [parse] fast {}..{}: {:.1}ms, {} events",
@@ -1491,74 +1551,153 @@ fn chunk_work(
 pub(crate) static FAST_SINGLE_PASS_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Gzip footer ISIZE (last 4 bytes, LE u32): the exact uncompressed size for
+/// single-member files. `None` when unreadable or zero — never fail because
+/// of it; the caller falls back to a growable buffer.
+fn read_gz_isize(file: &std::fs::File) -> Option<usize> {
+    use std::io::Seek;
+    let len = file.metadata().ok()?.len();
+    if len < 4 {
+        return None;
+    }
+    let mut f = file.try_clone().ok()?;
+    f.seek(std::io::SeekFrom::End(-4)).ok()?;
+    let mut footer = [0u8; 4];
+    std::io::Read::read_exact(&mut f, &mut footer).ok()?;
+    // `try_clone` shares the seek offset with `file`: rewind so the caller
+    // decodes from the start, not from EOF.
+    f.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let isize = u32::from_le_bytes(footer) as usize;
+    if isize == 0 { None } else { Some(isize) }
+}
+
+/// Read exactly `len` bytes from `r` into a fresh refcounted buffer, failing
+/// when fewer bytes — or a further trailing byte — follow (the size wasn't
+/// exact after all: multi-member gzip, a wrapped ISIZE, a changed file).
+/// Zero-copy: the source writes straight into the `Arc` allocation instead
+/// of a `Vec` that `Arc::from` would then memcpy (the refcount header needs
+/// inline room a `Vec` buffer has no space for).
+fn read_exact_shared<R: Read>(mut r: R, len: usize) -> std::io::Result<Arc<[u8]>> {
+    let mut arc = Arc::<[u8]>::new_uninit_slice(len);
+    {
+        let buf: &mut [std::mem::MaybeUninit<u8>] =
+            Arc::get_mut(&mut arc).expect("fresh Arc is uniquely owned");
+        // SAFETY: `read_exact` fills the entire buffer or returns `Err`, so
+        // every byte is initialized exactly when it returns `Ok`. On `Err`
+        // the `Arc` is dropped holding only `MaybeUninit` (no drop needed).
+        let dst = unsafe { &mut *(buf as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+        r.read_exact(dst)?;
+    }
+    let mut extra = [0u8; 1];
+    if r.read(&mut extra)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing data past expected length",
+        ));
+    }
+    // SAFETY: `read_exact` succeeded above; the trailing probe only reads.
+    Ok(unsafe { arc.assume_init() })
+}
+
+/// Growable-buffer fallback for unknown Inexact sizes: read to end, strip a
+/// BOM, and convert (one copy, cold path only).
+fn read_vec_shared<R: Read>(
+    mut r: R,
+    capacity: usize,
+    path: &Path,
+) -> Result<Arc<[u8]>, Box<dyn std::error::Error>> {
+    let mut out = Vec::with_capacity(capacity);
+    r.read_to_end(&mut out)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    if out.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        out.drain(..3);
+    }
+    Ok(Arc::from(out))
+}
+
 pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>> {
     // Drop any stale serde-fallback counts (unit tests deserialize events
     // directly without draining).
     take_serde_malformed();
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    // Decompress (if .gz) and parse from an in-memory slice. This is far
-    // faster than streaming serde_json through the gzip decoder: zlib-rs
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    // Decompress (if .gz) straight into the refcounted parse buffer. This is
+    // far faster than streaming serde_json through the gzip decoder: zlib-rs
     // inflates at ~1.5GB/s, and `from_slice` skips reader indirection.
-    let mut bytes = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        // Preallocate from the gzip footer ISIZE (last 4 bytes, LE u32):
-        // a hint for the uncompressed size. Never fail because of it.
-        let hint: Option<usize> = (|| {
-            use std::io::Seek;
-            let len = file.metadata().ok()?.len();
-            if len < 4 {
-                return None;
-            }
-            file.seek(std::io::SeekFrom::End(-4)).ok()?;
-            let mut footer = [0u8; 4];
-            std::io::Read::read_exact(&mut file, &mut footer).ok()?;
-            file.seek(std::io::SeekFrom::Start(0)).ok()?;
-            let isize = u32::from_le_bytes(footer) as usize;
-            if isize == 0 {
-                return None;
-            }
-            Some(isize.min(1 << 30))
-        })();
-        let mut out = Vec::with_capacity(hint.map(|h| h + 32).unwrap_or(0));
-        flate2::read::GzDecoder::new(file)
-            .read_to_end(&mut out)
-            .map_err(|e| format!("{}: {}", path.display(), e))?;
-        out
+    // Decoding into the final `Arc` allocation (rather than a `Vec` that is
+    // then converted) avoids a whole-file copy: `Arc<[u8]>` carries its
+    // refcount inline, so `Arc::from(vec)` would memcpy the buffer.
+    let shared: Arc<[u8]> = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        // Exact size from the gzip footer ISIZE (last 4 bytes, LE u32).
+        // Never fail because of it: any mismatch falls back to a growable
+        // `Vec` (multi-member gzip, trailing data, corrupt footer).
+        let hint: Option<usize> = read_gz_isize(&file);
+        match hint {
+            Some(h) => match read_exact_shared(flate2::read::GzDecoder::new(file), h) {
+                Ok(shared) => shared,
+                Err(e) => {
+                    if std::env::var("CHPERF_DEBUG").is_ok() {
+                        eprintln!("  [parse] exact gz read failed ({e}), Vec fallback");
+                    }
+                    let file = std::fs::File::open(path)
+                        .map_err(|e| format!("{}: {}", path.display(), e))?;
+                    read_vec_shared(flate2::read::GzDecoder::new(file), h + 32, path)?
+                }
+            },
+            None => read_vec_shared(flate2::read::GzDecoder::new(file), 0, path)?,
+        }
     } else {
-        let mut out = Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
-        file.take(u64::MAX)
-            .read_to_end(&mut out)
-            .map_err(|e| format!("{}: {}", path.display(), e))?;
-        out
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        match usize::try_from(len).ok() {
+            Some(h) if h > 0 => match read_exact_shared(file, h) {
+                Ok(shared) => shared,
+                Err(_) => {
+                    let file = std::fs::File::open(path)
+                        .map_err(|e| format!("{}: {}", path.display(), e))?;
+                    read_vec_shared(file, h.saturating_add(1), path)?
+                }
+            },
+            _ => read_vec_shared(file, 0, path)?,
+        }
     };
     // Strip a UTF-8 BOM so every downstream path (fast single-pass, block
     // scan, serde) sees the same `{`-first buffer. Without this the fast
     // path bails (first byte isn't `{`) and relies on the slower fallbacks.
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        bytes.drain(..3);
-    }
+    // The BOM essentially never occurs, so a strip copies (once, cold).
+    let shared: Arc<[u8]> = if shared.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Arc::from(&shared[3..])
+    } else {
+        shared
+    };
     // LIFETIME NOTE — no leaks on this path by design.
     //
-    // Every `TraceEvent` owns its strings: the fast tokenizer copies each
-    // event's `name`/`cat`/`args` slices into owned `String`/`Box<str>`
-    // values, and the serde fallback does the same from its owned `Value`s.
-    // Nothing borrows from the file buffer, so the buffer below is an
-    // ordinary local and is freed when this function returns. Repeated
-    // `parse_trace` calls retain no memory.
+    // The file buffer is wrapped in an `Arc` and every event's `args` is a
+    // zero-copy span of it (see `ArgsText`): no per-event `args` copies, and
+    // the buffer lives exactly as long as any event references it. `name`/
+    // `cat` are small owned `String`s copied out per event; the serde
+    // fallback owns small dedicated buffers per event. Nothing borrows from
+    // a local, so repeated `parse_trace` calls retain no memory.
     //
     // (History: `args` used to be `Option<&'static str>` borrowed zero-copy
     // from a `Box::leak`ed whole-file buffer, plus a leaked name/category
     // interner and per-event leaks on the serde path — one file-sized leak
-    // per call. The owned model costs one small copy per event string;
-    // see the throughput test below for the measured budget.)
+    // per call. The `Arc`-span model keeps the zero-copy win with none of
+    // the leaks; see the throughput test below for the measured budget.)
 
     // Fast path: single-pass top-level + traceEvents parse without
-    // pre-scanning 64KB blocks across the buffer. Events own their
-    // strings, so the buffer below is freed when parsing finishes.
+    // pre-scanning 64KB blocks across the buffer.
     let debug = std::env::var("CHPERF_DEBUG").is_ok();
     let mut trace: Option<TraceFile> = None;
     let mut scan_none = false;
     let t_fast = std::time::Instant::now();
-    if let Ok(tf) = parse_trace_fast(&bytes) {
+    // Route big traces straight to the block-parallel path: the serial fast
+    // path tokenizes ~1GB/s, so above ~16MB decoded the parallel scan +
+    // tokenize wins despite its fixed costs (measured tokenize: 245MB
+    // 180→78ms, 959MB 980→436ms). Small traces stay serial (no
+    // thread/scan tax) and unusual layouts still fall through below.
+    let go_parallel = shared.len() >= 16 * 1024 * 1024;
+    if !go_parallel
+        && let Ok(tf) = parse_trace_fast(&shared, &shared)
+    {
         #[cfg(test)]
         FAST_SINGLE_PASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if debug {
@@ -1571,7 +1710,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
         trace = Some(tf);
     } else {
         let t_scan = std::time::Instant::now();
-        if let Some((layout, blocks)) = scan_layout(&bytes) {
+        if let Some((layout, blocks)) = scan_layout(&shared) {
             if debug {
                 eprintln!(
                     "  [parse] scan {:.1}ms: array {}..{}, metadata={}",
@@ -1586,7 +1725,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             if debug {
                 eprintln!("  [parse] threads: {}", threads);
             }
-            match parse_parallel(&bytes, &layout, &blocks, threads) {
+            match parse_parallel(&shared, &layout, &blocks, threads) {
                 Ok((trace_events, metadata, stats)) => {
                     if debug {
                         eprintln!(
@@ -1618,20 +1757,20 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     let mut trace = match trace {
         Some(t) => t,
         None => {
-            if scan_none && memchr::memmem::find(&bytes, b"traceEvents").is_none() {
+            if scan_none && memchr::memmem::find(&shared, b"traceEvents").is_none() {
                 return Err(format!(
                     "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
                     path.display()
                 )
                 .into());
             }
-            match serde_json::from_slice::<TraceFile>(&bytes) {
+            match serde_json::from_slice::<TraceFile>(&shared) {
                 Ok(mut t) => {
                     t.stats.parsed = t.trace_events.len();
                     t.stats.malformed += take_serde_malformed();
                     t
                 }
-                Err(_) => parse_trace_tolerant(&bytes, path)?,
+                Err(_) => parse_trace_tolerant(&shared, path)?,
             }
         }
     };
@@ -2083,7 +2222,7 @@ mod tests {
             giant_end > to + BLOCK,
             "giant must close well beyond to + BLOCK"
         );
-        let buf = bytes.clone();
+        let buf: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes.clone());
         let (first, _) = chunk_work(&buf, &blocks, layout.arr_open, to).expect("chunk 1");
         assert_eq!(first.len(), 2, "first chunk owns tiny + giant");
         assert_eq!(first[0].name, "Tiny");
@@ -2125,7 +2264,7 @@ mod tests {
         let (layout, blocks) = scan_layout(&bytes).expect("layout");
         let mut all: Vec<Vec<super::super::TraceEvent>> = Vec::new();
         for threads in [1usize, 3, 4] {
-            let buf = bytes.clone();
+            let buf: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes.clone());
             let (evs, _, _) = parse_parallel(&buf, &layout, &blocks, threads).expect("parallel");
             assert_eq!(evs.len(), 1000, "threads={threads}");
             all.push(evs);

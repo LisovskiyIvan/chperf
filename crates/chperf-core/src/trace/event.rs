@@ -1,10 +1,11 @@
 //! The parsed trace event model (fully owned, no borrowed buffers).
 //!
-//! Every `TraceEvent` owns its strings (`name`, `cat`, `args`). Parsing
-//! copies the small slices it needs out of the file buffer and drops the
-//! buffer afterwards, so a parsed `TraceFile` is self-contained: no
-//! `Box::leak`, no `mem::forget`, no `'static` transmutes anywhere on the
-//! parse path, and repeated `parse_trace` calls retain no memory.
+//! Every `TraceEvent` owns its strings (`name`/`cat` shared via refcounted
+//! interning, `args` as buffer spans). Parsing shares the small slices it
+//! needs out of the file buffer and drops the buffer with the last event,
+//! so a parsed `TraceFile` is self-contained: no `Box::leak`, no
+//! `mem::forget`, no `'static` transmutes anywhere on the parse path, and
+//! repeated `parse_trace` calls retain no memory.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,6 +29,230 @@ pub(crate) fn take_serde_malformed() -> usize {
     SERDE_MALFORMED.with(|c| c.replace(0))
 }
 
+/// Reference-counted shared string for event `name`/`cat`.
+///
+/// Chrome traces reuse a tiny vocabulary (~300 names, ~30 cats across ~1M
+/// events), so one `String` per event is ~2M small allocations of duplicated
+/// bytes. `SharedStr` clones by bumping an `Arc` instead, and the fast
+/// tokenizer interns through [`StrInterner`] so each distinct value allocates
+/// exactly once per parse. Reads like `&str`: [`Self::as_str`], `Deref`,
+/// `Display`, `PartialEq<&str>` and friends cover every existing use, and
+/// `Debug`/`Serialize` render exactly like `String` so outputs are unchanged.
+#[derive(Clone)]
+pub struct SharedStr(std::sync::Arc<str>);
+
+impl SharedStr {
+    /// Empty string (no allocation: the empty `Arc<str>`).
+    pub fn empty() -> Self {
+        Self(std::sync::Arc::from(""))
+    }
+
+    /// Borrow as `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for SharedStr {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::ops::Deref for SharedStr {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for SharedStr {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for SharedStr {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Debug for SharedStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for SharedStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq for SharedStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SharedStr {}
+
+impl std::hash::Hash for SharedStr {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state)
+    }
+}
+
+impl PartialOrd for SharedStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SharedStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+macro_rules! shared_str_eq {
+    ($($rhs:ty),*) => {$(
+        impl PartialEq<$rhs> for SharedStr {
+            #[inline]
+            fn eq(&self, other: &$rhs) -> bool {
+                self.as_str() == &other[..]
+            }
+        }
+        impl PartialEq<SharedStr> for $rhs {
+            #[inline]
+            fn eq(&self, other: &SharedStr) -> bool {
+                &self[..] == other.as_str()
+            }
+        }
+    )*};
+}
+
+shared_str_eq!(str, &'_ str, String, &'_ String);
+
+impl From<&str> for SharedStr {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self(std::sync::Arc::from(s))
+    }
+}
+
+impl From<String> for SharedStr {
+    #[inline]
+    fn from(s: String) -> Self {
+        Self(std::sync::Arc::from(s))
+    }
+}
+
+impl From<Box<str>> for SharedStr {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        Self(std::sync::Arc::from(s))
+    }
+}
+
+impl serde::Serialize for SharedStr {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// Per-parse name/category interner: one allocation per distinct value.
+/// Keys borrow the parse buffer (valid for the whole parse); values own
+/// their `Arc<str>`, so interned strings outlive the parse. Single-threaded
+/// by design — each parse thread (fast path, parallel chunks) holds its own.
+#[derive(Default)]
+pub(crate) struct StrInterner<'a> {
+    map: rustc_hash::FxHashMap<&'a str, SharedStr>,
+}
+
+impl<'a> StrInterner<'a> {
+    pub(crate) fn with_capacity(n: usize) -> Self {
+        Self {
+            map: rustc_hash::FxHashMap::with_capacity_and_hasher(
+                n,
+                rustc_hash::FxBuildHasher,
+            ),
+        }
+    }
+
+    /// The shared string for `s` (already UTF-8 validated by the caller):
+    /// a clone on hit, a single allocation on first sight.
+    pub(crate) fn intern(&mut self, s: &'a str) -> SharedStr {
+        if let Some(v) = self.map.get(s) {
+            return v.clone();
+        }
+        let v = SharedStr::from(s);
+        self.map.insert(s, v.clone());
+        v
+    }
+}
+
+/// Zero-copy `args` text: a span of a shared JSON buffer.
+///
+/// The fast tokenizer never copies `args` (often the largest per-event
+/// payload — ~140MB on a 663K-event trace): each event holds an `Arc` to the
+/// whole uncompressed buffer plus its byte span. The buffer lives exactly as
+/// long as any event references it and is freed with the last event — no
+/// leaks, no lifetime parameters on `TraceEvent`. Cloning an event (B/E
+/// pairing, synthetic `X`) bumps a refcount instead of copying kilobytes.
+///
+/// The serde fallback and test paths own small dedicated buffers instead of
+/// sharing (see `ArgsText::copy`).
+#[derive(Clone, Debug)]
+pub struct ArgsText {
+    buf: std::sync::Arc<[u8]>,
+    start: u32,
+    len: u32,
+}
+
+impl ArgsText {
+    /// Span of a shared buffer (the fast parse path). Falls back to a
+    /// dedicated copy when the span exceeds `u32` (a >4GB buffer — never in
+    /// practice; Chrome traces are orders of magnitude smaller).
+    pub(crate) fn shared(buf: &std::sync::Arc<[u8]>, start: usize, end: usize) -> Self {
+        match (u32::try_from(start), u32::try_from(end.saturating_sub(start))) {
+            (Ok(s), Ok(l)) => Self {
+                buf: std::sync::Arc::clone(buf),
+                start: s,
+                len: l,
+            },
+            _ => Self::copy(std::str::from_utf8(buf.get(start..end).unwrap_or(b"")).unwrap_or("")),
+        }
+    }
+
+    /// Owned copy of a small string (serde fallback, tests).
+    pub(crate) fn copy(s: &str) -> Self {
+        debug_assert!(s.len() <= u32::MAX as usize);
+        Self {
+            buf: std::sync::Arc::from(s.as_bytes()),
+            start: 0,
+            len: u32::try_from(s.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The text, or `None` when the span is out of bounds or not UTF-8
+    /// (cannot happen for parser-built values — the fast path validates —
+    /// but cheap to guarantee).
+    pub fn as_str(&self) -> Option<&str> {
+        let s = self.start as usize;
+        let l = self.len as usize;
+        std::str::from_utf8(self.buf.get(s..s.saturating_add(l))?).ok()
+    }
+}
 /// FNV-1a 64 over the id string bytes. Shared by the fast tokenizer and the
 /// serde fallback so both paths map a non-numeric id to the same `u64`, and
 /// `s`/`f` pairing by `(pid, id)` agrees across paths.
@@ -99,17 +324,22 @@ pub(crate) fn parse_tid_pid_str(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// A single parsed event. All strings are owned (`String` / `Box<str>`):
-/// parsing copies each event's slices out of the file buffer, so the buffer
-/// is freed when parsing finishes and a `TraceFile` never borrows from it.
+/// A single parsed event. `name`/`cat` are interned shared strings (see
+/// `SharedStr`/`StrInterner`): cloning an event bumps refcounts instead of
+/// copying, and `args` is a zero-copy span of the shared parse buffer (see
+/// `ArgsText`) — parsing copies only the small slices it needs, and the
+/// buffer is freed with the last event referencing it, so a parsed
+/// `TraceFile` is self-contained: no `Box::leak`, no `mem::forget`, no
+/// `'static` transmutes anywhere on the parse path, and repeated
+/// `parse_trace` calls retain no memory.
 /// `name`/`cat` values repeat heavily across a trace; the per-event cost is
-/// one small allocation each (see the parse-throughput test in `parse.rs`).
+/// a refcount bump each (see the parse-throughput test in `parse.rs`).
 /// `ph` is a single byte, so the struct stays compact.
 #[derive(Clone, Debug)]
 pub struct TraceEvent {
-    /// Event name (owned per event; Chrome traces reuse a small vocabulary,
-    /// so these compress well but are not shared between events).
-    pub name: String,
+    /// Event name (interned; Chrome traces reuse a small vocabulary, so
+    /// these compress well and are shared between events).
+    pub name: SharedStr,
     /// Async id: pairs `s` (start) / `f` (finish) events with the same
     /// `(pid, id)`. `0` unless `has_id` is set — `0` is a valid Chrome id
     /// (GC jobs use it), so it cannot serve as an absence sentinel. Placed
@@ -128,12 +358,12 @@ pub struct TraceEvent {
     #[allow(dead_code)]
     pub pid: u64,
     #[allow(dead_code)]
-    /// Event category (owned; a few dozen distinct values repeat across the
-    /// trace, so this compresses well but is not shared between events).
-    pub cat: Option<String>,
-    /// Raw `args` JSON text (owned copy of the event's `args` slice).
+    /// Event category (interned; a few dozen distinct values repeat across
+    /// the trace, so this compresses well and is shared between events).
+    pub cat: Option<SharedStr>,
+    /// Raw `args` JSON text (zero-copy span of the shared parse buffer).
     /// Parsed on demand via `args_value`; no JSON DOM is retained.
-    pub args: Option<Box<str>>,
+    pub args: Option<ArgsText>,
 }
 
 impl<'de> Deserialize<'de> for TraceEvent {
@@ -175,11 +405,11 @@ impl<'de> Deserialize<'de> for TraceEvent {
             h.id.as_ref()
                 .and_then(id_from_value)
                 .or_else(|| h.id2.as_ref().and_then(id2_from_value));
-        // Owned copy of the raw `args` slice: the source buffer is freed
-        // after parsing, so events must not borrow from it.
-        let args = h.args.map(|r| Box::<str>::from(r.get()));
+        // Zero-copy span of the raw `args` slice (the source buffer outlives
+        // the events via `Arc`; see `ArgsText`).
+        let args = h.args.map(|r| ArgsText::copy(r.get()));
         Ok(TraceEvent {
-            name: h.name,
+            name: SharedStr::from(h.name),
             id: id_opt.unwrap_or(0),
             has_id: id_opt.is_some(),
             ph: h.ph.as_bytes().first().copied().unwrap_or(0),
@@ -187,7 +417,7 @@ impl<'de> Deserialize<'de> for TraceEvent {
             dur: h.dur,
             tid: h.tid,
             pid: h.pid,
-            cat: h.cat,
+            cat: h.cat.map(SharedStr::from),
             args,
         })
     }
@@ -292,11 +522,11 @@ where
 
 /// Test helper: build an event `args` field from a JSON value (owned copy).
 #[cfg(test)]
-pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<str>> {
+pub(crate) fn test_args(v: serde_json::Value) -> Option<ArgsText> {
     if v.is_null() {
         None
     } else {
-        Some(serde_json::to_string(&v).unwrap().into_boxed_str())
+        Some(ArgsText::copy(&serde_json::to_string(&v).unwrap()))
     }
 }
 
@@ -337,10 +567,16 @@ pub(crate) fn test_args(v: serde_json::Value) -> Option<Box<str>> {
 pub fn normalize_be_pairs(events: &mut Vec<TraceEvent>) -> usize {
     let orig_len = events.len();
     // Per-(thread, name) stack of unmatched begins (owned event copies).
-    let mut stacks: rustc_hash::FxHashMap<(u64, u64, String), Vec<TraceEvent>> =
+    let mut stacks: rustc_hash::FxHashMap<(u64, u64, SharedStr), Vec<TraceEvent>> =
         rustc_hash::FxHashMap::default();
     let mut made = 0usize;
     for i in 0..orig_len {
+        // Non-begin/end events never touch the stacks: skip the deep clone
+        // (typical traces carry a handful of B/E events among ~1M X events).
+        let ph = events[i].ph;
+        if ph != b'B' && ph != b'E' {
+            continue;
+        }
         // Clone the begin/end event: the stacks own their entries and the
         // synthetic `X` clones the begin's strings.
         let e = events[i].clone();
@@ -387,7 +623,7 @@ impl TraceEvent {
     /// Raw `args` JSON text, or `None`.
     #[inline]
     pub fn args_raw(&self) -> Option<&str> {
-        self.args.as_deref()
+        self.args.as_ref().and_then(|a| a.as_str())
     }
 }
 
@@ -405,7 +641,7 @@ mod tests {
         args: Option<&str>,
     ) -> TraceEvent {
         TraceEvent {
-            name: name.to_owned(),
+            name: SharedStr::from(name),
             id: 0,
             has_id: false,
             ph,
@@ -413,8 +649,8 @@ mod tests {
             dur: None,
             tid,
             pid,
-            cat: cat.map(str::to_owned),
-            args: args.map(Box::<str>::from),
+            cat: cat.map(SharedStr::from),
+            args: args.map(ArgsText::copy),
         }
     }
 
@@ -422,7 +658,7 @@ mod tests {
     #[test]
     fn be_pairs_synthesize_x_without_removing_originals() {
         let cat = "devtools.timeline".to_owned();
-        let args: Box<str> = r#"{"x":1}"#.into();
+        let args = r#"{"x":1}"#;
         let mut events = vec![
             be("RunTask", b'B', 0.0, 1, 1, Some(&cat), Some(&args)),
             be("FunctionCall", b'B', 10_000.0, 1, 1, None, None),
@@ -442,7 +678,7 @@ mod tests {
         assert_eq!(rt.dur, Some(100_000.0));
         assert_eq!((rt.pid, rt.tid), (1, 1));
         assert_eq!(rt.cat.as_deref(), Some(cat.as_str()));
-        assert_eq!(rt.args.as_deref(), Some(args.as_ref() as &str));
+        assert_eq!(rt.args.as_ref().and_then(|a| a.as_str()), Some(args));
         let fc = xs.iter().find(|e| e.name == "FunctionCall").unwrap();
         assert_eq!((fc.ts, fc.dur), (10_000.0, Some(20_000.0)));
     }
@@ -494,7 +730,7 @@ mod tests {
         for i in 0..n {
             let name = format!("Fn{i}");
             events.push(TraceEvent {
-                name,
+                name: SharedStr::from(name),
                 id: 0,
                 has_id: false,
                 ph: b'B',
@@ -509,7 +745,7 @@ mod tests {
         for i in 0..n {
             let name = format!("Fn{i}");
             events.push(TraceEvent {
-                name,
+                name: SharedStr::from(name),
                 id: 0,
                 has_id: false,
                 ph: b'E',
@@ -654,7 +890,7 @@ mod tests {
         assert!(without_args.args_value().is_none());
 
         let invalid = TraceEvent {
-            name: "E".to_owned(),
+            name: "E".into(),
             id: 0,
             has_id: false,
             ph: b'X',
@@ -663,7 +899,7 @@ mod tests {
             tid: 0,
             pid: 0,
             cat: None,
-            args: Some("{not valid json".into()),
+            args: Some(ArgsText::copy("{not valid json")),
         };
         assert!(invalid.args_value().is_none());
         assert!(invalid.args_value().is_none());
