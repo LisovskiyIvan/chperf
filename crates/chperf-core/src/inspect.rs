@@ -1980,6 +1980,15 @@ fn downsample_indices(n: usize, top: usize) -> Vec<usize> {
     (0..top).map(|k| k * (n - 1) / denom).collect()
 }
 
+/// Cheap pre-check for [`memory_section`]: true when the trace holds any
+/// `UpdateCounters` (phase `I`) event. Lets callers skip the full memory
+/// sweep (which materializes every sample) on traces with no memory data.
+pub fn has_memory_samples(events: &[TraceEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| e.name == "UpdateCounters" && e.ph == b'I')
+}
+
 /// Memory timeline: `UpdateCounters` (phase `I`) samples carry the JS heap
 /// size and DOM node / document / event-listener counts. Renders a peak &
 /// growth summary plus a (downsampled) timeline; JSON returns every sample.
@@ -3103,10 +3112,10 @@ pub fn loading_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let kept: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
+    let kept = events.iter().filter(|e| scope.allows_event(e));
     let main_tid = crate::trace::detect_main_thread(events);
-    let r = crate::analysis::analyze_loading(&kept);
-    let official = crate::analysis::analyze_long_tasks_official(&kept, main_tid);
+    let r = crate::analysis::analyze_loading(kept.clone());
+    let official = crate::analysis::analyze_long_tasks_official(kept, main_tid);
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -3253,9 +3262,9 @@ pub fn network_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let kept: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
+    let kept = events.iter().filter(|e| scope.allows_event(e));
     let main_tid = crate::trace::detect_main_thread(events);
-    let r = crate::analysis::analyze_network(&kept, main_tid);
+    let r = crate::analysis::analyze_network(kept, main_tid);
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -3335,9 +3344,9 @@ pub fn raster_section(
     top: usize,
     min_ts: f64,
 ) -> (String, Value) {
-    let kept: Vec<&TraceEvent> = events.iter().filter(|e| scope.allows_event(e)).collect();
+    let kept = events.iter().filter(|e| scope.allows_event(e));
     let main_tid = crate::trace::detect_main_thread(events);
-    let r = crate::analysis::analyze_raster(&kept, main_tid);
+    let r = crate::analysis::analyze_raster(kept, main_tid);
 
     let mut out = String::new();
     out.push_str(&format!(

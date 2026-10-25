@@ -180,7 +180,10 @@ fn fold_meta(b: &mut Build, data: &serde_json::Value) {
     }
 }
 
-pub fn analyze_network(events: &[&TraceEvent], main_tid: u64) -> NetworkResult {
+pub fn analyze_network<'a>(
+    events: impl IntoIterator<Item = &'a TraceEvent>,
+    main_tid: u64,
+) -> NetworkResult {
     let mut builds: FxHashMap<String, Build> = FxHashMap::default();
     let mut order: Vec<String> = Vec::new();
 
@@ -429,7 +432,7 @@ mod tests {
                 req("1", serde_json::json!({})),
             ),
         ];
-        let r = analyze_network(&events.iter().collect::<Vec<_>>(), 1);
+        let r = analyze_network(events.iter(), 1);
         assert_eq!(r.request_count, 1);
         assert_eq!(r.incomplete, 0);
         assert_eq!(r.render_blocking_count, 1);
@@ -474,7 +477,7 @@ mod tests {
             // No requestId at all: ignored, must not crash.
             ev("ResourceFinish", 9_000.0, None, 2),
         ];
-        let r = analyze_network(&events.iter().collect::<Vec<_>>(), 1);
+        let r = analyze_network(events.iter(), 1);
         assert_eq!(r.request_count, 2);
         assert_eq!(r.incomplete, 2);
         assert_eq!(r.cache_hits, 1);
@@ -514,7 +517,7 @@ mod tests {
             ),
             ev_args("ResourceFinish", 10.0, 1, req("f", serde_json::json!({}))),
         ];
-        let r = analyze_network(&events.iter().collect::<Vec<_>>(), 1);
+        let r = analyze_network(events.iter(), 1);
         assert_eq!(r.request_count, 3);
         let x = r.requests.iter().find(|q| q.is_xhr).unwrap();
         assert_eq!(x.url, "https://x/api");

@@ -117,15 +117,15 @@ pub(crate) fn load_and_analyze(
         )
     };
     // Single-trace report sections (also used uncompared in compare mode).
-    // Scope-filtered passes borrow event refs instead of cloning the trace.
-    let refs: Vec<&trace::TraceEvent> = events.iter().collect();
+    // The analysis passes take lazy event iterators: no `Vec<&Event>`
+    // materialization (8B x N events transient) on this path.
     // Independent and read-only: run concurrently (each is 10-25ms on big
     // traces; the scope join costs microseconds).
     let (loading, network, raster, official_long_tasks) = std::thread::scope(|s| {
-        let a = s.spawn(|| analysis::analyze_loading(&refs));
-        let b = s.spawn(|| analysis::analyze_network(&refs, main_tid));
-        let c = s.spawn(|| analysis::analyze_raster(&refs, main_tid));
-        let d = s.spawn(|| analysis::analyze_long_tasks_official(&refs, main_tid));
+        let a = s.spawn(|| analysis::analyze_loading(events.iter()));
+        let b = s.spawn(|| analysis::analyze_network(events.iter(), main_tid));
+        let c = s.spawn(|| analysis::analyze_raster(events.iter(), main_tid));
+        let d = s.spawn(|| analysis::analyze_long_tasks_official(events.iter(), main_tid));
         (
             a.join().unwrap(),
             b.join().unwrap(),

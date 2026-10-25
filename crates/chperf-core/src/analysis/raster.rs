@@ -58,12 +58,16 @@ fn is_decode_hotspot(name: &str) -> bool {
     matches!(name, "Decode Image" | "DecodeImage" | "PaintImage")
 }
 
-pub fn analyze_raster(events: &[&TraceEvent], main_tid: u64) -> RasterResult {
+pub fn analyze_raster<'a>(
+    events: impl IntoIterator<Item = &'a TraceEvent> + Clone,
+    main_tid: u64,
+) -> RasterResult {
     let _ = main_tid;
     // Thread names from `thread_name` metadata (single pre-pass; metadata
-    // events are cheap to match by interned name).
+    // events are cheap to match by interned name). The pre-pass clones the
+    // iterator; the main pass below consumes it.
     let mut names: FxHashMap<u64, String> = FxHashMap::default();
-    for e in events {
+    for e in events.clone() {
         if e.name == "thread_name"
             && let Some(n) = e
                 .args_value()
@@ -247,7 +251,7 @@ mod tests {
             2,
             serde_json::json!({"data": {"url": "https://x/img.png"}}),
         ));
-        let r = analyze_raster(&events.iter().collect::<Vec<_>>(), 1);
+        let r = analyze_raster(events.iter(), 1);
         assert_eq!(r.total_raster_us, 800.0);
         assert_eq!(r.total_decode_us, 1_400.0);
         assert_eq!(r.total_composite_us, 100.0);
@@ -270,7 +274,7 @@ mod tests {
 
     #[test]
     fn non_x_phases_count_without_time_and_empty_trace() {
-        let r = analyze_raster(&[], 1);
+        let r = analyze_raster(std::iter::empty(), 1);
         assert!(r.lanes.is_empty());
         assert!(r.decode_hotspots.is_empty());
         assert_eq!(r.total_raster_us, 0.0);
@@ -280,7 +284,7 @@ mod tests {
             ev("BeginFrame", b'B', 100.0, None, 2),
             ev("BeginFrame", b'E', 150.0, None, 2),
         ];
-        let r = analyze_raster(&events.iter().collect::<Vec<_>>(), 1);
+        let r = analyze_raster(events.iter(), 1);
         assert_eq!(r.lanes.len(), 1);
         assert_eq!(r.lanes[0].count, 2);
         assert_eq!(r.lanes[0].total_us, 0.0);
@@ -307,7 +311,7 @@ mod tests {
                 serde_json::json!({"data": {"nodeName": "IMG"}}),
             ),
         ];
-        let r = analyze_raster(&events.iter().collect::<Vec<_>>(), 1);
+        let r = analyze_raster(events.iter(), 1);
         assert_eq!(r.decode_hotspots.len(), 2);
         assert_eq!(r.decode_hotspots[0].url_or_node, "IMG");
         assert_eq!(r.decode_hotspots[1].url_or_node, "77");
