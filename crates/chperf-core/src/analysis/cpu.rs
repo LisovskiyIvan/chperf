@@ -2,7 +2,7 @@
 //! and the reusable full-trace cache used by windowed queries.
 
 use crate::inspect::Scope;
-use crate::trace::{TraceEvent, is_metadata_event};
+use crate::trace::{SourceMapResolver, SourceMapStats, TraceEvent, is_metadata_event};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -83,7 +83,7 @@ pub(crate) fn assign_sessions(events: &[TraceEvent]) -> (Vec<u32>, Vec<SessionKe
     (out, table)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FunctionTime {
     pub function_name: String,
     pub url: String,
@@ -95,7 +95,7 @@ pub struct FunctionTime {
 /// `CpuProfileResult` totals (`app_time_us` etc. over `total_sample_time_us`)
 /// are shares **of sampled time** — the denominator is profiler sample
 /// weight, not trace wall-clock time.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceType {
     /// Framework/library code: `node_modules` or a known framework package
     /// (`svelte`, `react`, `vue`, `angular`, `polyfill`). Bundler output
@@ -152,6 +152,9 @@ pub struct CpuProfileResult {
     pub runtime_time_us: f64,
     /// Sample time attributed to `Native` functions (of sampled time).
     pub native_time_us: f64,
+    /// Inline source-map resolution counters: scripts with ≥1 resolution
+    /// and resolved anonymous frames. Zero when no source maps applied.
+    pub source_maps: SourceMapStats,
 }
 
 /// Parallel ProfileChunk scan: each thread accumulates its own node/self-time
@@ -164,11 +167,29 @@ pub fn scan_profile_chunks(
     scope: Option<&Scope>,
     reserve_threads: usize,
 ) -> (ProfileNodes, ProfileSelfTimes) {
+    scan_profile_chunks_with_resolver(events, scope, reserve_threads, None)
+}
+
+/// Like [`scan_profile_chunks`] but resolves anonymous frames through
+/// `resolver` (see [`node_display_name`]).
+pub fn scan_profile_chunks_with_resolver(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    reserve_threads: usize,
+    resolver: Option<&SourceMapResolver>,
+) -> (ProfileNodes, ProfileSelfTimes) {
     let windows = [scope.and_then(|s| s.window)];
     let threads = scan_threads(reserve_threads);
     let (sessions, session_table) = assign_sessions(events);
-    let (nodes, mut times) =
-        scan_profile_chunks_core(events, scope, &windows, &sessions, &session_table, threads);
+    let (nodes, mut times) = scan_profile_chunks_core(
+        events,
+        scope,
+        &windows,
+        &sessions,
+        &session_table,
+        threads,
+        resolver,
+    );
     (nodes, times.remove(0))
 }
 
@@ -181,6 +202,17 @@ pub fn scan_profile_chunks_windows(
     windows: &[Option<(f64, f64)>],
     reserve_threads: usize,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
+    scan_profile_chunks_windows_with_resolver(events, scope, windows, reserve_threads, None)
+}
+
+/// Like [`scan_profile_chunks_windows`] with source-map resolution.
+pub fn scan_profile_chunks_windows_with_resolver(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    windows: &[Option<(f64, f64)>],
+    reserve_threads: usize,
+    resolver: Option<&SourceMapResolver>,
+) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     let (sessions, session_table) = assign_sessions(events);
     scan_profile_chunks_core(
         events,
@@ -189,6 +221,7 @@ pub fn scan_profile_chunks_windows(
         &sessions,
         &session_table,
         scan_threads(reserve_threads),
+        resolver,
     )
 }
 
@@ -239,6 +272,35 @@ struct CallFrameRaw<'a> {
     function_name: Option<std::borrow::Cow<'a, str>>,
     #[serde(borrow)]
     url: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "lineNumber", default)]
+    line_number: Option<u32>,
+    #[serde(rename = "columnNumber", default)]
+    column_number: Option<u32>,
+}
+
+/// Resolve a profile node name: anonymous frames (`""` / `"(anonymous)"`)
+/// with a non-empty `url` resolve through `resolver` to
+/// `"{display} ({basename}:{line})"` (original function name when the
+/// mappings segment carries one, else the source basename). Named frames
+/// pass through untouched; no map / no hit keeps the current fallback.
+fn node_display_name(
+    resolver: Option<&SourceMapResolver>,
+    function_name: Option<&str>,
+    url: Option<&str>,
+    line_number: Option<u32>,
+    column_number: Option<u32>,
+) -> String {
+    let fname = function_name.unwrap_or("(anonymous)");
+    let is_anon = fname.is_empty() || fname == "(anonymous)";
+    if is_anon
+        && let Some(res) = resolver
+        && let Some(u) = url
+        && !u.is_empty()
+        && let Some(frame) = res.resolve(u, line_number.unwrap_or(0), column_number.unwrap_or(0))
+    {
+        return crate::trace::display_name(&frame);
+    }
+    fname.to_string()
 }
 
 fn scan_threads(reserve_threads: usize) -> usize {
@@ -259,6 +321,7 @@ fn scan_profile_chunks_core(
     sessions: &[u32],
     session_table: &[SessionKey],
     threads: usize,
+    resolver: Option<&SourceMapResolver>,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     const MIN_CHUNK_WORK: usize = 64_000;
     let any_window = windows.iter().any(|w| w.is_some());
@@ -269,7 +332,15 @@ fn scan_profile_chunks_core(
     let session_table = &session_table;
     if threads == 1 || events.len() < MIN_CHUNK_WORK {
         return scan_profile_chunk(
-            events, 0, scope, bases, first_chunks, sessions, session_table, windows,
+            events,
+            0,
+            scope,
+            bases,
+            first_chunks,
+            sessions,
+            session_table,
+            windows,
+            resolver,
         );
     }
     let chunk = events.len().div_ceil(threads);
@@ -288,6 +359,7 @@ fn scan_profile_chunks_core(
                         sessions,
                         session_table,
                         windows,
+                        resolver,
                     )
                 })
             })
@@ -454,6 +526,7 @@ fn scan_profile_chunk(
     sessions: &[u32],
     session_table: &[SessionKey],
     windows: &[Option<(f64, f64)>],
+    resolver: Option<&SourceMapResolver>,
 ) -> (ProfileNodes, Vec<ProfileSelfTimes>) {
     let mut node_map: ProfileNodes = ProfileNodes::default();
     let mut self_times: Vec<ProfileSelfTimes> = (0..windows.len())
@@ -487,14 +560,17 @@ fn scan_profile_chunk(
                 // session (later chunks redefine id 1..N for new frames),
                 // so an `or_insert` would keep a stale name and attribute
                 // later samples to the old function.
+                let name = node_display_name(
+                    resolver,
+                    call_frame.as_ref().and_then(|cf| cf.function_name.as_deref()).map(|s| s.as_ref()),
+                    call_frame.as_ref().and_then(|cf| cf.url.as_deref()).map(|s| s.as_ref()),
+                    call_frame.as_ref().and_then(|cf| cf.line_number),
+                    call_frame.as_ref().and_then(|cf| cf.column_number),
+                );
                 node_map.insert(
                     (sess.0, sess.1, sess.2, id),
                     (
-                        call_frame
-                            .as_ref()
-                            .and_then(|cf| cf.function_name.as_deref())
-                            .unwrap_or("(anonymous)")
-                            .to_string(),
+                        name,
                         call_frame
                             .as_ref()
                             .and_then(|cf| cf.url.as_deref())
@@ -595,8 +671,20 @@ pub fn analyze_cpu_profile(events: &[TraceEvent]) -> CpuProfileResult {
 /// node table and self-times (which `analyze_cpu_profile` would otherwise
 /// drop) so REPL queries with an empty scope can skip re-scanning the trace.
 pub fn analyze_cpu_profile_full(events: &[TraceEvent]) -> (CpuProfileResult, CpuProfileCache) {
-    let (node_map, self_times) = scan_profile_chunks(events, None, 5);
-    let result = build_cpu_profile_result(&node_map, &self_times);
+    analyze_cpu_profile_full_with_resolver(events, None)
+}
+
+/// Like [`analyze_cpu_profile_full`] with source-map resolution for
+/// anonymous frames; the returned result carries the resolution counters.
+pub fn analyze_cpu_profile_full_with_resolver(
+    events: &[TraceEvent],
+    resolver: Option<&SourceMapResolver>,
+) -> (CpuProfileResult, CpuProfileCache) {
+    let (node_map, self_times) = scan_profile_chunks_with_resolver(events, None, 5, resolver);
+    let mut result = build_cpu_profile_result(&node_map, &self_times);
+    if let Some(res) = resolver {
+        result.source_maps = res.stats();
+    }
     (
         result,
         CpuProfileCache {
@@ -670,6 +758,7 @@ fn build_cpu_profile_result(
         app_time_us,
         runtime_time_us,
         native_time_us,
+        source_maps: SourceMapStats::default(),
     }
 }
 
@@ -699,13 +788,243 @@ pub fn cpu_profile_for(
     scope: &Scope,
     cache: Option<&CpuProfileCache>,
 ) -> (Arc<ProfileNodes>, ProfileSelfTimes) {
+    cpu_profile_for_with_resolver(events, scope, cache, None)
+}
+
+/// Like [`cpu_profile_for`] with source-map resolution for anonymous frames.
+pub fn cpu_profile_for_with_resolver(
+    events: &[TraceEvent],
+    scope: &Scope,
+    cache: Option<&CpuProfileCache>,
+    resolver: Option<&SourceMapResolver>,
+) -> (Arc<ProfileNodes>, ProfileSelfTimes) {
     match cache.filter(|c| c.serves(scope)) {
         Some(c) => (Arc::clone(&c.nodes), c.self_times.clone()),
         None => {
-            let (nodes, times) = scan_profile_chunks(events, Some(scope), 0);
+            let (nodes, times) =
+                scan_profile_chunks_with_resolver(events, Some(scope), 0, resolver);
             (Arc::new(nodes), times)
         }
     }
+}
+
+/// One sampled thread's slice of the CPU profile: the cross-thread totals
+/// from [`scan_profile_chunks`] broken down by the `ProfileChunk` event's
+/// own `(pid, tid)`.
+///
+/// Every `ProfileChunk` event carries the `tid` it belongs to (each profiled
+/// thread emits its own chunk sequence), so each sample is attributed to the
+/// chunk event's thread — no invented data. This answers per-thread questions
+/// like "how much `(program)` time is on the main game thread vs raster
+/// threads" that the merged totals cannot.
+#[derive(Clone, Debug)]
+pub struct CpuThreadProfile {
+    /// Process id of the `ProfileChunk` events these samples came from.
+    pub pid: u64,
+    /// Thread id of the `ProfileChunk` events these samples came from.
+    pub tid: u64,
+    /// `thread_name` metadata for `tid` (`""` when the trace carries none).
+    pub thread_name: String,
+    /// Total sampled self-time on this thread (µs). The per-thread totals
+    /// sum to the [`scan_profile_chunks`] full-trace total.
+    pub total_us: f64,
+    /// Samples attributed to this thread (after attach-warm-up capping).
+    pub sample_count: u64,
+    /// Per-function self-time on this thread, heaviest first (same row
+    /// shape as [`CpuProfileResult::functions`]).
+    pub functions: Vec<FunctionTime>,
+}
+
+/// `thread_name` metadata per tid (first definition wins, mirroring
+/// `analyze_raster`): metadata events are cheap to match by interned name.
+pub fn cpu_thread_names(events: &[TraceEvent]) -> rustc_hash::FxHashMap<u64, String> {
+    let mut names: rustc_hash::FxHashMap<u64, String> = rustc_hash::FxHashMap::default();
+    for e in events {
+        if e.name == "thread_name"
+            && let Some(n) = e
+                .args_value()
+                .as_ref()
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+        {
+            names.entry(e.tid).or_insert_with(|| n.to_string());
+        }
+    }
+    names
+}
+
+/// Per-thread CPU profile for `scope`: one [`CpuThreadProfile`] per
+/// `(pid, tid)` with samples in scope, heaviest thread first (exact-total
+/// ties break by `(pid, tid)`).
+///
+/// The walk mirrors [`scan_profile_chunks`] exactly — same session
+/// assignment, same profiler-attach warm-up cap, same left-closed/right-open
+/// window rule — except each sample accrues to its chunk event's thread
+/// instead of one merged map. `scope` filters chunk events by
+/// tid/pid/category (`Scope::allows_chunk`) and samples by time window.
+/// `None` scopes the full trace. Single-threaded pass: thread fan-out would
+/// still merge into shared per-thread maps, so parallelism buys nothing.
+pub fn cpu_profile_per_thread(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+) -> Vec<CpuThreadProfile> {
+    cpu_profile_per_thread_with_resolver(events, scope, None)
+}
+
+/// Like [`cpu_profile_per_thread`] with source-map resolution for anonymous
+/// frames (resolved names flow into each thread's `functions` rows).
+pub fn cpu_profile_per_thread_with_resolver(
+    events: &[TraceEvent],
+    scope: Option<&Scope>,
+    resolver: Option<&SourceMapResolver>,
+) -> Vec<CpuThreadProfile> {
+    let names = cpu_thread_names(events);
+    let (session_idx, session_table) = assign_sessions(events);
+    let need_bases = scope.is_some_and(|s| s.window.is_some());
+    let (bases, first_chunks) = profile_chunk_bases(events, &session_idx, need_bases);
+    let mut node_map: ProfileNodes = ProfileNodes::default();
+    let mut per_thread: rustc_hash::FxHashMap<(u64, u64), ProfileSelfTimes> =
+        rustc_hash::FxHashMap::default();
+    let mut counts: rustc_hash::FxHashMap<(u64, u64), u64> = rustc_hash::FxHashMap::default();
+
+    for (idx, e) in events.iter().enumerate() {
+        if e.name != "ProfileChunk" {
+            continue;
+        }
+        let sess = session_table[session_idx[idx] as usize];
+        let Some(raw) = e.args_raw() else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<ChunkFull>(raw) else {
+            continue;
+        };
+        let Some(data) = parsed.data else {
+            continue;
+        };
+        let Some(cpu_profile) = data.cpu_profile else {
+            continue;
+        };
+
+        if let Some(nodes) = cpu_profile.nodes {
+            for node in nodes {
+                let id = node.id;
+                let parent = node.parent;
+                let call_frame = node.call_frame;
+                // Latest definition wins (same as `scan_profile_chunk`).
+                let name = node_display_name(
+                    resolver,
+                    call_frame.as_ref().and_then(|cf| cf.function_name.as_deref()).map(|s| s.as_ref()),
+                    call_frame.as_ref().and_then(|cf| cf.url.as_deref()).map(|s| s.as_ref()),
+                    call_frame.as_ref().and_then(|cf| cf.line_number),
+                    call_frame.as_ref().and_then(|cf| cf.column_number),
+                );
+                node_map.insert(
+                    (sess.0, sess.1, sess.2, id),
+                    (
+                        name,
+                        call_frame
+                            .as_ref()
+                            .and_then(|cf| cf.url.as_deref())
+                            .unwrap_or("")
+                            .to_string(),
+                        parent,
+                    ),
+                );
+            }
+        }
+
+        if let Some(s) = scope
+            && !s.allows_chunk(e)
+        {
+            continue;
+        }
+        let samples = cpu_profile.samples;
+        let time_deltas = data.time_deltas;
+
+        if let (Some(samples), Some(deltas)) = (samples, time_deltas) {
+            let n = samples.len().min(deltas.len());
+            if n == 0 {
+                continue;
+            }
+            // Same attach-warm-up cap as `scan_profile_chunk`: the first
+            // chunk of a session reaches back to the `Profile` event's ts.
+            let first_cap: f64 = if first_chunks.contains(&idx) {
+                let mut rest: Vec<f64> = deltas[..n]
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .filter(|d| *d > 0.0)
+                    .collect();
+                if rest.is_empty() {
+                    0.0
+                } else {
+                    rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    rest[rest.len() / 2]
+                }
+            } else {
+                f64::INFINITY
+            };
+            let weight_at = |k: usize| {
+                let w = deltas[k].max(0.0);
+                if k == 0 { w.min(first_cap) } else { w }
+            };
+            let key = (e.pid, e.tid);
+            let mut accum = |node_id: u64, weight: f64| {
+                *per_thread
+                    .entry(key)
+                    .or_default()
+                    .entry((sess.0, sess.1, sess.2, node_id))
+                    .or_default() += weight;
+                *counts.entry(key).or_default() += 1;
+            };
+            match scope.and_then(|s| s.window) {
+                None => {
+                    for (k, &node_id) in samples.iter().take(n).enumerate() {
+                        let weight = weight_at(k);
+                        if weight > 0.0 {
+                            accum(node_id, weight);
+                        }
+                    }
+                }
+                Some((lo, hi)) => {
+                    let base = bases.get(&idx).copied().unwrap_or(0.0);
+                    // Same advance-first walk as `scan_profile_chunk`.
+                    let mut sample_ts = base;
+                    for (k, &node_id) in samples.iter().take(n).enumerate() {
+                        let weight = weight_at(k);
+                        if weight > 0.0 && sample_ts >= lo && sample_ts < hi {
+                            accum(node_id, weight);
+                        }
+                        if let Some(&d) = deltas.get(k + 1) {
+                            sample_ts += d;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<CpuThreadProfile> = Vec::with_capacity(per_thread.len());
+    for ((pid, tid), times) in per_thread {
+        let result = build_cpu_profile_result(&node_map, &times);
+        out.push(CpuThreadProfile {
+            pid,
+            tid,
+            thread_name: names.get(&tid).cloned().unwrap_or_default(),
+            total_us: result.total_sample_time_us,
+            sample_count: counts.get(&(pid, tid)).copied().unwrap_or(0),
+            functions: result.functions,
+        });
+    }
+    // Total desc; exact ties break by (pid, tid) (map order is
+    // hash-dependent).
+    out.sort_by(|a, b| {
+        b.total_us
+            .partial_cmp(&a.total_us)
+            .unwrap()
+            .then_with(|| (a.pid, a.tid).cmp(&(b.pid, b.tid)))
+    });
+    out
 }
 
 #[cfg(test)]
@@ -1156,9 +1475,9 @@ mod tests {
 
         let sessions = assign_sessions(&events);
         let (nodes_serial, times_serial) =
-            scan_profile_chunks_core(&events, None, &[None], &sessions.0, &sessions.1, 1);
+            scan_profile_chunks_core(&events, None, &[None], &sessions.0, &sessions.1, 1, None);
         let (nodes_par, times_par) =
-            scan_profile_chunks_core(&events, None, &[None], &sessions.0, &sessions.1, 8);
+            scan_profile_chunks_core(&events, None, &[None], &sessions.0, &sessions.1, 8, None);
         assert_eq!(nodes_serial.len(), nodes_par.len());
         for (id, v) in &nodes_serial {
             assert_eq!(nodes_par.get(id), Some(v));
@@ -1206,5 +1525,243 @@ mod tests {
         }
         // The built result agrees with the raw self-times.
         assert!(result.total_sample_time_us > 0.0);
+    }
+
+    fn thread_name_event(tid: u64, pid: u64, name: &str) -> TraceEvent {
+        TraceEvent {
+            name: "thread_name".into(),
+            id: 0,
+            has_id: false,
+            ph: b'M',
+            ts: 0.0,
+            dur: None,
+            tid,
+            pid,
+            cat: None,
+            args: crate::trace::test_args(serde_json::json!({"name": name})),
+        }
+    }
+
+    /// Two tids sampled independently: per-thread totals sum to the merged
+    /// cross-thread total, `(program)` is split per thread (not merged),
+    /// and `thread_name` metadata resolves per tid.
+    fn two_thread_fixture() -> Vec<TraceEvent> {
+        vec![
+            thread_name_event(65, 2, "CrRendererMain"),
+            thread_name_event(66, 2, "CompositorTileWorker"),
+            profile_event_sess(1_000_000.0, 2, 65),
+            chunk_event_sess(
+                1_000_000.0,
+                2,
+                65,
+                &[
+                    (1, "(root)", None),
+                    (2, "(program)", Some(1)),
+                    (3, "gameUpdate", Some(1)),
+                ],
+                &[2, 2, 3],
+                &[1000.0, 1000.0, 1000.0],
+            ),
+            profile_event_sess(2_000_000.0, 2, 66),
+            chunk_event_sess(
+                2_000_000.0,
+                2,
+                66,
+                &[
+                    (1, "(root)", None),
+                    (2, "(program)", Some(1)),
+                    (4, "raster", Some(1)),
+                ],
+                &[2, 4],
+                &[2000.0, 2000.0],
+            ),
+        ]
+    }
+
+    fn thread_func_us(t: &CpuThreadProfile, name: &str) -> f64 {
+        t.functions
+            .iter()
+            .find(|f| f.function_name == name)
+            .map(|f| f.self_time_us)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn per_thread_totals_sum_to_global_with_names() {
+        let events = two_thread_fixture();
+        let threads = cpu_profile_per_thread(&events, None);
+        assert_eq!(threads.len(), 2);
+        // Heaviest thread first.
+        assert_eq!((threads[0].pid, threads[0].tid), (2, 66));
+        assert_eq!(threads[0].thread_name, "CompositorTileWorker");
+        assert_eq!(threads[0].total_us, 4_000.0);
+        assert_eq!(threads[0].sample_count, 2);
+        assert_eq!((threads[1].pid, threads[1].tid), (2, 65));
+        assert_eq!(threads[1].thread_name, "CrRendererMain");
+        assert_eq!(threads[1].total_us, 3_000.0);
+        assert_eq!(threads[1].sample_count, 3);
+        // `(program)` is split per thread, not merged into one row.
+        assert_eq!(thread_func_us(&threads[0], "(program)"), 2_000.0);
+        assert_eq!(thread_func_us(&threads[0], "raster"), 2_000.0);
+        assert_eq!(thread_func_us(&threads[1], "(program)"), 2_000.0);
+        assert_eq!(thread_func_us(&threads[1], "gameUpdate"), 1_000.0);
+        // Per-thread totals sum to the merged cross-thread total.
+        let (_, merged) = scan_profile_chunks(&events, None, 0);
+        let merged_total: f64 = merged.values().sum();
+        let split_total: f64 = threads.iter().map(|t| t.total_us).sum();
+        assert_eq!(merged_total, 7_000.0);
+        assert_eq!(split_total, merged_total);
+        // `build_cpu_profile_result` merges what the split keeps apart.
+        let merged_result = build_cpu_profile_result(
+            &scan_profile_chunks(&events, None, 0).0,
+            &merged,
+        );
+        assert_eq!(
+            merged_result
+                .functions
+                .iter()
+                .find(|f| f.function_name == "(program)")
+                .map(|f| f.self_time_us),
+            Some(4_000.0)
+        );
+    }
+
+    #[test]
+    fn per_thread_respects_tid_scope() {
+        // A tid filter keeps only that tid's chunks — same rule as the
+        // merged scan's `allows_chunk`.
+        let events = two_thread_fixture();
+        let scope = Scope {
+            window: None,
+            tid: Some(65),
+            pid: None,
+            cat: None,
+        };
+        let threads = cpu_profile_per_thread(&events, Some(&scope));
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].tid, 65);
+        assert_eq!(threads[0].total_us, 3_000.0);
+        assert_eq!(threads[0].sample_count, 3);
+    }
+
+    /// VLQ encoder for the sourcemap end-to-end fixture (inverse of decode).
+    fn enc_vlq_test(mut v: i64) -> String {
+        let mut uv: u32 = if v < 0 {
+            (((-v - 1) << 1) | 1) as u32
+        } else {
+            (v << 1) as u32
+        };
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        loop {
+            let mut d = uv & 31;
+            uv >>= 5;
+            if uv != 0 {
+                d |= 32;
+            }
+            out.push(B64[d as usize] as char);
+            if uv == 0 {
+                break;
+            }
+        }
+        let _ = &mut v;
+        out
+    }
+
+    fn enc_seg_test(fields: &[i64]) -> String {
+        fields.iter().map(|f| enc_vlq_test(*f)).collect()
+    }
+
+    /// End-to-end: synthetic `metadata.sourceMaps` + a `ProfileChunk` with
+    /// an anonymous frame at the mapped (line, col) resolves to the original
+    /// name; an anonymous frame with an unmapped url falls back unchanged;
+    /// a named frame is left untouched. Covers both ingestion paths.
+    #[test]
+    fn sourcemap_anon_frames_resolve_end_to_end() {
+        use crate::trace::{SourceMapEntry, SourceMapResolver};
+        // Line 0: col 0 → src 0, line 41 (0-based), name 0 ("updateHUD").
+        let mappings = enc_seg_test(&[0, 0, 41, 0, 0]);
+        let entries = [SourceMapEntry {
+            url: "http://localhost:5173/src/app.js".to_string(),
+            source_map: crate::trace::SourceMapData {
+                mappings,
+                names: vec!["updateHUD".to_string()],
+                sources: vec!["src/HUD.ts".to_string()],
+            },
+        }];
+        // Round-trip through serde: sourcesContent-heavy shapes parse, but
+        // only mappings/names/sources are kept.
+        let meta_json = serde_json::to_value(&serde_json::json!({
+            "sourceMaps": [{
+                "url": "http://localhost:5173/src/app.js",
+                "sourceMap": {
+                    "version": 3,
+                    "mappings": entries[0].source_map.mappings.clone(),
+                    "names": ["updateHUD"],
+                    "sources": ["src/HUD.ts"],
+                    "sourcesContent": ["huge — dropped"],
+                }
+            }]
+        }))
+        .unwrap();
+        let meta: crate::trace::TraceMetadata =
+            serde_json::from_value(meta_json).unwrap();
+        assert_eq!(meta.source_maps.len(), 1);
+        let resolver = SourceMapResolver::new(&meta.source_maps);
+
+        let nodes_json = serde_json::json!([
+            {"id": 1, "callFrame": {"functionName": "(root)", "url": ""}},
+            {"id": 2, "callFrame": {"functionName": "", "url": "http://localhost:5173/src/app.js", "lineNumber": 0, "columnNumber": 0}},
+            {"id": 3, "callFrame": {"functionName": "(anonymous)", "url": "http://x/unmapped.js", "lineNumber": 0, "columnNumber": 0}},
+            {"id": 4, "callFrame": {"functionName": "namedFunc", "url": "http://localhost:5173/src/app.js", "lineNumber": 0, "columnNumber": 0}},
+        ]);
+        let chunk = TraceEvent {
+            name: "ProfileChunk".into(),
+            id: 0,
+            has_id: false,
+            ph: b'P',
+            ts: 0.0,
+            dur: None,
+            tid: 65,
+            pid: 2,
+            cat: None,
+            args: crate::trace::test_args(serde_json::json!({
+                "data": {
+                    "cpuProfile": {"nodes": nodes_json, "samples": [2, 2, 3, 4]},
+                    "timeDeltas": [500.0, 500.0, 500.0, 500.0],
+                }
+            })),
+        };
+        let events = vec![profile_event(0.0), chunk];
+        let (result, _) = analyze_cpu_profile_full_with_resolver(&events, Some(&resolver));
+        let names: Vec<&str> = result
+            .functions
+            .iter()
+            .map(|f| f.function_name.as_str())
+            .collect();
+        // Mapped anon frame resolves to the original name + source line.
+        assert!(
+            names.contains(&"updateHUD (HUD.ts:42)"),
+            "resolved name missing in {names:?}"
+        );
+        // Unmapped url falls back to the current behavior.
+        assert!(
+            names.contains(&"(anonymous)"),
+            "anonymous fallback missing in {names:?}"
+        );
+        // Named frames pass through untouched.
+        assert!(names.contains(&"namedFunc"), "named frame lost in {names:?}");
+        assert_eq!(result.source_maps.scripts, 1);
+        assert!(result.source_maps.resolved_frames >= 1);
+        // Second ingestion path: per-thread split resolves identically.
+        let threads = cpu_profile_per_thread_with_resolver(&events, None, Some(&SourceMapResolver::new(&meta.source_maps)));
+        assert_eq!(threads.len(), 1);
+        let tnames: Vec<&str> = threads[0]
+            .functions
+            .iter()
+            .map(|f| f.function_name.as_str())
+            .collect();
+        assert!(tnames.contains(&"updateHUD (HUD.ts:42)"));
+        assert!(tnames.contains(&"(anonymous)"));
     }
 }

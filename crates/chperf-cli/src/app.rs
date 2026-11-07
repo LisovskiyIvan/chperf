@@ -11,6 +11,10 @@ pub struct App {
     pub summary: SummaryResult,
     pub scroll_frames: ScrollFrameResult,
     pub cpu_profile: CpuProfileResult,
+    /// Per-thread slice of `cpu_profile` (same samples, attributed by each
+    /// `ProfileChunk` event's own tid), heaviest thread first. Empty when
+    /// the trace carries no CPU samples.
+    pub cpu_threads: Vec<CpuThreadProfile>,
     pub layout_dirty: LayoutDirtyResult,
     pub style_recalc: StyleRecalcResult,
     pub forced_reflows: ForcedReflowResult,
@@ -65,6 +69,7 @@ impl App {
             summary,
             scroll_frames,
             cpu_profile,
+            cpu_threads: Vec::new(),
             layout_dirty,
             style_recalc,
             forced_reflows,

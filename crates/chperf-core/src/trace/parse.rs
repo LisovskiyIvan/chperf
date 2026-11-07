@@ -1852,7 +1852,10 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
     // Drop any stale serde-fallback counts (unit tests deserialize events
     // directly without draining).
     take_serde_malformed();
-    let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
+    // Gzip is sniffed by content (magic `0x1f 0x8b`), not by extension: a
+    // gzipped dump named without `.gz` (e.g. DevTools `download`) still
+    // decodes, and a `.json.gz` name holding plain JSON parses as plain.
+    let is_gz = super::stream::path_is_gzip(path);
     match super::stream::open_source(path, is_gz)? {
         super::stream::SourceKind::SmallPlain(file) => {
             // Small plain file: exact-size read, as before (no thread/scan
@@ -1882,7 +1885,7 @@ pub fn parse_trace(path: &Path) -> Result<TraceFile, Box<dyn std::error::Error>>
             finalize_trace(parse_trace_whole(&shared, path)?, path)
         }
         super::stream::SourceKind::SmallGz(bytes) => {
-            // Small `.gz` input, already decoded + BOM-stripped by the
+            // Small gzip input, already decoded + BOM-stripped by the
             // bounded sniff: same whole-buffer path as before.
             let shared: Arc<[u8]> = Arc::from(bytes);
             finalize_trace(parse_trace_whole(&shared, path)?, path)
@@ -2065,6 +2068,7 @@ fn finalize_trace(
             network_throttling: None,
             hardware_concurrency: None,
             host_dpr: None,
+            source_maps: Vec::new(),
             page_url: None,
             frames: Vec::new(),
         });

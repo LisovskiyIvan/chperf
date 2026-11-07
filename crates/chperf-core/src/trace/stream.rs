@@ -29,8 +29,8 @@
 
 use super::event::ArgsArena;
 use super::parse::{
-    ArgsSpan, BLOCK, Blocks, ParseStats, chunk_work_stream_into, count_unescaped_quotes,
-    parse_thread_count, skip_value, skip_ws, walk_range,
+    chunk_work_stream_into, count_unescaped_quotes, parse_thread_count, skip_value, skip_ws,
+    walk_range, ArgsSpan, Blocks, ParseStats, BLOCK,
 };
 use super::{TraceEvent, TraceMetadata};
 use std::fs::File;
@@ -47,8 +47,15 @@ pub(crate) const STREAM_THRESHOLD: usize = 16 * 1024 * 1024;
 pub(crate) const WINDOW: usize = 4 * 1024 * 1024;
 
 /// Head bytes probed for the `traceEvents` opener. Real headers are <1KB;
-/// anything larger falls back to the whole-buffer path.
+/// when the array starts past the head (a huge metadata-first header), the
+/// forward probe below continues the same search over later blocks.
 const HEAD_CAP: usize = 1024 * 1024;
+
+/// Header bytes (`[0, arr_open)`) read once for the `metadata` parse when the
+/// array starts past the head window. Tens of MB is a bounded one-time read;
+/// past this the metadata is skipped (the whole-file probe also fails to
+/// close it then) while event parsing continues.
+const META_PRE_CAP: usize = 64 * 1024 * 1024;
 
 /// Tail bytes (`arr_close..EOF`) retained for the `metadata` parse. Trailing
 /// garbage past a small tail is ignored exactly like the whole-file path;
@@ -105,6 +112,7 @@ fn ctx(path: &Path, e: impl std::fmt::Display) -> Box<dyn std::error::Error> {
 /// How the windowed parse gave up before reading events: exotic layouts
 /// fall back to the whole-buffer path (same outcome as today), anything else
 /// is a hard error with the whole-file message.
+#[derive(Debug)]
 pub(crate) enum StreamFail {
     /// No array opener in the head / layout unrecognized: run the
     /// whole-buffer path instead (correct, memory-heavy, rare).
@@ -480,6 +488,232 @@ fn head_array_open(
             return Err("non-array");
         }
         return Ok(Some(j));
+    }
+    Ok(None)
+}
+
+/// Metadata object `(open, end)` in a `[0, arr_open)` prefix buffer
+/// (metadata-first layouts where the array starts past the head window): the
+/// same key probe + depth-1 check + close walk `scan_layout` runs, over the
+/// in-memory prefix with the prescan's exact block states. `None` when
+/// absent, non-object, or unclosed — all matching the whole-file outcome.
+fn pre_metadata_span(pre: &[u8], blocks: &Blocks) -> Option<(usize, usize)> {
+    for m in memchr::memmem::find_iter(pre, b"metadata") {
+        if m == 0 || pre[m - 1] != b'"' {
+            continue;
+        }
+        let after = m + b"metadata".len();
+        if after >= pre.len() || pre[after] != b'"' {
+            continue;
+        }
+        let mut j = after + 1;
+        while j < pre.len() && pre[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= pre.len() || pre[j] != b':' {
+            continue;
+        }
+        j += 1;
+        while j < pre.len() && pre[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= pre.len() {
+            continue;
+        }
+        let opener = pre[j];
+        if opener != b'[' && opener != b'{' {
+            continue;
+        }
+        let pos = j;
+        let b = pos / BLOCK;
+        let bs = b * BLOCK;
+        let mut d = blocks.depth_at[b];
+        let mut s = blocks.in_string_at[b];
+        let mut esc = blocks.esc_at[b];
+        walk_range(&pre[bs..pos], &mut d, &mut s, &mut esc);
+        if d != 1 {
+            continue;
+        }
+        if opener != b'{' {
+            return None;
+        }
+        // Closing brace of the metadata object, walked from its block start
+        // (the `scan_layout` close-walk shape).
+        let mut d = blocks.depth_at[b];
+        let mut s = blocks.in_string_at[b];
+        let mut esc = blocks.esc_at[b];
+        let mut end = None;
+        for (i, &by) in pre[bs..].iter().enumerate() {
+            let idx = bs + i;
+            if s {
+                if esc {
+                    esc = false;
+                } else if by == b'\\' {
+                    esc = true;
+                } else if by == b'"' {
+                    s = false;
+                }
+            } else {
+                match by {
+                    b'"' => s = true,
+                    b'{' | b'[' => d += 1,
+                    b'}' | b']' => {
+                        if by == b'}' && d == 2 {
+                            end = Some(idx + 1);
+                            break;
+                        }
+                        d -= 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Unclosed within the prefix: no metadata, like the whole-file walk
+        // running past EOF.
+        return end.map(|e| (pos, e));
+    }
+    None
+}
+
+/// Forward continuation of the `traceEvents` opener probe past the head
+/// window (metadata-first layouts: a huge `metadata` object pushes the array
+/// past HEAD_CAP). Iterates blocks forward from the end of the head,
+/// re-running `head_array_open`'s probe over a sliding window (backward
+/// context + current + next block, so member-position checks and keys split
+/// across a block boundary stay exact) and verifying depth 1 from the
+/// prescan's exact block states. Returns the array-`[` offset, `Err` on a
+/// non-array member (genuinely non-trace, like the head probe), or `None`
+/// when no opener exists (the caller falls back to the whole-buffer path).
+fn forward_array_open(
+    src: &ByteSource,
+    len: usize,
+    head_len: usize,
+    blocks: &Blocks,
+) -> Result<Option<usize>, &'static str> {
+    /// Keys starting this far before the head end are re-probed here (a key
+    /// split across the head boundary was skipped by the head probe for lack
+    /// of bytes).
+    const REWIND: usize = 32;
+    /// Backward context kept before each block for the member-position
+    /// check and keys split across a boundary (the quoted key is 13 bytes).
+    const BACK: usize = 64;
+    if len <= head_len {
+        return Ok(None);
+    }
+    let scan_from = head_len.saturating_sub(REWIND);
+    let k0 = scan_from / BLOCK;
+    let nb = len.div_ceil(BLOCK);
+    // Each block is read once (`next` becomes next round's `cur`); the
+    // backward context is a tiny pread, not a block re-read.
+    let mut cur = vec![0u8; 0];
+    let mut next = vec![0u8; 0];
+    let read_block = |k: usize, out: &mut Vec<u8>| -> std::io::Result<()> {
+        let base = k as u64 * BLOCK as u64;
+        if base >= len as u64 {
+            out.clear();
+            return Ok(());
+        }
+        let n = ((len as u64 - base).min(BLOCK as u64)) as usize;
+        out.resize(n, 0);
+        src.file.read_exact_at(out, base)
+    };
+    read_block(k0, &mut cur).map_err(|_| "read error")?;
+    read_block(k0 + 1, &mut next).map_err(|_| "read error")?;
+    for k in k0..nb {
+        let base = k as u64 * BLOCK as u64;
+        // Backward context: up to BACK bytes ending at the block start.
+        let back_from = base.saturating_sub(BACK as u64);
+        let mut back = vec![0u8; (base - back_from) as usize];
+        if !back.is_empty() {
+            src.file
+                .read_exact_at(&mut back, back_from)
+                .map_err(|_| "read error")?;
+        }
+        let win_base = back_from as usize;
+        let mut win = Vec::with_capacity(back.len() + cur.len() + next.len());
+        win.extend_from_slice(&back);
+        win.extend_from_slice(&cur);
+        win.extend_from_slice(&next);
+        let lo = if k == k0 { scan_from } else { base as usize };
+        let hi = base as usize + cur.len();
+        for m in memchr::memmem::find_iter(&win, b"traceEvents") {
+            let s = win_base + m;
+            if s < lo || s >= hi {
+                continue;
+            }
+            if s == 0 || win[m - 1] != b'"' {
+                continue;
+            }
+            let after = m + b"traceEvents".len();
+            if after >= win.len() || win[after] != b'"' {
+                continue;
+            }
+            let mut j = after + 1;
+            while j < win.len() && win[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= win.len() || win[j] != b':' {
+                continue;
+            }
+            j += 1;
+            while j < win.len() && win[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= win.len() {
+                continue;
+            }
+            let opener = win[j];
+            if opener != b'[' && opener != b'{' {
+                continue;
+            }
+            // Byte before the key (skipping whitespace) must be `{` or `,`.
+            let mut kk = m - 1;
+            while kk > 0 {
+                kk -= 1;
+                if !win[kk].is_ascii_whitespace() {
+                    break;
+                }
+            }
+            // A whitespace run reaching the window start is only conclusive
+            // at the file start; otherwise the context is incomplete.
+            if kk == 0 && (win[0].is_ascii_whitespace() || win_base > 0) {
+                continue;
+            }
+            if win[kk] != b'{' && win[kk] != b',' {
+                continue;
+            }
+            // Depth at the opener, walked from the exact block-start state
+            // (the same walk `state_at_peek` runs over the head).
+            let pos = win_base + j;
+            let b = pos / BLOCK;
+            let from = b * BLOCK;
+            // The opener sits at most one block past `s`, so its block start
+            // is always inside the window.
+            if from < win_base || pos > win_base + win.len() {
+                continue;
+            }
+            let mut d = blocks.depth_at[b];
+            let mut st = blocks.in_string_at[b];
+            let mut esc = blocks.esc_at[b];
+            walk_range(&win[from - win_base..j], &mut d, &mut st, &mut esc);
+            if d != 1 {
+                continue;
+            }
+            if opener != b'[' {
+                return Err("non-array");
+            }
+            return Ok(Some(pos));
+        }
+        if cur.is_empty() {
+            break;
+        }
+        cur.splice(.., next.drain(..));
+        let nk = k + 2;
+        if (nk as u64 * BLOCK as u64) < len as u64 {
+            read_block(nk, &mut next).map_err(|_| "read error")?;
+        } else {
+            next.clear();
+        }
     }
     Ok(None)
 }
@@ -951,19 +1185,27 @@ pub(crate) fn parse_stream(
     // per-block open counts size the in-place event slices).
     let threads = parse_thread_count(&len);
     let (blocks, opens) = scan_blocks_source(src, len, threads);
+    let not_array = || {
+        StreamFail::Fatal(Box::<dyn std::error::Error>::from(format!(
+            "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
+            path.display()
+        )))
+    };
     let arr_open = match head_array_open(&head, bom, &blocks) {
         Ok(Some(o)) => o,
-        // No top-level array in the head: exotic layout — the caller falls
-        // back to the whole-buffer path (same outcome as today).
-        Ok(None) => return Err(StreamFail::Fallback),
+        // No opener in the head: metadata-first layouts push the array past
+        // HEAD_CAP — keep probing forward over later blocks before giving up
+        // to the whole-buffer path.
+        Ok(None) => match forward_array_open(src, len, head.len(), &blocks) {
+            Ok(Some(o)) => o,
+            // No top-level array anywhere: exotic layout — the caller falls
+            // back to the whole-buffer path (same outcome as today).
+            Ok(None) => return Err(StreamFail::Fallback),
+            Err(_) => return Err(not_array()),
+        },
         Err(_) => {
             // Non-array `traceEvents` value: genuinely non-trace input.
-            return Err(StreamFail::Fatal(Box::<dyn std::error::Error>::from(
-                format!(
-                    "{}: not a Chrome trace (missing top-level \"traceEvents\" array)",
-                    path.display()
-                ),
-            )));
+            return Err(not_array());
         }
     };
     if arr_open + 1 >= len {
@@ -997,13 +1239,31 @@ pub(crate) fn parse_stream(
             .map_err(|e| ctx(path, e))?;
     }
     let meta_tail = tail_metadata_span(&tail, tail_keep_from, &blocks);
-    let meta_head = if head.len() > arr_open {
+    let meta_head = if arr_open < head.len() {
         head_metadata_span(&head, bom, arr_open)
+    } else {
+        None
+    };
+    // Metadata-first layout (array past the head window): the header lives
+    // in `[0, arr_open)` — read it once (bounded) and locate the metadata
+    // object with the whole-file probe + close walk. Past the cap the
+    // metadata is skipped while event parsing continues.
+    let mut pre: Vec<u8> = Vec::new();
+    if debug && arr_open >= head.len() && arr_open > META_PRE_CAP {
+        eprintln!("  [stream] header {arr_open}B past metadata cap, skipping metadata");
+    }
+    let meta_pre = if arr_open >= head.len() && arr_open <= META_PRE_CAP {
+        pre.resize(arr_open, 0);
+        src.read_at_exact(&mut pre, 0).map_err(|e| ctx(path, e))?;
+        pre_metadata_span(&pre, &blocks)
     } else {
         None
     };
     let metadata: Option<TraceMetadata> = meta_head
         .and_then(|(s, e)| serde_json::from_slice::<TraceMetadata>(&head[s..e]).ok())
+        .or_else(|| {
+            meta_pre.and_then(|(s, e)| serde_json::from_slice::<TraceMetadata>(&pre[s..e]).ok())
+        })
         .or_else(|| {
             meta_tail.and_then(|(s, e)| {
                 serde_json::from_slice::<TraceMetadata>(
@@ -1018,11 +1278,13 @@ pub(crate) fn parse_stream(
             metadata.is_some()
         );
     }
-    // Layout inputs (head, tail probe, tail) are fully consumed: drop them
-    // before the window parse so only events + arenas + windows peak.
+    // Layout inputs (head, tail probe, tail, pre-array header) are fully
+    // consumed: drop them before the window parse so only events + arenas +
+    // windows peak.
     drop(head);
     drop(tail_probe);
     drop(tail);
+    drop(pre);
     // Windows over the array content (window 0 starts at the array `[` so
     // the header is skipped by ownership), parsed in place: counts from the
     // prescan open table size disjoint slices of one events vec, workers
@@ -1147,8 +1409,24 @@ fn read_capped<R: Read>(mut r: R, cap: usize) -> std::io::Result<(Vec<u8>, bool)
     }
 }
 
-/// Dispatch helper for `parse_trace`: stream-decodes a `.gz` file, returning
-/// either the full small bytes or a temp-backed source for large input.
+/// Gzip content sniff: the first two bytes `0x1f 0x8b`. Extensionless
+/// `.gz` inputs (e.g. a DevTools dump literally named `download`) must still
+/// decode; conversely a `.json.gz` name holding plain JSON parses as plain.
+/// Unreadable files sniff as non-gzip (the open below errors with context).
+pub(crate) fn path_is_gzip(path: &Path) -> bool {
+    let mut magic = [0u8; 2];
+    match std::fs::File::open(path).and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut magic).map(|_| magic)
+    }) {
+        Ok(m) => m == [0x1f, 0x8b],
+        Err(_) => false,
+    }
+}
+
+/// Dispatch helper for `parse_trace`: stream-decodes gzip input (sniffed by
+/// content, see [`path_is_gzip`]), returning either the full small bytes or
+/// a temp-backed source for large input.
 pub(crate) fn open_source(
     path: &Path,
     is_gz: bool,
@@ -1442,7 +1720,7 @@ mod tests {
     /// values get dedicated chunks, seal-then-resolve is exact.
     #[test]
     fn arena_append_resolve_roundtrip() {
-        use super::super::event::{ARENA_CHUNK, ArgsArena};
+        use super::super::event::{ArgsArena, ARENA_CHUNK};
         let mut a = ArgsArena::new();
         let (s1, a1, l1) = a.append(br#"{"x":1}"#);
         let (s2, a2, l2) = a.append(br#"{"y":[1,2,3]}"#);
@@ -1485,5 +1763,125 @@ mod tests {
             trace.metadata.as_ref().and_then(|m| m.cpu_throttling),
             Some(2.0)
         );
+    }
+
+    /// Metadata-first doc with the `traceEvents` opener pushed past the 1MB
+    /// head window (the enhancedTrace layout: a huge metadata object first).
+    fn meta_first_doc(meta_pad: usize, n_events: usize) -> Vec<u8> {
+        let mut body =
+            String::from("{\"metadata\":{\"startTime\":\"2024-01-01T00:00:00\",\"pad\":\"");
+        body.push_str(&"p".repeat(meta_pad));
+        body.push_str("\"},\"traceEvents\":[");
+        for i in 0..n_events {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                "{{\"name\":\"E{i}\",\"ph\":\"X\",\"ts\":{i},\"pid\":1,\"tid\":1}}"
+            ));
+        }
+        body.push_str("]}");
+        body.into_bytes()
+    }
+
+    /// Gzip a doc to a bare (extensionless) temp path — the DevTools
+    /// `download` shape: gzip content, no `.gz` name.
+    fn write_big_gz_bare(name: &str, bytes: &[u8]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("chperf-stream-{name}-{}", std::process::id()));
+        let f = File::create(&path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap();
+        path
+    }
+
+    /// Metadata-first layout with the array past the head window: the
+    /// forward probe must stream-parse (not fall back), and the pre-array
+    /// metadata must parse with its `startTime`.
+    #[test]
+    fn stream_metadata_first_past_head_streams() {
+        let doc = meta_first_doc(1_100_000, 340_000);
+        assert!(doc.len() > STREAM_THRESHOLD, "must take stream path");
+        let open = super::super::parse::find_trace_events_open(&doc).unwrap();
+        assert!(open > HEAD_CAP, "array must start past the head");
+        let path = write_big("metafirst", &doc);
+        // Streaming proof: `parse_stream` itself succeeds (the whole-buffer
+        // fallback would surface here as `Err(Fallback)` instead).
+        let src = match open_source(&path, false).expect("open") {
+            SourceKind::Stream(s) => s,
+            SourceKind::SmallPlain(_) | SourceKind::SmallGz(_) => {
+                panic!("big plain file must take the stream source")
+            }
+        };
+        let len = src.decoded_len() as usize;
+        let (events, meta, stats) =
+            parse_stream(&src, &path, len).expect("stream parse must succeed");
+        assert_eq!(events.len(), 340_000);
+        assert_eq!(stats.parsed, 340_000);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(
+            meta.as_ref().and_then(|m| m.start_time.clone()).as_deref(),
+            Some("2024-01-01T00:00:00")
+        );
+        drop(src);
+        // End to end through `parse_trace`.
+        let trace = crate::trace::parse_trace(&path).expect("stream test parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 340_000);
+        assert_eq!(trace.stats.parsed, 340_000);
+        assert_eq!(
+            trace
+                .metadata
+                .as_ref()
+                .and_then(|m| m.start_time.clone())
+                .as_deref(),
+            Some("2024-01-01T00:00:00")
+        );
+    }
+
+    /// Same metadata-first doc, gzipped with no `.gz` extension and decoded
+    /// past the stream threshold: content sniffing must route it through
+    /// gunzip + the forward probe, not fail as raw text.
+    #[test]
+    fn stream_gz_without_extension_meta_first_big() {
+        let doc = meta_first_doc(1_100_000, 340_000);
+        assert!(doc.len() > STREAM_THRESHOLD, "must take stream path");
+        let path = write_big_gz_bare("metafirst-gz", &doc);
+        assert!(super::path_is_gzip(&path));
+        let trace = crate::trace::parse_trace(&path).expect("bare .gz must parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 340_000);
+        assert_eq!(trace.stats.parsed, 340_000);
+        assert_eq!(
+            trace
+                .metadata
+                .as_ref()
+                .and_then(|m| m.start_time.clone())
+                .as_deref(),
+            Some("2024-01-01T00:00:00")
+        );
+    }
+
+    /// Small gzipped trace without a `.gz` extension parses (content sniff,
+    /// not the file name, decides the codec).
+    #[test]
+    fn stream_gz_without_extension_small() {
+        let mut body = String::from("{\"traceEvents\":[");
+        for i in 0..10 {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                "{{\"name\":\"S{i}\",\"ph\":\"X\",\"ts\":{i},\"pid\":1,\"tid\":1}}"
+            ));
+        }
+        body.push_str("]}");
+        let path = write_big_gz_bare("gzbare-small", body.as_bytes());
+        assert!(!path.extension().is_some());
+        let trace = crate::trace::parse_trace(&path).expect("bare .gz must parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(trace.trace_events.len(), 10);
+        assert_eq!(trace.stats.parsed, 10);
     }
 }

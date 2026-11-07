@@ -10,6 +10,7 @@ mod meta;
 mod parse;
 mod profiler;
 pub(crate) mod stream;
+mod sourcemap;
 
 pub use event::ArgsText;
 pub use event::SharedStr;
@@ -19,10 +20,11 @@ pub use event::normalize_be_pairs;
 pub(crate) use event::test_args;
 
 pub use meta::{
-    FrameInfo, RendererThread, ThreadModel, TraceFile, TraceMetadata, detect_main_thread,
-    detect_thread_model, expand_trace_input, is_metadata_event, list_traces,
+    FrameInfo, RendererThread, SourceMapData, SourceMapEntry, ThreadModel, TraceFile, TraceMetadata,
+    detect_main_thread, detect_thread_model, expand_trace_input, is_metadata_event, list_traces,
     list_traces_with_skipped, trace_stem,
 };
+pub use sourcemap::{ResolvedFrame, SourceMapResolver, SourceMapStats, display_name, source_basename};
 pub use parse::{ParseStats, parse_trace};
 pub use profiler::{
     ProfilerOverhead, effective_runtask_dur, find_profiler_overhead, is_profiler_dropped_frame,

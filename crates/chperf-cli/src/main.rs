@@ -47,6 +47,11 @@ pub(crate) fn load_and_analyze(
     // (Both are full-event scans; ~25ms on big traces, sub-ms on small.)
     let frame_budget_us = chperf_core::windowed::detect_frame_budget_us(events);
     let thread_model = trace::detect_thread_model(events);
+    // Inline source maps (enhancedTrace v1): resolve anonymous CPU frames.
+    // Built before the parallel section so both CPU passes share it.
+    let sourcemap_resolver = trace.metadata.as_ref().map(|m| {
+        chperf_core::trace::SourceMapResolver::new(&m.source_maps)
+    });
     // The analysis passes are independent and read-only, so on large
     // traces they run concurrently (each pass itself parallelizes hot work).
     // Per-renderer summary/jank ride the same scope: they hide under the
@@ -67,7 +72,13 @@ pub(crate) fn load_and_analyze(
         std::thread::scope(|s| {
             let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
             let b = s.spawn(|| analysis::analyze_scroll_frames(events, main_tid));
-            let c = s.spawn(|| analysis::analyze_cpu_profile_full(events).0);
+            let c = s.spawn(|| {
+                analysis::analyze_cpu_profile_full_with_resolver(
+                    events,
+                    sourcemap_resolver.as_ref(),
+                )
+                .0
+            });
             let d = s.spawn(|| analysis::analyze_layout_dirty(events, main_tid));
             let e = s.spawn(|| analysis::analyze_style_recalc(events, main_tid));
             let f = s.spawn(|| analysis::analyze_forced_reflows(events, main_tid));
@@ -110,7 +121,11 @@ pub(crate) fn load_and_analyze(
             analysis::analyze_style_recalc(events, main_tid),
             analysis::analyze_forced_reflows(events, main_tid),
             analysis::analyze_jank(events, main_tid, None),
-            analysis::analyze_cpu_profile_full(events).0,
+            analysis::analyze_cpu_profile_full_with_resolver(
+                events,
+                sourcemap_resolver.as_ref(),
+            )
+            .0,
             analysis::analyze_summary_per_renderer(events, &thread_model),
             analysis::analyze_jank_per_renderer(events, &thread_model, Some(frame_budget_us)),
             tids.len(),
@@ -136,7 +151,7 @@ pub(crate) fn load_and_analyze(
 
     let metadata = trace.metadata.clone();
     let trace_span_us = summary.total_trace_duration_us;
-    let app = app::App::new(
+    let mut app = app::App::new(
         summary,
         scroll_frames,
         cpu_profile,
@@ -160,6 +175,14 @@ pub(crate) fn load_and_analyze(
         name,
         None,
         metadata,
+    );
+    // Per-thread CPU split (same samples as `cpu_profile`, attributed by
+    // each ProfileChunk event's own tid). Serial single pass; rides outside
+    // the parallel section above so it never contends with it.
+    app.cpu_threads = analysis::cpu_profile_per_thread_with_resolver(
+        events,
+        None,
+        sourcemap_resolver.as_ref(),
     );
     Ok(Loaded { app, trace, min_ts })
 }
@@ -404,7 +427,17 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         junit::write_junit(target, &junit::junit_single_xml(&gates))?;
     }
     let Some(path_b) = cli.compare.as_deref().map(Path::new) else {
-        return inspect::inspect_output(&trace.trace_events, min_ts, &name_a, cli, &trace.stats);
+        let resolver = trace.metadata.as_ref().map(|m| {
+            chperf_core::trace::SourceMapResolver::new(&m.source_maps)
+        });
+        return inspect::inspect_output(
+            &trace.trace_events,
+            min_ts,
+            &name_a,
+            cli,
+            &trace.stats,
+            resolver.as_ref(),
+        );
     };
     eprintln!("Loading {}...", path_b.display());
     let trace_b = trace::parse_trace(path_b).map_err(|e| {
@@ -415,6 +448,12 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         )
     })?;
     eprintln!("  {} events", trace_b.trace_events.len());
+    let resolver_a = trace.metadata.as_ref().map(|m| {
+        chperf_core::trace::SourceMapResolver::new(&m.source_maps)
+    });
+    let resolver_b = trace_b.metadata.as_ref().map(|m| {
+        chperf_core::trace::SourceMapResolver::new(&m.source_maps)
+    });
     inspect::inspect_compare_output(
         &trace.trace_events,
         &name_a,
@@ -423,6 +462,8 @@ fn run_inspect(path: &Path, cli: &Cli) -> Result<(), Box<dyn std::error::Error>>
         cli,
         &trace.stats,
         &trace_b.stats,
+        resolver_a.as_ref(),
+        resolver_b.as_ref(),
     )
 }
 

@@ -110,11 +110,31 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
             "app_us": app.cpu_profile.app_time_us.round(),
             "runtime_us": app.cpu_profile.runtime_time_us.round(),
             "native_us": app.cpu_profile.native_time_us.round(),
+            "source_maps": {
+                "scripts": app.cpu_profile.source_maps.scripts,
+                "resolved_frames": app.cpu_profile.source_maps.resolved_frames,
+            },
             "functions": app.cpu_profile.functions.iter().take(30).map(|f| json!({
                 "function": f.function_name, "url": f.url,
                 "source": f.source_type.label(),
                 "self_us": f.self_time_us.round(), "self_ms": ms(f.self_time_us),
             })).collect::<Vec<_>>(),
+            "threads": app.cpu_threads.iter().take(20).map(|t| {
+                let prog_us: f64 = t.functions.iter()
+                    .find(|f| f.function_name == "(program)")
+                    .map(|f| f.self_time_us).unwrap_or(0.0);
+                json!({
+                    "pid": t.pid, "tid": t.tid, "thread_name": t.thread_name,
+                    "total_us": t.total_us.round(), "total_ms": ms(t.total_us),
+                    "sample_count": t.sample_count,
+                    "program_us": prog_us.round(),
+                    "top": t.functions.iter().take(5).map(|f| json!({
+                        "function": f.function_name, "url": f.url,
+                        "source": f.source_type.label(),
+                        "self_us": f.self_time_us.round(), "self_ms": ms(f.self_time_us),
+                    })).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
         }),
     );
     obj.insert(

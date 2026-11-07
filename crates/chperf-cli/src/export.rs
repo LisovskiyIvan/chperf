@@ -111,7 +111,7 @@ pub fn export_markdown(app: &App) -> String {
     export_scroll_frames(&mut out, &app.scroll_frames);
 
     // ── CPU Profile ──
-    export_cpu_profile(&mut out, &app.cpu_profile);
+    export_cpu_profile(&mut out, &app.cpu_profile, &app.cpu_threads);
 
     // ── Layout Dirty ──
     export_layout_dirty(&mut out, &app.layout_dirty);
@@ -398,7 +398,7 @@ fn export_scroll_frames(out: &mut String, sf: &ScrollFrameResult) {
     out.push('\n');
 }
 
-fn export_cpu_profile(out: &mut String, cp: &CpuProfileResult) {
+fn export_cpu_profile(out: &mut String, cp: &CpuProfileResult, threads: &[CpuThreadProfile]) {
     out.push_str("## CPU Profile (Top Functions by Self-Time)\n\n");
 
     if cp.functions.is_empty() {
@@ -432,10 +432,17 @@ fn export_cpu_profile(out: &mut String, cp: &CpuProfileResult) {
         rt_pct
     ));
     out.push_str(&format!(
-        "- **Native/Browser**: {} ({:.1}%)\n\n",
+        "- **Native/Browser**: {} ({:.1}%)\n",
         fmt_us(cp.native_time_us),
         native_pct
     ));
+    if cp.source_maps.scripts > 0 {
+        out.push_str(&format!(
+            "- **Source maps**: {} scripts, {} anonymous frames resolved\n",
+            cp.source_maps.scripts, cp.source_maps.resolved_frames,
+        ));
+    }
+    out.push('\n');
 
     out.push_str("| # | Source | Function | Self Time | % of sampled time | Cumulative % of sampled time | File |\n");
     out.push_str("|---|--------|----------|-----------|---------------------|--------------------------------|------|\n");
@@ -474,6 +481,74 @@ fn export_cpu_profile(out: &mut String, cp: &CpuProfileResult) {
         ));
     }
     out.push('\n');
+
+    // Per-thread breakdown: top 8 threads by sampled time, each with its
+    // top 5 nodes (share of that thread) plus an explicit `(program)` cell.
+    if !threads.is_empty() {
+        let shown = threads.len().min(8);
+        out.push_str(&format!(
+            "### Per-thread breakdown (top {} of {} threads)\n\n",
+            shown,
+            threads.len(),
+        ));
+        out.push_str("| # | tid | thread | total | samples | (program) | top nodes |\n");
+        out.push_str("|---|-----|--------|-------|---------|-----------|-----------|\n");
+        for (i, t) in threads.iter().take(shown).enumerate() {
+            let prog_us = t
+                .functions
+                .iter()
+                .find(|f| f.function_name == "(program)")
+                .map(|f| f.self_time_us)
+                .unwrap_or(0.0);
+            let prog_cell = if prog_us > 0.0 && t.total_us > 0.0 {
+                format!(
+                    "{} ({:.1}%)",
+                    fmt_us(prog_us),
+                    prog_us / t.total_us * 100.0
+                )
+            } else {
+                "—".to_string()
+            };
+            let top: Vec<String> = t
+                .functions
+                .iter()
+                .take(5)
+                .map(|f| {
+                    let name = if f.function_name.is_empty() {
+                        "(anonymous)"
+                    } else {
+                        &f.function_name
+                    };
+                    let pct = if t.total_us > 0.0 {
+                        f.self_time_us / t.total_us * 100.0
+                    } else {
+                        0.0
+                    };
+                    format!("{} ({} {:.1}%)", name, fmt_us(f.self_time_us), pct)
+                })
+                .collect();
+            let thread_label = if t.thread_name.is_empty() {
+                "—"
+            } else {
+                &t.thread_name
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                i + 1,
+                t.tid,
+                thread_label,
+                fmt_us(t.total_us),
+                t.sample_count,
+                prog_cell,
+                if top.is_empty() {
+                    "—".to_string()
+                } else {
+                    top.join(", ")
+                },
+            ));
+        }
+        out.push('\n');
+    }
 }
 
 fn export_layout_dirty(out: &mut String, ld: &LayoutDirtyResult) {

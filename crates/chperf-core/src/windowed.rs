@@ -595,7 +595,21 @@ pub fn calltree_section(
     min_ts: f64,
     cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
-    let cpu = crate::inspect::collect_cpu_profile(events, scope, cache);
+    calltree_section_with_resolver(events, scope, name_matcher, url_matcher, top, min_ts, cache, None)
+}
+
+/// Like [`calltree_section`] with source-map resolution.
+pub fn calltree_section_with_resolver(
+    events: &[TraceEvent],
+    scope: &Scope,
+    name_matcher: Option<&Matcher>,
+    url_matcher: Option<&Matcher>,
+    top: usize,
+    min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+    resolver: Option<&crate::trace::SourceMapResolver>,
+) -> (String, Value) {
+    let cpu = crate::inspect::collect_cpu_profile_with_resolver(events, scope, cache, resolver);
     let nodes = cpu.nodes;
     let self_time = cpu.leaf_time;
 

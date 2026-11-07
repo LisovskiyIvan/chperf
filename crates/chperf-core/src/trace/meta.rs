@@ -16,6 +16,24 @@ pub struct FrameInfo {
     pub is_main_frame: bool,
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct SourceMapData {
+    #[serde(default)]
+    pub mappings: String,
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct SourceMapEntry {
+    #[serde(default)]
+    pub url: String,
+    #[serde(rename = "sourceMap")]
+    pub source_map: SourceMapData,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct TraceMetadata {
     #[serde(rename = "cpuThrottling", default)]
@@ -29,6 +47,8 @@ pub struct TraceMetadata {
     pub network_throttling: Option<String>,
     #[serde(rename = "hardwareConcurrency", default)]
     pub hardware_concurrency: Option<u32>,
+    #[serde(rename = "sourceMaps", default)]
+    pub source_maps: Vec<SourceMapEntry>,
     #[serde(rename = "hostDPR", default)]
     pub host_dpr: Option<f64>,
     /// Extracted from TracingStartedInBrowser (not in JSON metadata)
@@ -431,8 +451,36 @@ pub fn list_traces_with_skipped(
     Ok((by_stem.into_values().collect(), skipped))
 }
 
+/// Content sniff for a bare (extensionless) file: gzip magic, or a JSON
+/// object/array start after an optional BOM and whitespace. Anything else
+/// (e.g. `notes.txt`) is not a trace dump.
+fn bare_file_is_trace(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 64];
+    let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let b = &head[..n];
+    if b.starts_with(&[0x1f, 0x8b]) {
+        return true;
+    }
+    let mut p = if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+    while p < n && b[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    p < n && (b[p] == b'{' || b[p] == b'[')
+}
+
 /// Resolve a trace input string to trace file paths:
 /// - an existing `.json` / `.json.gz` file → `vec![it]`;
+/// - an existing bare (extensionless) trace dump → `vec![it]` when its
+///   content sniffs as a trace (gzip magic, or a JSON object/array start —
+///   e.g. a DevTools dump literally named `download`);
 /// - an existing directory → the `list_traces` listing (`.gz` preferred);
 /// - a glob pattern (contains `*`, `?` or `[`) → the matching `*.json` /
 ///   `*.json.gz` files in one directory (**non-recursive**; the pattern's
@@ -450,8 +498,14 @@ pub fn expand_trace_input(input: &str) -> Result<Vec<PathBuf>, String> {
         if lower.ends_with(".json") || lower.ends_with(".json.gz") {
             return Ok(vec![p.to_path_buf()]);
         }
+        // Bare trace dump (no `.json` / `.json.gz` name): accept by content
+        // sniff so the parser's gzip/JSON detection applies downstream.
+        // Anything else keeps the "not a trace file" error.
+        if bare_file_is_trace(p) {
+            return Ok(vec![p.to_path_buf()]);
+        }
         return Err(format!(
-            "input '{input}' is not a trace file: expected a .json or .json.gz file, a directory, or a glob pattern"
+            "input '{input}' is not a trace file: expected a .json or .json.gz file, a bare trace dump, a directory, or a glob pattern"
         ));
     }
     if p.is_dir() {
@@ -464,7 +518,7 @@ pub fn expand_trace_input(input: &str) -> Result<Vec<PathBuf>, String> {
         return Ok(traces);
     }
     Err(format!(
-        "input '{input}' does not exist: expected a .json/.json.gz file, a directory, or a glob pattern"
+        "input '{input}' does not exist: expected a .json/.json.gz file, a bare trace dump, a directory, or a glob pattern"
     ))
 }
 
@@ -886,6 +940,38 @@ mod tests {
         let m = super::detect_thread_model(&events);
         assert_eq!(m.compositor, vec![7, 8]);
         assert_eq!(m.browser_main, Some(9));
+    }
+
+    /// Bare (extensionless) dumps resolve by content sniff — plain JSON and
+    /// gzip both — while non-trace bytes stay an error.
+    #[test]
+    fn expand_trace_input_bare_dump_sniffs_content() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("chperf-bare-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("download-json");
+        std::fs::write(&json, "{}").unwrap();
+        let gz = dir.join("download-gz");
+        {
+            let f = std::fs::File::create(&gz).unwrap();
+            let mut enc =
+                flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            enc.write_all(b"{}").unwrap();
+            enc.finish().unwrap();
+        }
+        let txt = dir.join("download-txt");
+        std::fs::write(&txt, "x").unwrap();
+        assert_eq!(
+            super::expand_trace_input(json.to_str().unwrap()),
+            Ok(vec![json.clone()])
+        );
+        assert_eq!(
+            super::expand_trace_input(gz.to_str().unwrap()),
+            Ok(vec![gz.clone()])
+        );
+        assert!(super::expand_trace_input(txt.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

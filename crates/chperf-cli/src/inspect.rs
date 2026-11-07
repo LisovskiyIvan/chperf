@@ -17,6 +17,8 @@ pub(crate) fn inspect_compare_output(
     cli: &Cli,
     stats_a: &trace::ParseStats,
     stats_b: &trace::ParseStats,
+    resolver_a: Option<&trace::SourceMapResolver>,
+    resolver_b: Option<&trace::SourceMapResolver>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_inspect_query(cli)?;
     let min_ts_a = inspect::trace_start_us(events_a);
@@ -33,11 +35,23 @@ pub(crate) fn inspect_compare_output(
             .transpose()?;
         print!(
             "{}",
-            inspect::stacks_folded(events_a, matcher.as_ref(), &ws_a.scope, None)
+            inspect::stacks_folded_with_resolver(
+                events_a,
+                matcher.as_ref(),
+                &ws_a.scope,
+                None,
+                resolver_a,
+            )
         );
         print!(
             "{}",
-            inspect::stacks_folded(events_b, matcher.as_ref(), &ws_b.scope, None)
+            inspect::stacks_folded_with_resolver(
+                events_b,
+                matcher.as_ref(),
+                &ws_b.scope,
+                None,
+                resolver_b,
+            )
         );
         return Ok(());
     }
@@ -94,6 +108,7 @@ pub(crate) fn inspect_compare_output(
         cli,
         compare.as_ref().map(|(da, _)| da),
         stats_a,
+        resolver_a,
     )?;
     let mut sections_b = build_sections(
         events_b,
@@ -102,6 +117,7 @@ pub(crate) fn inspect_compare_output(
         cli,
         compare.as_ref().map(|(_, db)| db),
         stats_b,
+        resolver_b,
     )?;
 
     if cli.json {
@@ -279,6 +295,7 @@ pub(crate) fn inspect_output(
     trace_name: &str,
     cli: &Cli,
     stats: &trace::ParseStats,
+    resolver: Option<&trace::SourceMapResolver>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_inspect_query(cli)?;
     let ws = resolve_windows(events, min_ts, cli)?;
@@ -292,12 +309,12 @@ pub(crate) fn inspect_output(
             .transpose()?;
         print!(
             "{}",
-            inspect::stacks_folded(events, matcher.as_ref(), &ws.scope, None)
+            inspect::stacks_folded_with_resolver(events, matcher.as_ref(), &ws.scope, None, resolver)
         );
         return Ok(());
     }
 
-    let mut sections = build_sections(events, min_ts, &ws, cli, None, stats)?;
+    let mut sections = build_sections(events, min_ts, &ws, cli, None, stats, resolver)?;
     cap_memory_json(&mut sections, cli.top);
     dispatch_output(&sections, trace_name, min_ts, &ws, cli)
 }
@@ -461,6 +478,7 @@ fn build_sections(
     cli: &Cli,
     delta: Option<&windowed::DeltaData>,
     stats: &trace::ParseStats,
+    resolver: Option<&trace::SourceMapResolver>,
 ) -> Result<Vec<Section>, Box<dyn std::error::Error>> {
     let scope = &ws.scope;
     let sort = match cli.sort.as_deref() {
@@ -619,13 +637,27 @@ fn build_sections(
         None
     };
     if let Some(m) = &func_matcher {
-        let (md, j) = inspect::functions_section(events, m, scope, cli.top, min_ts, None);
+        let (md, j) =
+            inspect::functions_section_with_resolver(events, m, scope, cli.top, min_ts, None, resolver);
         sections.push(("functions", md, j));
     }
     if cli.stacks {
-        let (md, j) =
-            inspect::stacks_section(events, func_matcher.as_ref(), scope, cli.top, min_ts, None);
+        let (md, j) = inspect::stacks_section_with_resolver(
+            events,
+            func_matcher.as_ref(),
+            scope,
+            cli.top,
+            min_ts,
+            None,
+            resolver,
+        );
         sections.push(("stacks", md, j));
+    }
+    if cli.cpu_threads {
+        let (md, j) = inspect::cpu_threads_section_with_resolver(
+            events, scope, cli.top, 3, min_ts, resolver,
+        );
+        sections.push(("cpu_threads", md, j));
     }
     if cli.calltree {
         let url_matcher = if let Some(p) = &cli.url {
@@ -633,7 +665,7 @@ fn build_sections(
         } else {
             None
         };
-        let (md, j) = windowed::calltree_section(
+        let (md, j) = windowed::calltree_section_with_resolver(
             events,
             scope,
             func_matcher.as_ref(),
@@ -641,6 +673,7 @@ fn build_sections(
             cli.top,
             min_ts,
             None,
+            resolver,
         );
         sections.push(("calltree", md, j));
     }
@@ -671,8 +704,16 @@ fn build_sections(
     }
     if let Some(needle) = &cli.find {
         let m = inspect::Matcher::new(needle, cli.regex)?;
-        let (md, j) =
-            inspect::find_section(events, &m, scope, cli.full_args, cli.top, min_ts, None);
+        let (md, j) = inspect::find_section_with_resolver(
+            events,
+            &m,
+            scope,
+            cli.full_args,
+            cli.top,
+            min_ts,
+            None,
+            resolver,
+        );
         sections.push(("find", md, j));
     }
 

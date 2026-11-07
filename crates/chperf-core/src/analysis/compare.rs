@@ -763,6 +763,7 @@ mod tests {
             app_time_us: total,
             runtime_time_us: 0.0,
             native_time_us: 0.0,
+            source_maps: crate::trace::SourceMapStats::default(),
         }
     }
 

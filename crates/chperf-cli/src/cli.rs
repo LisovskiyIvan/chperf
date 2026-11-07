@@ -85,6 +85,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) stacks: bool,
 
+    /// Inspect: per-thread CPU sample breakdown (tid-aware ProfileChunk
+    /// attribution, heaviest thread first, with per-thread top nodes)
+    #[arg(long = "cpu-threads")]
+    pub(crate) cpu_threads: bool,
     /// Inspect: folded stacks (`a;b;c <us>`) for flamegraph.pl / speedscope
     #[arg(long)]
     pub(crate) flame: bool,
@@ -273,6 +277,7 @@ impl Cli {
             || self.names
             || self.threads
             || self.stacks
+            || self.cpu_threads
             || self.flame
             || self.task
             || self.timeline

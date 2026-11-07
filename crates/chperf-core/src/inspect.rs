@@ -793,7 +793,23 @@ pub fn functions_section(
     min_ts: f64,
     cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
-    let (node_map, self_times) = crate::analysis::cpu_profile_for(events, scope, cache);
+    functions_section_with_resolver(events, matcher, scope, top, min_ts, cache, None)
+}
+
+/// Like [`functions_section`] with source-map resolution: resolved names
+/// flow through the node table, so `--function <substr>` matches them with
+/// no new flag.
+pub fn functions_section_with_resolver(
+    events: &[TraceEvent],
+    matcher: &Matcher,
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+    resolver: Option<&crate::trace::SourceMapResolver>,
+) -> (String, Value) {
+    let (node_map, self_times) =
+        crate::analysis::cpu_profile_for_with_resolver(events, scope, cache, resolver);
     let total_in_scope: f64 = self_times.values().sum();
 
     let mut funcs: Vec<(&str, &str, f64)> = self_times
@@ -886,7 +902,18 @@ pub fn collect_cpu_profile(
     scope: &Scope,
     cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> CpuProfile {
-    let (nodes, leaf_time) = crate::analysis::cpu_profile_for(events, scope, cache);
+    collect_cpu_profile_with_resolver(events, scope, cache, None)
+}
+
+/// Like [`collect_cpu_profile`] with source-map resolution.
+pub fn collect_cpu_profile_with_resolver(
+    events: &[TraceEvent],
+    scope: &Scope,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+    resolver: Option<&crate::trace::SourceMapResolver>,
+) -> CpuProfile {
+    let (nodes, leaf_time) =
+        crate::analysis::cpu_profile_for_with_resolver(events, scope, cache, resolver);
     CpuProfile { nodes, leaf_time }
 }
 
@@ -931,7 +958,20 @@ pub fn stacks_section(
     min_ts: f64,
     cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> (String, Value) {
-    let cpu = collect_cpu_profile(events, scope, cache);
+    stacks_section_with_resolver(events, matcher, scope, top, min_ts, cache, None)
+}
+
+/// Like [`stacks_section`] with source-map resolution.
+pub fn stacks_section_with_resolver(
+    events: &[TraceEvent],
+    matcher: Option<&Matcher>,
+    scope: &Scope,
+    top: usize,
+    min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+    resolver: Option<&crate::trace::SourceMapResolver>,
+) -> (String, Value) {
+    let cpu = collect_cpu_profile_with_resolver(events, scope, cache, resolver);
     let node_map = cpu.nodes;
     let leaf_time = cpu.leaf_time;
 
@@ -1036,7 +1076,18 @@ pub fn stacks_folded(
     scope: &Scope,
     cache: Option<&crate::analysis::CpuProfileCache>,
 ) -> String {
-    let cpu = collect_cpu_profile(events, scope, cache);
+    stacks_folded_with_resolver(events, matcher, scope, cache, None)
+}
+
+/// Like [`stacks_folded`] with source-map resolution.
+pub fn stacks_folded_with_resolver(
+    events: &[TraceEvent],
+    matcher: Option<&Matcher>,
+    scope: &Scope,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+    resolver: Option<&crate::trace::SourceMapResolver>,
+) -> String {
+    let cpu = collect_cpu_profile_with_resolver(events, scope, cache, resolver);
     let mut leaves: Vec<(crate::analysis::NodeKey, f64)> = cpu
         .leaf_time
         .iter()
@@ -1065,6 +1116,132 @@ pub fn stacks_folded(
     out
 }
 
+/// Per-thread CPU sample breakdown (tid-aware attribution of ProfileChunk
+/// samples): one row per `(pid, tid)` with samples in scope, heaviest
+/// thread first, each with its top `top_nodes` functions (self-time share
+/// of that thread) plus an explicit `(program)` column — native time
+/// outside JS stacks is the main thing the merged totals cannot attribute.
+///
+/// `top_threads` caps the rendered rows (JSON carries the same rows);
+/// threads beyond the cap are noted, not dropped from the totals.
+pub fn cpu_threads_section(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top_threads: usize,
+    top_nodes: usize,
+    min_ts: f64,
+) -> (String, Value) {
+    cpu_threads_section_with_resolver(events, scope, top_threads, top_nodes, min_ts, None)
+}
+
+/// Like [`cpu_threads_section`] with source-map resolution: resolved names
+/// flow into each thread's top nodes automatically.
+pub fn cpu_threads_section_with_resolver(
+    events: &[TraceEvent],
+    scope: &Scope,
+    top_threads: usize,
+    top_nodes: usize,
+    min_ts: f64,
+    resolver: Option<&crate::trace::SourceMapResolver>,
+) -> (String, Value) {
+    let threads =
+        crate::analysis::cpu_profile_per_thread_with_resolver(events, Some(scope), resolver);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## CPU profile per thread ({} threads, {})\n\n",
+        threads.len(),
+        window_label(scope.window),
+    ));
+    if let Some(line) = scope.window_line(min_ts) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let mut json_rows: Vec<Value> = Vec::new();
+    if threads.is_empty() {
+        out.push_str("No CPU profile samples in scope.\n\n");
+        return (out, Value::Array(json_rows));
+    }
+    out.push_str("| # | tid | thread | total(ms) | samples | (program) | top nodes |\n");
+    out.push_str("|---|-----|--------|-----------|---------|-----------|-----------|\n");
+    for (i, t) in threads.iter().take(top_threads).enumerate() {
+        let prog_us = t
+            .functions
+            .iter()
+            .find(|f| f.function_name == "(program)")
+            .map(|f| f.self_time_us)
+            .unwrap_or(0.0);
+        let prog_cell = if prog_us > 0.0 {
+            format!(
+                "{}ms ({:.1}%)",
+                fmt_ms(prog_us),
+                prog_us / t.total_us * 100.0
+            )
+        } else {
+            "—".to_string()
+        };
+        let top: Vec<String> = t
+            .functions
+            .iter()
+            .take(top_nodes)
+            .map(|f| {
+                let label = if f.function_name.is_empty() {
+                    "(anonymous)"
+                } else {
+                    f.function_name.as_str()
+                };
+                format!(
+                    "{} {}ms ({:.1}%)",
+                    truncate(label, 48),
+                    fmt_ms(f.self_time_us),
+                    f.self_time_us / t.total_us * 100.0,
+                )
+            })
+            .collect();
+        let thread_label = if t.thread_name.is_empty() {
+            "—"
+        } else {
+            t.thread_name.as_str()
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            i + 1,
+            t.tid,
+            thread_label,
+            fmt_ms(t.total_us),
+            t.sample_count,
+            prog_cell,
+            if top.is_empty() {
+                "—".to_string()
+            } else {
+                top.join(", ")
+            },
+        ));
+        json_rows.push(json!({
+            "pid": t.pid,
+            "tid": t.tid,
+            "thread_name": t.thread_name,
+            "total_us": t.total_us.round(),
+            "sample_count": t.sample_count,
+            "program_us": prog_us.round(),
+            "top": t.functions.iter().take(top_nodes).map(|f| json!({
+                "function": if f.function_name.is_empty() { "(anonymous)" } else { &f.function_name },
+                "url": f.url,
+                "self_us": f.self_time_us.round(),
+                "pct": f.self_time_us / t.total_us * 100.0,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    if threads.len() > top_threads {
+        out.push_str(&format!(
+            "\n_Showing {} of {} threads (use --top to see more)._\n",
+            top_threads,
+            threads.len(),
+        ));
+    }
+    out.push('\n');
+    (out, Value::Array(json_rows))
+}
+
 /// Does this JSON value (or any nested string, object key, number, bool)
 /// match? Mirrors the old behavior of matching the fully serialized JSON.
 fn value_matches(v: &Value, matcher: &Matcher) -> bool {
@@ -1089,6 +1266,20 @@ pub fn find_section(
     top: usize,
     min_ts: f64,
     cache: Option<&crate::analysis::CpuProfileCache>,
+) -> (String, Value) {
+    find_section_with_resolver(events, matcher, scope, full_args, top, min_ts, cache, None)
+}
+
+/// Like [`find_section`] with source-map resolution for the CPU-profile half.
+pub fn find_section_with_resolver(
+    events: &[TraceEvent],
+    matcher: &Matcher,
+    scope: &Scope,
+    full_args: bool,
+    top: usize,
+    min_ts: f64,
+    cache: Option<&crate::analysis::CpuProfileCache>,
+    resolver: Option<&crate::trace::SourceMapResolver>,
 ) -> (String, Value) {
     let mut matches: Vec<(&TraceEvent, String)> = Vec::new();
     let needle_label = matcher.label();
@@ -1177,7 +1368,8 @@ pub fn find_section(
     out.push('\n');
 
     // Combined search: also match CPU profile function names and source URLs.
-    let (node_map, self_times) = crate::analysis::cpu_profile_for(events, scope, cache);
+    let (node_map, self_times) =
+        crate::analysis::cpu_profile_for_with_resolver(events, scope, cache, resolver);
     let mut cpu_matches: Vec<(String, String, f64)> = self_times
         .iter()
         .filter_map(|(id, t)| node_map.get(id).map(|(n, u, _)| (n.clone(), u.clone(), *t)))
@@ -4524,5 +4716,114 @@ mod tests {
         let (md, j) = renderers_section(&[], &scope, 0.0);
         assert!(md.contains("No renderer threads found."), "{}", md);
         assert_eq!(j.as_array().unwrap().len(), 0);
+    }
+
+    fn ev_profile(ts: f64, tid: u64, pid: u64) -> TraceEvent {
+        TraceEvent {
+            name: "Profile".into(),
+            id: 0,
+            has_id: false,
+            ph: b'P',
+            ts,
+            dur: None,
+            tid,
+            pid,
+            cat: None,
+            args: None,
+        }
+    }
+
+    fn ev_chunk(
+        ts: f64,
+        tid: u64,
+        pid: u64,
+        nodes: &[(u64, &str, Option<u64>)],
+        samples: &[u64],
+        deltas: &[f64],
+    ) -> TraceEvent {
+        let nodes_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(id, name, parent)| {
+                json!({"id": id, "callFrame": {"functionName": name, "url": ""}, "parent": parent})
+            })
+            .collect();
+        TraceEvent {
+            name: "ProfileChunk".into(),
+            id: 0,
+            has_id: false,
+            ph: b'P',
+            ts,
+            dur: None,
+            tid,
+            pid,
+            cat: None,
+            args: crate::trace::test_args(json!({
+                "data": {"cpuProfile": {"nodes": nodes_json, "samples": samples}, "timeDeltas": deltas}
+            })),
+        }
+    }
+
+    #[test]
+    fn cpu_threads_section_splits_samples_per_tid() {
+        // Two tids sampled independently: the section reports one row per
+        // thread (heaviest first) with per-thread totals and (program)
+        // shares that sum to the merged scan.
+        let events = vec![
+            ev_tn(2, 65, "CrRendererMain"),
+            ev_tn(2, 66, "CompositorTileWorker"),
+            ev_profile(1_000_000.0, 65, 2),
+            ev_chunk(
+                1_000_000.0,
+                65,
+                2,
+                &[
+                    (1, "(root)", None),
+                    (2, "(program)", Some(1)),
+                    (3, "gameUpdate", Some(1)),
+                ],
+                &[2, 2, 3],
+                &[1000.0, 1000.0, 1000.0],
+            ),
+            ev_profile(2_000_000.0, 66, 2),
+            ev_chunk(
+                2_000_000.0,
+                66,
+                2,
+                &[
+                    (1, "(root)", None),
+                    (2, "(program)", Some(1)),
+                    (4, "raster", Some(1)),
+                ],
+                &[2, 4],
+                &[2000.0, 2000.0],
+            ),
+        ];
+        let scope = Scope {
+            window: None,
+            tid: None,
+            pid: None,
+            cat: None,
+        };
+        let (md, j) = cpu_threads_section(&events, &scope, 10, 3, 0.0);
+        assert!(md.contains("## CPU profile per thread (2 threads"), "{}", md);
+        assert!(md.contains("CrRendererMain"), "{}", md);
+        assert!(md.contains("CompositorTileWorker"), "{}", md);
+        let rows = j.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Heaviest thread first; per-thread totals sum to the merged total.
+        assert_eq!(rows[0]["tid"], 66);
+        assert_eq!(rows[0]["total_us"], 4_000.0);
+        assert_eq!(rows[0]["sample_count"], 2);
+        assert_eq!(rows[0]["program_us"], 2_000.0);
+        assert_eq!(rows[1]["tid"], 65);
+        assert_eq!(rows[1]["total_us"], 3_000.0);
+        let total: f64 = rows
+            .iter()
+            .map(|r| r["total_us"].as_f64().unwrap())
+            .sum();
+        assert_eq!(total, 7_000.0);
+        // Top nodes carry per-thread shares.
+        assert_eq!(rows[0]["top"][0]["function"], "(program)");
+        assert_eq!(rows[0]["top"][0]["self_us"], 2_000.0);
     }
 }
