@@ -22,6 +22,10 @@ pub struct App {
     pub loading: LoadingResult,
     pub network: NetworkResult,
     pub raster: RasterResult,
+    /// GPU time: `GPUTask` utilization + compositor frame-pipeline latency.
+    /// `tasks`/`frame_latency` are `None` when their events are absent
+    /// (traces without a GPU process or without compositor frame pairs).
+    pub gpu: GpuResult,
     pub official_long_tasks: Vec<LatencyEntry>,
     pub thread_model: ThreadModel,
     pub renderer_summaries: Vec<(chperf_core::trace::RendererThread, SummaryResult)>,
@@ -50,6 +54,7 @@ impl App {
         loading: LoadingResult,
         network: NetworkResult,
         raster: RasterResult,
+        gpu: GpuResult,
         official_long_tasks: Vec<LatencyEntry>,
         thread_model: ThreadModel,
         renderer_summaries: Vec<(chperf_core::trace::RendererThread, SummaryResult)>,
@@ -77,6 +82,7 @@ impl App {
             loading,
             network,
             raster,
+            gpu,
             official_long_tasks,
             thread_model,
             renderer_summaries,

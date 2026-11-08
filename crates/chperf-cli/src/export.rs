@@ -134,6 +134,9 @@ pub fn export_markdown(app: &App) -> String {
     // ── Raster/Compositor ──
     export_raster(&mut out, app);
 
+    // ── GPU (skipped when the trace has neither GPUTask nor frame pairs) ──
+    export_gpu(&mut out, app);
+
     // ── Official long tasks / EventTiming ──
     export_official(&mut out, app);
 
@@ -882,6 +885,93 @@ fn export_raster(out: &mut String, app: &App) {
         }
         out.push('\n');
     }
+}
+
+/// Shared GPU renderer: the full-report `## GPU` section and `--gpu`
+/// inspect output render the same markdown from one `GpuResult`.
+/// Returns an empty string when the trace has neither `GPUTask` events
+/// nor compositor frame pairs (report skips the section entirely).
+pub fn gpu_section_md(gpu: &GpuResult) -> String {
+    if gpu.tasks.is_none() && gpu.frame_latency.is_none() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(1024);
+    out.push_str("## GPU\n\n");
+    if let Some(t) = &gpu.tasks {
+        out.push_str(&format!(
+            "- **GPUTask**: {} events · busy {} ({:.1}% of trace)\n",
+            t.count,
+            fmt_us(t.busy_us),
+            t.utilization_pct,
+        ));
+        out.push_str(&format!(
+            "- **Task duration**: median {} · p95 {} · max {}\n\n",
+            fmt_us(t.median_us),
+            fmt_us(t.p95_us),
+            fmt_us(t.max_us),
+        ));
+        out.push_str("| renderer_pid | tasks | busy | share |\n");
+        out.push_str("|--------------|-------|------|-------|\n");
+        for r in &t.per_renderer {
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.1}% |\n",
+                r.renderer_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                r.count,
+                fmt_us(r.busy_us),
+                r.share_pct,
+            ));
+        }
+        out.push('\n');
+        if !t.longest.is_empty() {
+            out.push_str("### Longest GPU tasks\n\n");
+            out.push_str("| # | dur | t offset | renderer_pid |\n");
+            out.push_str("|---|-----|----------|--------------|\n");
+            for (i, l) in t.longest.iter().enumerate() {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    i + 1,
+                    fmt_us(l.dur_us),
+                    fmt_us(l.ts_offset_us),
+                    l.renderer_pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ));
+            }
+            out.push('\n');
+        }
+    }
+    if let Some(f) = &gpu.frame_latency {
+        out.push_str("### Frame pipeline (compositor submit→present)\n\n");
+        out.push_str(&format!("- **Frames**: {} paired\n", f.frame_count));
+        out.push_str(&format!(
+            "- **submit→present**: median {} · p95 {} · max {}\n",
+            fmt_us(f.total.median_us),
+            fmt_us(f.total.p95_us),
+            fmt_us(f.total.max_us),
+        ));
+        out.push_str(&format!(
+            "- **draw phase** (StartDrawToSwapStart): median {} · p95 {} · max {} (n={})\n",
+            fmt_us(f.draw.median_us),
+            fmt_us(f.draw.p95_us),
+            fmt_us(f.draw.max_us),
+            f.draw.count,
+        ));
+        out.push_str(&format!(
+            "- **present phase** (SwapEndToPresentationCompositorFrame): median {} · p95 {} · max {} (n={})\n",
+            fmt_us(f.present.median_us),
+            fmt_us(f.present.p95_us),
+            fmt_us(f.present.max_us),
+            f.present.count,
+        ));
+        out.push('\n');
+    }
+    out
+}
+
+fn export_gpu(out: &mut String, app: &App) {
+    out.push_str(&gpu_section_md(&app.gpu));
 }
 
 fn export_official(out: &mut String, app: &App) {

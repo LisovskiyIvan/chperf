@@ -3,7 +3,7 @@
 //! inspect JSON conventions.
 
 use crate::app::App;
-use chperf_core::analysis::FindingSeverity;
+use chperf_core::analysis::{FindingSeverity, GpuResult};
 use chperf_core::{inspect, trace};
 use serde_json::{json, Value};
 
@@ -11,9 +11,48 @@ fn ms(us: f64) -> f64 {
     (us / 1000.0 * 100.0).round() / 100.0
 }
 
+/// Machine-readable GPU section, mirroring the `## GPU` markdown tables.
+/// `tasks` / `frame_latency` are `null` when their events are absent.
+pub fn gpu_json(gpu: &GpuResult) -> Value {
+    json!({
+        "tasks": gpu.tasks.as_ref().map(|t| json!({
+            "count": t.count,
+            "busy_us": t.busy_us.round(), "busy_ms": ms(t.busy_us),
+            "utilization_pct": t.utilization_pct,
+            "median_us": t.median_us.round(), "median_ms": ms(t.median_us),
+            "p95_us": t.p95_us.round(), "p95_ms": ms(t.p95_us),
+            "max_us": t.max_us.round(), "max_ms": ms(t.max_us),
+            "per_renderer": t.per_renderer.iter().map(|r| json!({
+                "renderer_pid": r.renderer_pid,
+                "count": r.count,
+                "busy_us": r.busy_us.round(), "busy_ms": ms(r.busy_us),
+                "share_pct": r.share_pct,
+            })).collect::<Vec<_>>(),
+            "longest": t.longest.iter().map(|l| json!({
+                "dur_us": l.dur_us.round(), "dur_ms": ms(l.dur_us),
+                "ts_offset_us": l.ts_offset_us.round(),
+                "renderer_pid": l.renderer_pid,
+            })).collect::<Vec<_>>(),
+        })),
+        "frame_latency": gpu.frame_latency.as_ref().map(|f| {
+            let phase = |p: &chperf_core::analysis::GpuPhaseStats| json!({
+                "count": p.count,
+                "median_us": p.median_us.round(), "median_ms": ms(p.median_us),
+                "p95_us": p.p95_us.round(), "p95_ms": ms(p.p95_us),
+                "max_us": p.max_us.round(), "max_ms": ms(p.max_us),
+            });
+            json!({
+                "frame_count": f.frame_count,
+                "total": phase(&f.total),
+                "draw": phase(&f.draw),
+                "present": phase(&f.present),
+            })
+        }),
+    })
+}
 /// Full-report JSON value. Top-level shape (stable):
 /// trace, trace_health, summary, frame_blocking_tasks, cpu_profile,
-/// jank, loading, network, raster, renderers, memory?, compare?.
+/// jank, loading, network, raster, gpu?, renderers, memory?, compare?.
 pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) -> Value {
     let scope = inspect::Scope {
         window: None,
@@ -198,8 +237,7 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
     obj.insert(
         "raster".into(),
         json!({
-            "total_raster_us": app.raster.total_raster_us.round(),
-            "total_decode_us": app.raster.total_decode_us.round(),
+            "total_raster_us": app.raster.total_raster_us.round(),            "total_decode_us": app.raster.total_decode_us.round(),
             "total_composite_us": app.raster.total_composite_us.round(),
             "gpu_task_us": app.raster.gpu_task_us.round(),
             "max_decode_us": app.raster.max_decode_us.round(),
@@ -212,6 +250,9 @@ pub fn full_report_json(app: &App, events: &[trace::TraceEvent], min_ts: f64) ->
             })).collect::<Vec<_>>(),
         }),
     );
+    if app.gpu.tasks.is_some() || app.gpu.frame_latency.is_some() {
+        obj.insert("gpu".into(), gpu_json(&app.gpu));
+    }
     obj.insert(
         "renderers".into(),
         json!(app

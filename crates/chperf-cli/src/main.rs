@@ -68,6 +68,7 @@ pub(crate) fn load_and_analyze(
         renderer_summaries,
         renderer_janks,
         thread_count,
+        gpu,
     ) = if events.len() >= PARALLEL_THRESHOLD {
         std::thread::scope(|s| {
             let a = s.spawn(|| analysis::analyze_summary(events, main_tid));
@@ -96,6 +97,8 @@ pub(crate) fn load_and_analyze(
                 }
                 tids.len()
             });
+            // GPU pass is cheap (one linear scan); rides the same scope.
+            let k = s.spawn(|| analysis::analyze_gpu(events, frame_budget_us));
             (
                 a.join().unwrap(),
                 b.join().unwrap(),
@@ -107,6 +110,7 @@ pub(crate) fn load_and_analyze(
                 h.join().unwrap(),
                 i.join().unwrap(),
                 j.join().unwrap(),
+                k.join().unwrap(),
             )
         })
     } else {
@@ -129,6 +133,7 @@ pub(crate) fn load_and_analyze(
             analysis::analyze_summary_per_renderer(events, &thread_model),
             analysis::analyze_jank_per_renderer(events, &thread_model, Some(frame_budget_us)),
             tids.len(),
+            analysis::analyze_gpu(events, frame_budget_us),
         )
     };
     // Single-trace report sections (also used uncompared in compare mode).
@@ -162,6 +167,7 @@ pub(crate) fn load_and_analyze(
         loading,
         network,
         raster,
+        gpu,
         official_long_tasks,
         thread_model,
         renderer_summaries,

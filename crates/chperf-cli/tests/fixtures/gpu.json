@@ -1,0 +1,22 @@
+{
+  "traceEvents": [
+    {"name": "thread_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 7, "tid": 1, "args": {"name": "CrRendererMain"}},
+    {"name": "process_name", "cat": "__metadata", "ph": "M", "ts": 0, "pid": 7, "tid": 0, "args": {"name": "Renderer"}},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1000000, "dur": 1000, "pid": 7, "tid": 1},
+    {"name": "RunTask", "cat": "devtools.timeline", "ph": "X", "ts": 1090000, "dur": 10000, "pid": 7, "tid": 1},
+    {"name": "GPUTask", "cat": "disabled-by-default-devtools.timeline", "ph": "X", "ts": 1001000, "dur": 100, "pid": 44368, "tid": 931144, "args": {"data": {"renderer_pid": 73654, "used_bytes": 1000}}, "tdur": 90},
+    {"name": "GPUTask", "cat": "disabled-by-default-devtools.timeline", "ph": "X", "ts": 1002000, "dur": 200, "pid": 44368, "tid": 931144, "args": {"data": {"renderer_pid": 73654, "used_bytes": 2000}}, "tdur": 190},
+    {"name": "GPUTask", "cat": "disabled-by-default-devtools.timeline", "ph": "X", "ts": 1003000, "dur": 300, "pid": 44368, "tid": 931144, "args": {"data": {"renderer_pid": 73654, "used_bytes": 3000}}, "tdur": 290},
+    {"name": "GPUTask", "cat": "disabled-by-default-devtools.timeline", "ph": "X", "ts": 1004000, "dur": 1000, "pid": 44368, "tid": 931144, "args": {"data": {"renderer_pid": 90001, "used_bytes": 4000}}, "tdur": 990},
+    {"name": "GPUTask", "cat": "disabled-by-default-devtools.timeline", "ph": "X", "ts": 1005000, "dur": 2000, "pid": 44368, "tid": 931144, "args": {"data": {"renderer_pid": 90001, "used_bytes": 5000}}, "tdur": 1990},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "b", "ts": 1000000, "pid": 52760, "tid": 989929, "id2": {"local": "0x2"}, "args": {}},
+    {"name": "StartDrawToSwapStart", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "b", "ts": 1001000, "pid": 52760, "tid": 989929, "id2": {"local": "0x2"}, "args": {}},
+    {"name": "StartDrawToSwapStart", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "e", "ts": 1006000, "pid": 52760, "tid": 989929, "id2": {"local": "0x2"}, "args": {}},
+    {"name": "SwapEndToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "b", "ts": 1013000, "pid": 52760, "tid": 989929, "id2": {"local": "0x2"}, "args": {}},
+    {"name": "SwapEndToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "e", "ts": 1021000, "pid": 52760, "tid": 989929, "id2": {"local": "0x2"}, "args": {}},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "e", "ts": 1021000, "pid": 52760, "tid": 989929, "id2": {"local": "0x2"}, "args": {}},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "b", "ts": 1030000, "pid": 52760, "tid": 989929, "id2": {"local": "0x3"}, "args": {}},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "e", "ts": 1060000, "pid": 52760, "tid": 989929, "id2": {"local": "0x3"}, "args": {}},
+    {"name": "SubmitCompositorFrameToPresentationCompositorFrame", "cat": "cc,benchmark,disabled-by-default-devtools.timeline.frame", "ph": "b", "ts": 1070000, "pid": 52760, "tid": 989929, "id2": {"local": "0x4"}, "args": {}}
+  ]
+}

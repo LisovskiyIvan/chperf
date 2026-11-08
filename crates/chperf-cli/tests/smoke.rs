@@ -8,6 +8,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_chperf");
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.json");
 const FLOWS_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/flows.json");
 const MEDIUM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/medium.json");
+const GPU_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gpu.json");
 
 struct Out {
     status: i32,
@@ -241,7 +242,7 @@ fn smoke_regex_and_errors() {
     exits_nonzero(&[FIXTURE, "--regex", "--function", "("]); // invalid regex
     exits_nonzero(&[FIXTURE, "/nonexistent/trace.json", "--names"]); // missing file
     exits_nonzero(&[FIXTURE, "--events", "RunTask", "--tid", "notanumber"]); // bad tid
-    // anchor miss hard-fails (exit 2) unless --full-on-miss
+                                                                             // anchor miss hard-fails (exit 2) unless --full-on-miss
     exits_nonzero(&[FIXTURE, "--anchor", "zzz_no_match", "--names"]);
     ok(&[
         FIXTURE,
@@ -686,11 +687,9 @@ fn smoke_junit() {
         "junit+fail-on-regressed: {}{}",
         o.stdout, o.stderr
     );
-    assert!(
-        std::fs::read_to_string(&cmp)
-            .unwrap()
-            .contains("<testsuite")
-    );
+    assert!(std::fs::read_to_string(&cmp)
+        .unwrap()
+        .contains("<testsuite"));
 
     // Bare --junit with an inspect query, and --junit with compare+inspect,
     // are usage errors (exit 2).
@@ -706,6 +705,30 @@ fn smoke_junit() {
         2,
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn smoke_gpu_section() {
+    // GPUTask + compositor b/e pairs: report carries ## GPU, --gpu matches it.
+    contains(&[GPU_FIXTURE, "--export"], "## GPU");
+    contains(&[GPU_FIXTURE, "--export"], "73654");
+    contains(&[GPU_FIXTURE, "--export"], "Frame pipeline");
+    contains(&[GPU_FIXTURE, "--gpu"], "## GPU");
+    contains(&[GPU_FIXTURE, "--gpu"], "90001");
+    // Traces without GPU data skip the report section entirely.
+    let o = ok(&[FIXTURE, "--export"]);
+    assert!(
+        !o.stdout.contains("## GPU"),
+        "tiny fixture must not render a GPU section"
+    );
+    // JSON report carries the gpu object; --gpu --json mirrors it.
+    let o = ok(&[GPU_FIXTURE, "--export", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    assert_eq!(v["gpu"]["tasks"]["count"], 5);
+    assert_eq!(v["gpu"]["frame_latency"]["frame_count"], 2);
+    let o = ok(&[GPU_FIXTURE, "--gpu", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o.stdout).expect("valid JSON");
+    assert_eq!(v["sections"]["gpu"]["tasks"]["count"], 5);
 }
 
 #[test]

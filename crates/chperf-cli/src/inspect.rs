@@ -558,6 +558,19 @@ fn build_sections(
         let (m, j) = inspect::raster_section(events, scope, cli.top, min_ts);
         sections.push(("raster", m, j));
     }
+    if cli.gpu {
+        // Standalone render of the report's `## GPU` section over the
+        // scope-filtered events (same markdown renderer, same JSON shape).
+        let kept = events.iter().filter(|e| scope.allows_event(e));
+        let g = chperf_core::analysis::analyze_gpu(kept, inspect_budget_us(events, cli));
+        let m = crate::export::gpu_section_md(&g);
+        let m = if m.is_empty() {
+            "## GPU\n\nNo GPUTask events or compositor frame pairs found.\n\n".to_string()
+        } else {
+            m
+        };
+        sections.push(("gpu", m, crate::report_json::gpu_json(&g)));
+    }
     if cli.coverage {
         let (m, j) = inspect::coverage_section(events, scope, stats, min_ts);
         sections.push(("coverage", m, j));

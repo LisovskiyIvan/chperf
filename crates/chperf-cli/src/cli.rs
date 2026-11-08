@@ -220,6 +220,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) raster: bool,
 
+    /// Inspect: GPU time (GPUTask utilization + compositor frame-pipeline
+    /// latency), standalone render of the report's `## GPU` section
+    #[arg(long)]
+    pub(crate) gpu: bool,
+
     /// Inspect: async flow/causality chains (s/t/f/n + legacy b/e with ids,
     /// grouped by pid+id); optional chain-name filter (no value = all chains)
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
@@ -298,6 +303,7 @@ impl Cli {
             || self.loading
             || self.network
             || self.raster
+            || self.gpu
             || self.coverage
             || self.renderers
     }
